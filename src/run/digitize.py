@@ -141,6 +141,29 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--grid_origin",
+        type=str,
+        choices=["masks", "lines"],
+        default="masks",
+        help=(
+            "Only for --time_mapping grid. masks = origin and pitch of the column grid "
+            "from the mask edges; lines = refined to sub pixel accuracy with the printed "
+            "1 mm grid lines of the image (assumes that the first column starts on a "
+            "grid line), masks if the image shows no such lines."
+        ),
+    )
+    parser.add_argument(
+        "--baseline",
+        type=str,
+        choices=["page", "leads"],
+        default="leads",
+        help=(
+            "page = baseline from the page geometry, scaled with the column pitch; "
+            "leads = additionally shifted so that the Einthoven and Goldberger sums "
+            "have no DC offset (needs --time_mapping grid)."
+        ),
+    )
+    parser.add_argument(
         "--save_mask",
         action="store_true",
         default=False,
@@ -427,7 +450,21 @@ PAGE_PITCH_TOLERANCE = 0.0015
 GRID_GAP_TOLERANCE = 0.01
 # Maximal residual of a column edge to the fitted grid, relative to the pitch.
 GRID_RESIDUAL_TOLERANCE = 0.02
+# Maximal disagreement of the Einthoven and the Goldberger baseline estimate,
+# relative to the pitch (about 2 px). Above it neither estimate is trusted.
+BASELINE_DISAGREEMENT_TOLERANCE = 0.004
 NUM_COLUMNS = int(LONG_SIGNAL_LENGTH_SEC / SHORT_SIGNAL_LENGTH_SEC)
+
+
+def _grid_inliers(lead_edges):
+    """Flag the lead edges within GRID_RESIDUAL_TOLERANCE of a Theil-Sen grid."""
+    boundaries = np.array([edge[0] for edge in lead_edges], float)
+    edges = np.array([edge[1] for edge in lead_edges], float)
+    i, j = np.triu_indices(len(edges), 1)
+    distinct = boundaries[i] != boundaries[j]
+    P = np.median((edges[j] - edges[i])[distinct] / (boundaries[j] - boundaries[i])[distinct])
+    residuals = edges - boundaries * P
+    return np.abs(residuals - np.median(residuals)) <= GRID_RESIDUAL_TOLERANCE * P
 
 
 def fit_column_grid(
@@ -452,9 +489,9 @@ def fit_column_grid(
     if any(widths[lead] < (NUM_COLUMNS - 0.5) * median_width for lead in long_leads):
         return None, None, long_leads, "rhythm strip does not span all columns"
 
-    # Column starts = min x1 per column, column ends = max x-end per column.
-    # The rhythm strip gives the start of the first and the end of the last column.
-    starts, ends = {}, {}
+    # Every lead gives the start of its first and the end of its last column. The
+    # rhythm strip gives the start of the first and the end of the last column.
+    lead_edges = []
     for lead, width in widths.items():
         x1 = signal_positions[lead]["x1"]
         if lead in long_leads:
@@ -464,8 +501,8 @@ def fit_column_grid(
             last_column = first_column
         else:
             return None, None, long_leads, f"unknown lead {lead}"
-        starts[first_column] = min(starts.get(first_column, np.inf), x1)
-        ends[last_column] = max(ends.get(last_column, -np.inf), x1 + width)
+        lead_edges.append((first_column, x1, True))
+        lead_edges.append((last_column + 1, x1 + width, False))
     short_columns = {
         int(STANDARD_LEAD_OFFSETS_SEC[lead] / SHORT_SIGNAL_LENGTH_SEC)
         for lead in widths
@@ -474,8 +511,25 @@ def fit_column_grid(
     if short_columns != set(range(NUM_COLUMNS)):
         return None, None, long_leads, "not every column has a short lead"
 
+    # A mask that runs on past its column (into the margin or the next lead) must
+    # not set the column edge, so edges far off the consensus grid are left out.
+    inliers = _grid_inliers(lead_edges)
+    # Column starts = min x1 per column, column ends = max x-end per column.
+    starts, ends = {}, {}
+    for (boundary, edge, is_start), inlier in zip(lead_edges, inliers):
+        if not inlier:
+            continue
+        if is_start:
+            starts[boundary] = min(starts.get(boundary, np.inf), edge)
+        else:
+            ends[boundary] = max(ends.get(boundary, -np.inf), edge)
+    if set(starts) != set(range(NUM_COLUMNS)) or set(ends) != set(
+        range(1, NUM_COLUMNS + 1)
+    ):
+        return None, None, long_leads, "a column has all its edges off the grid"
+
     # Pixel c covers [c, c+1), so starts and ends are both column boundaries.
-    boundaries = np.array(list(starts.keys()) + [c + 1 for c in ends.keys()], float)
+    boundaries = np.array(list(starts.keys()) + list(ends.keys()), float)
     edges = np.array(list(starts.values()) + list(ends.values()), float)
     P_fit, g0 = np.polyfit(boundaries, edges, 1)
     P = P_fit
@@ -497,7 +551,105 @@ def fit_column_grid(
     return float(g0), float(P), long_leads, ""
 
 
-def vectorise_grid(image_rotated, mask, position, g0, P, column, is_long, y_shift_ratio, lead):
+# Printed 1 mm grid lines in one 2.5 s column (25 mm/s).
+GRID_LINES_PER_COLUMN = 25 * SHORT_SIGNAL_LENGTH_SEC
+# Height of the bands whose median darkness gives the grid line profile. The median
+# over a band drops the traces and the text, short bands survive a residual skew.
+GRID_LINE_BAND_HEIGHT = 100
+# Search range of the grid line pitch around the pitch of the masks, relative.
+GRID_LINE_PITCH_RANGE = 0.005
+# Minimal amplitude of the grid line comb relative to the neighbouring periods.
+GRID_LINE_MIN_CONTRAST = 5.0
+# Maximal move of the origin by the grid lines, relative to the pitch (about 2 px).
+# The mask origin is good to about 1 px, more means the columns are not on the lines.
+GRID_LINE_SHIFT_TOLERANCE = 0.004
+# The generator draws with matplotlib, whose Agg backend snaps an axis parallel line
+# of odd pixel width to round(x) + 0.5, on average 0.5 px right of where the unsnapped
+# traces put it. A scanned page has no such offset.
+GRID_LINE_SNAP_OFFSET = 0.5
+
+
+def _grid_line_comb(profiles, period):
+    """Complex amplitude of the comb with this period in every band profile."""
+    width = profiles.shape[1]
+    # Pixel c covers [c, c+1). The Hann window leaves no side lobes for a pitch scan.
+    x = np.arange(width) + 0.5
+    centred = profiles - profiles.mean(axis=1, keepdims=True)
+    return (centred * np.hanning(width)) @ np.exp(-2j * np.pi * x / period)
+
+
+def refine_grid_from_lines(image_rotated, g0, P):
+    """Refine the column grid with the printed 1 mm grid lines of the image.
+
+    The vertical grid lines are a comb over the whole page width, whose period gives
+    the pitch and whose phase gives the origin far below one pixel, while the mask
+    edges are whole pixels. The origin is the grid line next to the mask origin.
+    Returns (g0, P, info). Without usable grid lines g0 and P come back unchanged and
+    info["reason"] says why.
+    """
+    image = image_rotated.numpy() if torch.is_tensor(image_rotated) else image_rotated
+    darkness = 255.0 - image.min(axis=0).astype(float)
+    band_starts = range(
+        0, darkness.shape[0] - GRID_LINE_BAND_HEIGHT + 1, GRID_LINE_BAND_HEIGHT
+    )
+    info = {"contrast": float("nan"), "shift": float("nan"), "reason": ""}
+    if len(band_starts) == 0:
+        info["reason"] = "image too small for the grid line profile"
+        return g0, P, info
+    profiles = np.array(
+        [
+            np.median(darkness[start : start + GRID_LINE_BAND_HEIGHT], axis=0)
+            for start in band_starts
+        ]
+    )
+
+    def amplitude(period):
+        return np.abs(_grid_line_comb(profiles, period).sum())
+
+    # Coarse scan over the pitch range, then a fine one around the peak. The peak of
+    # the Hann window is 0.4 % of the period wide on a 2200 px page.
+    period = P / GRID_LINES_PER_COLUMN
+    for half_range, steps in ((GRID_LINE_PITCH_RANGE, 51), (2e-4, 41)):
+        candidates = period * (1 + np.linspace(-half_range, half_range, steps))
+        amplitudes = np.array([amplitude(candidate) for candidate in candidates])
+        best = int(np.argmax(amplitudes))
+        period = candidates[best]
+    if 0 < best < steps - 1:
+        left, peak, right = amplitudes[best - 1 : best + 2]
+        curvature = left - 2 * peak + right
+        if curvature < 0:
+            period += 0.5 * (left - right) / curvature * (candidates[1] - candidates[0])
+
+    background = np.mean([amplitude(period * f) for f in (0.93, 0.96, 1.04, 1.07)])
+    info["contrast"] = float(amplitude(period) / max(background, 1e-9))
+    if info["contrast"] < GRID_LINE_MIN_CONTRAST:
+        info["reason"] = f"no grid lines found (contrast {info['contrast']:.1f})"
+        return g0, P, info
+
+    P_lines = period * GRID_LINES_PER_COLUMN
+    phase = -np.angle(_grid_line_comb(profiles, period).sum()) / (2 * np.pi) * period
+    phase -= GRID_LINE_SNAP_OFFSET
+    # A new pitch turns the mask grid about its centre, not about its origin.
+    g0_masks = g0 + NUM_COLUMNS / 2 * (P - P_lines)
+    g0_lines = phase + np.round((g0_masks - phase) / period) * period
+    info["shift"] = float(g0_lines - g0_masks)
+    if abs(info["shift"]) > GRID_LINE_SHIFT_TOLERANCE * P:
+        info["reason"] = (
+            f"next grid line is {info['shift']:+.1f} px off the mask origin"
+        )
+        return g0, P, info
+    return float(g0_lines), float(P_lines), info
+
+
+def baseline_row(ratio, image_height, scale=1.0):
+    """Row of the zero line of one lead, for a page rescaled about its centre."""
+    centre = image_height / 2
+    return centre + scale * ((1 - ratio) * image_height - centre)
+
+
+def vectorise_grid(
+    image_rotated, mask, position, g0, P, column, is_long, y_shift_ratio, lead, scale=1.0
+):
     """Vectorise one lead by sampling it on the shared column grid."""
     total_seconds = LONG_SIGNAL_LENGTH_SEC if is_long else SHORT_SIGNAL_LENGTH_SEC
     y_shift_ratio_ = y_shift_ratio["full"] if is_long else y_shift_ratio[lead]
@@ -515,9 +667,63 @@ def vectorise_grid(image_rotated, mask, position, g0, P, column, is_long, y_shif
     # Pixel c covers [c, c+1), so its centre is at c + 0.5. np.interp holds the edges.
     x = g0 + column * P + np.arange(values_needed) * P / samples_per_column - 0.5
     sampled = np.interp(x, position["x1"] + filled, profile)
-    baseline = (1 - y_shift_ratio_) * image_rotated.shape[1]
+    baseline = baseline_row(y_shift_ratio_, image_rotated.shape[1], scale)
 
-    return torch.from_numpy(((baseline - sampled) * mV_per_pixel).astype(np.float32))
+    # Pixel row r covers [r, r+1) as well, so the sampled trace sits at row + 0.5.
+    return torch.from_numpy(
+        ((baseline - (sampled + 0.5)) * mV_per_pixel).astype(np.float32)
+    )
+
+
+def estimate_baseline_shift(signals_predicted, long_leads, mV_per_pixel, P, record=""):
+    """Baseline error of a record in pixels, from the limb lead sum rules.
+
+    Goldberger (aVR + aVL + aVF = 0) and Einthoven (I + III - II = 0) hold sample
+    wise, so with every lead read a px too low the medians of the two sums are
+    -3 a m and -a m. Returns (shift, disagreement of the two estimates) in pixels,
+    (0.0, nan) if a rule cannot be evaluated.
+    """
+    samples_per_column = int(SHORT_SIGNAL_LENGTH_SEC * FREQUENCY)
+
+    def rule_median(leads, coefficients):
+        # The first lead is short and names the column the whole rule lives in.
+        column = int(STANDARD_LEAD_OFFSETS_SEC[leads[0]] / SHORT_SIGNAL_LENGTH_SEC)
+        windows = []
+        for lead in leads:
+            signal = signals_predicted.get(lead)
+            if signal is None:
+                return np.nan
+            signal = np.asarray(signal, dtype=float)
+            if lead in long_leads:
+                start = column * samples_per_column
+                signal = signal[start : start + samples_per_column]
+            if signal.shape != (samples_per_column,):
+                return np.nan
+            windows.append(signal)
+        residual = sum(c * window for c, window in zip(coefficients, windows))
+        if not np.any(np.isfinite(residual)):
+            return np.nan
+        return float(np.nanmedian(residual))
+
+    einthoven = rule_median(["I", "III", "II"], [1.0, 1.0, -1.0])
+    goldberger = rule_median(["aVR", "aVL", "aVF"], [1.0, 1.0, 1.0])
+    if not np.isfinite(einthoven) or not np.isfinite(goldberger):
+        return 0.0, float("nan")
+
+    from_goldberger = -goldberger / (3 * mV_per_pixel)
+    from_einthoven = -einthoven / mV_per_pixel
+    disagreement = from_goldberger - from_einthoven
+    if abs(disagreement) > BASELINE_DISAGREEMENT_TOLERANCE * P:
+        print(
+            f"WARNING: baseline estimates disagree for record {record}: "
+            f"Goldberger {from_goldberger:.2f} px, Einthoven {from_einthoven:.2f} px, "
+            f"keeping the page baseline."
+        )
+        return 0.0, float(disagreement)
+
+    # Least squares over both rules, whose residuals weigh 3 a m and a m.
+    shift = -(3 * goldberger + einthoven) / (10 * mV_per_pixel)
+    return float(shift), float(disagreement)
 
 
 def compute_grid_lead_offsets(signal_positions, signal_lengths, long_leads, g0, P):
@@ -704,6 +910,11 @@ def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
         "goldberger_ratio",
         "goldberger_n",
         "max_offset_deviation",
+        "baseline_scale",
+        "baseline_shift_px",
+        "baseline_disagreement_px",
+        "grid_line_contrast",
+        "grid_line_shift_px",
     ]
     write_header = not os.path.exists(qc_path)
     with open(qc_path, "a", newline="") as f:
@@ -835,6 +1046,8 @@ def run(args):
         )
         sec_per_pixel = 2.5 / x_pixel_list_below_2x_median_mean
         g0, P, long_leads = None, None, []
+        grid_lines = {"contrast": float("nan"), "shift": float("nan")}
+        baseline_scale = 1.0
         if args.time_mapping == "grid":
             g0, P, long_leads, reason = fit_column_grid(
                 signal_masks_cropped,
@@ -849,7 +1062,16 @@ def run(args):
                     f"falling back to --time_mapping bbox."
                 )
             else:
+                if args.grid_origin == "lines":
+                    g0, P, grid_lines = refine_grid_from_lines(image_rotated, g0, P)
+                    if grid_lines["reason"]:
+                        print(
+                            f"WARNING: grid lines not used for record {record} "
+                            f"({grid_lines['reason']}), keeping the grid of the masks."
+                        )
                 sec_per_pixel = SHORT_SIGNAL_LENGTH_SEC / P
+                # A cropped page keeps its size, so its rows are rescaled with the pitch.
+                baseline_scale = P / (image_rotated.shape[1] * PAGE_PITCH_RATIO)
                 if args.verbose:
                     print(f"Column grid for record {record}: g0 {g0:.2f} px, P {P:.2f} px")
         mm_per_pixel = 25 * sec_per_pixel
@@ -878,6 +1100,7 @@ def run(args):
                     lead in long_leads,
                     Y_SHIFT_RATIO,
                     lead,
+                    baseline_scale,
                 )
             else:
                 signals_predicted[lead] = vectorise(
@@ -888,6 +1111,22 @@ def run(args):
                     mV_per_pixel,
                     Y_SHIFT_RATIO,
                     lead,
+                )
+
+        # Put the baseline of the whole record where the limb lead sums vanish.
+        baseline_shift, baseline_disagreement = 0.0, float("nan")
+        if g0 is not None and args.baseline == "leads":
+            baseline_shift, baseline_disagreement = estimate_baseline_shift(
+                signals_predicted, long_leads, mV_per_pixel, P, record
+            )
+            for lead, signal in signals_predicted.items():
+                if signal is not None:
+                    signals_predicted[lead] = signal + baseline_shift * mV_per_pixel
+            if args.verbose:
+                print(
+                    f"Baseline for record {record}: scale {baseline_scale:.4f}, "
+                    f"shift {baseline_shift:.2f} px, "
+                    f"disagreement {baseline_disagreement:.2f} px"
                 )
 
         # Save Challenge outputs.
@@ -941,6 +1180,11 @@ def run(args):
             if np.isfinite(offset["raw"])
         ]
         max_offset_deviation = max(deviations) if deviations else np.nan
+        qc["baseline_scale"] = baseline_scale
+        qc["baseline_shift_px"] = baseline_shift
+        qc["baseline_disagreement_px"] = baseline_disagreement
+        qc["grid_line_contrast"] = grid_lines["contrast"]
+        qc["grid_line_shift_px"] = grid_lines["shift"]
         append_qc_row(
             args.output_folder, record, args.lead_placement, qc, max_offset_deviation
         )
