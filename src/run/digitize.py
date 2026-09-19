@@ -1,6 +1,8 @@
 # Run the digitization of ECG images.
 import argparse
+import csv
 import cv2
+import json
 import numpy as np
 import matplotlib.pyplot as plt
 # import pandas as pd
@@ -9,6 +11,7 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import warnings
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
@@ -96,7 +99,46 @@ def get_parser():
         default=False,
         help="Allow failures.",
     )
+    parser.add_argument(
+        "--lead_placement",
+        type=str,
+        choices=["column", "start"],
+        default="column",
+        help=(
+            "column = each short lead in the time window of its column, NaN elsewhere; "
+            "start = legacy, all short leads at sample 0 and NaN written as 0."
+        ),
+    )
+    parser.add_argument(
+        "--save_mask",
+        action="store_true",
+        default=False,
+        help="Save the predicted label mask (rotation-corrected frame) as PNG plus JSON.",
+    )
+    parser.add_argument(
+        "--mask_folder",
+        type=str,
+        default=None,
+        help="Load masks from this folder instead of running nnUNet.",
+    )
     return parser
+
+
+# Offsets in seconds of the standard 3x4 layout, used as a fallback.
+STANDARD_LEAD_OFFSETS_SEC = {
+    "I": 0.0,
+    "II": 0.0,
+    "III": 0.0,
+    "aVR": 2.5,
+    "aVL": 2.5,
+    "aVF": 2.5,
+    "V1": 5.0,
+    "V2": 5.0,
+    "V3": 5.0,
+    "V4": 7.5,
+    "V5": 7.5,
+    "V6": 7.5,
+}
 
 
 def get_rotation_angle(np_image):
@@ -345,6 +387,178 @@ def vectorise(
     return predicted_signal_sampled
 
 
+def compute_lead_offsets(signal_positions, signal_lengths, sec_per_pixel, record=""):
+    """Get the time offset in seconds of every predicted lead."""
+    long_length = LONG_SIGNAL_LENGTH_SEC * FREQUENCY
+    max_offset = LONG_SIGNAL_LENGTH_SEC - SHORT_SIGNAL_LENGTH_SEC
+    long_leads = [
+        lead for lead, length in signal_lengths.items() if length >= long_length
+    ]
+
+    # Without a rhythm strip there is no reference, so fall back to the layout table.
+    if not long_leads:
+        print(
+            f"No rhythm lead found for record {record}, "
+            f"falling back to the standard lead offsets."
+        )
+        return {
+            lead: {
+                "raw": float("nan"),
+                "snapped": float(STANDARD_LEAD_OFFSETS_SEC.get(lead, 0.0)),
+            }
+            for lead in signal_lengths
+        }
+
+    x1_ref = min(signal_positions[lead]["x1"] for lead in long_leads)
+
+    offsets = {}
+    for lead in signal_lengths:
+        if lead in long_leads:
+            offsets[lead] = {"raw": 0.0, "snapped": 0.0}
+            continue
+        raw = (signal_positions[lead]["x1"] - x1_ref) * sec_per_pixel
+        snapped = round(raw / SHORT_SIGNAL_LENGTH_SEC) * SHORT_SIGNAL_LENGTH_SEC
+        clamped = float(min(max(snapped, 0.0), max_offset))
+        if abs(raw - snapped) > 0.5 or clamped != snapped:
+            print(
+                f"Suspicious lead offset for record {record}, lead {lead}: "
+                f"raw {raw:.3f} s, snapped {clamped:.3f} s."
+            )
+        offsets[lead] = {"raw": float(raw), "snapped": clamped}
+
+    return offsets
+
+
+def assemble_signals(signals, offsets, num_samples, placement):
+    """Put the single lead signals into one array of shape [num_samples, n_leads]."""
+    signal_list = []
+    for lead, signal in signals.items():
+        if placement == "start":
+            if len(signal) < num_samples:
+                nan_signal = np.empty(num_samples)
+                nan_signal[:] = np.nan
+                nan_signal[: int(len(signal))] = signal
+                signal_list.append(nan_signal)
+            else:
+                signal_list.append(signal)
+        else:
+            snapped = offsets.get(lead, {}).get("snapped", 0.0)
+            start = int(round(snapped * FREQUENCY))
+            nan_signal = np.empty(num_samples)
+            nan_signal[:] = np.nan
+            end = min(start + len(signal), num_samples)
+            if end > start:
+                nan_signal[start:end] = signal[: end - start]
+            signal_list.append(nan_signal)
+
+    sig_names = list(signals.keys())
+    return np.array(signal_list).T, sig_names
+
+
+def _residual_qc(signals, sig_names, leads, coefficients):
+    """Residual statistics of one lead consistency rule."""
+    nan_result = {"rms": np.nan, "rms_demedian": np.nan, "ratio": np.nan, "n": 0}
+    if any(lead not in sig_names for lead in leads):
+        return nan_result
+
+    columns = [signals[:, sig_names.index(lead)] for lead in leads]
+    valid = np.all([np.isfinite(column) for column in columns], axis=0)
+    n = int(np.sum(valid))
+    if n == 0:
+        return nan_result
+
+    columns = [column[valid] for column in columns]
+    residual = sum(c * column for c, column in zip(coefficients, columns))
+    rms = float(np.sqrt(np.mean(residual**2)))
+    rms_demedian = float(np.sqrt(np.mean((residual - np.median(residual)) ** 2)))
+    denominator = float(np.mean([np.sqrt(np.mean(column**2)) for column in columns]))
+    ratio = float(rms / denominator) if denominator != 0 else np.nan
+
+    return {"rms": rms, "rms_demedian": rms_demedian, "ratio": ratio, "n": n}
+
+
+def compute_consistency_qc(signals, sig_names):
+    """Einthoven and Goldberger consistency of the assembled signals."""
+    einthoven = _residual_qc(signals, sig_names, ["I", "III", "II"], [1.0, 1.0, -1.0])
+    goldberger = _residual_qc(
+        signals, sig_names, ["aVR", "aVL", "aVF"], [1.0, 1.0, 1.0]
+    )
+    return {
+        "einthoven_rms": einthoven["rms"],
+        "einthoven_rms_demedian": einthoven["rms_demedian"],
+        "einthoven_ratio": einthoven["ratio"],
+        "einthoven_n": einthoven["n"],
+        "goldberger_rms": goldberger["rms"],
+        "goldberger_rms_demedian": goldberger["rms_demedian"],
+        "goldberger_ratio": goldberger["ratio"],
+        "goldberger_n": goldberger["n"],
+    }
+
+
+def write_record(record, signals, sig_names, output_folder, placement):
+    """Write the signals to a WFDB record."""
+    kwargs = dict(
+        fs=FREQUENCY,
+        units=[SIGNAL_UNITS] * signals.shape[1],
+        sig_name=sig_names,
+        write_dir=output_folder,
+        fmt=[FMT] * signals.shape[1],
+        adc_gain=[ADC_GAIN] * signals.shape[1],
+        baseline=[BASELINE] * signals.shape[1],
+    )
+    if placement == "start":
+        wfdb.wrsamp(record, p_signal=np.nan_to_num(signals), **kwargs)
+    else:
+        # wfdb writes NaN as the fmt-16 sentinel, but warns while casting.
+        with warnings.catch_warnings():
+            warnings.filterwarnings(
+                "ignore",
+                message="invalid value encountered in cast",
+                category=RuntimeWarning,
+            )
+            with np.errstate(invalid="ignore"):
+                wfdb.wrsamp(record, p_signal=signals, **kwargs)
+
+
+def save_mask_files(mask, record, output_folder, rot_angle):
+    """Save the predicted mask as PNG plus a small JSON with the frame info."""
+    mask_to_save = mask.to(torch.uint8)
+    write_png(mask_to_save, os.path.join(output_folder, f"{record}_mask.png"))
+    meta = {
+        "rot_angle": float(rot_angle),
+        "height": int(mask_to_save.shape[1]),
+        "width": int(mask_to_save.shape[2]),
+    }
+    with open(os.path.join(output_folder, f"{record}_mask.json"), "w") as f:
+        json.dump(meta, f)
+
+
+def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
+    """Append one QC row to qc.csv, writing the header if needed."""
+    qc_path = os.path.join(output_folder, "qc.csv")
+    fieldnames = [
+        "record",
+        "placement",
+        "einthoven_rms",
+        "einthoven_rms_demedian",
+        "einthoven_ratio",
+        "einthoven_n",
+        "goldberger_rms",
+        "goldberger_rms_demedian",
+        "goldberger_ratio",
+        "goldberger_n",
+        "max_offset_deviation",
+    ]
+    write_header = not os.path.exists(qc_path)
+    with open(qc_path, "a", newline="") as f:
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        if write_header:
+            writer.writeheader()
+        row = {"record": record, "placement": placement, **qc}
+        row["max_offset_deviation"] = max_offset_deviation
+        writer.writerow(row)
+
+
 def save_plot_masks_and_signals(
     image, masks_cropped, mask_start_position, signals, sig_names, output_folder, filename="record.png"
 ):
@@ -431,14 +645,24 @@ def run(args):
         image_rotated = rotate(image, rot_angle)
 
         # Segment
-        mask_to_use = predict_mask_nnunet(
-            image_rotated,
-            DATASET_NAME,
-            args.model_folder,
-            device=args.device,
-            disable_tta=args.disable_tta,
-            fold=args.fold,
-        )
+        if args.mask_folder is not None:
+            mask_path = os.path.join(args.mask_folder, f"{record}_mask.png")
+            if not os.path.exists(mask_path):
+                raise FileNotFoundError(
+                    f"No mask found for record {record} at {mask_path}."
+                )
+            mask_to_use = read_image(mask_path)
+        else:
+            mask_to_use = predict_mask_nnunet(
+                image_rotated,
+                DATASET_NAME,
+                args.model_folder,
+                device=args.device,
+                disable_tta=args.disable_tta,
+                fold=args.fold,
+            )
+        if args.save_mask:
+            save_mask_files(mask_to_use, record, args.output_folder, rot_angle)
 
         # Use mask to cut into single, binary masks
         signal_masks_cropped, signal_positions_cropped, _ = cut_binary(
@@ -478,17 +702,18 @@ def run(args):
             if signals_predicted[signal_name] is not None
         }
         num_samples = int(LONG_SIGNAL_LENGTH_SEC * FREQUENCY)
-        signal_list = []
-        for signal in signals.values():
-            if len(signal) < num_samples:
-                nan_signal = np.empty(num_samples)
-                nan_signal[:] = np.nan
-                nan_signal[: int(len(signal))] = signal
-                signal_list.append(nan_signal)
-            else:
-                signal_list.append(signal)
-        sig_names = list(signals.keys())
-        signals = np.array(signal_list).T
+        signal_lengths = {lead: len(signal) for lead, signal in signals.items()}
+        offsets = compute_lead_offsets(
+            signal_positions_cropped, signal_lengths, sec_per_pixel, record
+        )
+        signals, sig_names = assemble_signals(
+            signals, offsets, num_samples, args.lead_placement
+        )
+        if args.lead_placement == "column" and args.verbose:
+            offsets_string = ", ".join(
+                f"{lead} {offset['snapped']:.1f}" for lead, offset in offsets.items()
+            )
+            print(f"Offsets for record {record}: {offsets_string}")
 
         # Check if signal is empty
         if signals.shape[0] == 0:
@@ -497,6 +722,27 @@ def run(args):
                 continue
             else:
                 raise ValueError(f"Signal is empty for record {record}.")
+
+        # Quality control of the assembled signals.
+        qc = compute_consistency_qc(signals, sig_names)
+        print(
+            f"QC {record}: "
+            f"Einthoven RMS {qc['einthoven_rms']:.4f} mV "
+            f"(demedian {qc['einthoven_rms_demedian']:.4f}, "
+            f"ratio {qc['einthoven_ratio']:.2f}, n={qc['einthoven_n']}) | "
+            f"Goldberger RMS {qc['goldberger_rms']:.4f} mV "
+            f"(demedian {qc['goldberger_rms_demedian']:.4f}, "
+            f"ratio {qc['goldberger_ratio']:.2f}, n={qc['goldberger_n']})"
+        )
+        deviations = [
+            abs(offset["raw"] - offset["snapped"])
+            for offset in offsets.values()
+            if np.isfinite(offset["raw"])
+        ]
+        max_offset_deviation = max(deviations) if deviations else np.nan
+        append_qc_row(
+            args.output_folder, record, args.lead_placement, qc, max_offset_deviation
+        )
 
         # Plot and save the image with the masks and signals.
         if args.show_image:
@@ -519,16 +765,8 @@ def run(args):
             max_val = np.nanmax(signals)
             min_val = np.nanmin(signals)
             signals = (signals - min_val) / (max_val - min_val) * 2 - 1
-        wfdb.wrsamp(
-            record,
-            fs=FREQUENCY,
-            units=[SIGNAL_UNITS] * signals.shape[1],
-            sig_name=sig_names,
-            p_signal=np.nan_to_num(signals),
-            write_dir=args.output_folder,
-            fmt=[FMT] * signals.shape[1],
-            adc_gain=[ADC_GAIN] * signals.shape[1],
-            baseline=[BASELINE] * signals.shape[1],
+        write_record(
+            record, signals, sig_names, args.output_folder, args.lead_placement
         )
 
     if args.verbose:
