@@ -413,12 +413,16 @@ def vectorise(
 PAGE_PITCH_RATIO = 25 * SHORT_SIGNAL_LENGTH_SEC / 10 / 21.59
 # Maximal relative deviation between the page pitch and the fitted pitch.
 PAGE_PITCH_TOLERANCE = 0.005
+# Gaps in a lead above this width, relative to the pitch, are reported (about 25 ms).
+GRID_GAP_TOLERANCE = 0.01
 # Maximal residual of a column edge to the fitted grid, relative to the pitch.
 GRID_RESIDUAL_TOLERANCE = 0.02
 NUM_COLUMNS = int(LONG_SIGNAL_LENGTH_SEC / SHORT_SIGNAL_LENGTH_SEC)
 
 
-def fit_column_grid(signal_masks, signal_positions, image_height, pitch="page"):
+def fit_column_grid(
+    signal_masks, signal_positions, image_height, pitch="page", record=""
+):
     """Fit the shared column grid of the standard 3x4 layout with rhythm strip.
 
     Returns (g0, P, long_leads, reason). g0 is the x position of the left edge of
@@ -474,7 +478,7 @@ def fit_column_grid(signal_masks, signal_positions, image_height, pitch="page"):
         else:
             print(
                 f"Page pitch {P_page:.2f} px does not match the fitted pitch "
-                f"{P_fit:.2f} px, using the fitted one."
+                f"{P_fit:.2f} px for record {record}, using the fitted one."
             )
     residual = np.max(np.abs(edges - (g0 + boundaries * P)))
     if residual > GRID_RESIDUAL_TOLERANCE * P:
@@ -504,6 +508,29 @@ def vectorise_grid(image_rotated, mask, position, g0, P, column, is_long, y_shif
     baseline = (1 - y_shift_ratio_) * image_rotated.shape[1]
 
     return torch.from_numpy(((baseline - sampled) * mV_per_pixel).astype(np.float32))
+
+
+def compute_grid_lead_offsets(signal_positions, signal_lengths, long_leads, g0, P):
+    """Get the time offset of every lead from the column grid it was sampled on."""
+    offsets = {}
+    for lead in signal_lengths:
+        if lead in long_leads:
+            offsets[lead] = {"raw": 0.0, "snapped": 0.0}
+            continue
+        raw = (signal_positions[lead]["x1"] - g0) * SHORT_SIGNAL_LENGTH_SEC / P
+        offsets[lead] = {
+            "raw": float(raw),
+            "snapped": float(STANDARD_LEAD_OFFSETS_SEC[lead]),
+        }
+    return offsets
+
+
+def max_mask_gap(mask):
+    """Longest run of empty columns inside the cropped mask of one lead, in pixels."""
+    filled = np.flatnonzero(mask[0].numpy().sum(axis=0) > 0)
+    if filled.size < 2:
+        return 0
+    return int(np.max(np.diff(filled)) - 1)
 
 
 def compute_lead_offsets(signal_positions, signal_lengths, sec_per_pixel, record=""):
@@ -797,13 +824,14 @@ def run(args):
             [v for v in x_pixel_list if v < 2 * x_pixel_list_median]
         )
         sec_per_pixel = 2.5 / x_pixel_list_below_2x_median_mean
-        g0, P = None, None
+        g0, P, long_leads = None, None, []
         if args.time_mapping == "grid":
             g0, P, long_leads, reason = fit_column_grid(
                 signal_masks_cropped,
                 signal_positions_cropped,
                 image_rotated.shape[1],
                 args.grid_pitch,
+                record,
             )
             if g0 is None:
                 print(
@@ -821,6 +849,13 @@ def run(args):
             if mask is None:
                 signals_predicted[lead] = None
             elif g0 is not None:
+                # The grid sampling interpolates over gaps, so report them.
+                gap = max_mask_gap(mask)
+                if gap > GRID_GAP_TOLERANCE * P:
+                    print(
+                        f"WARNING: lead {lead} of record {record} has a gap of "
+                        f"{gap} px in its mask, interpolated linearly."
+                    )
                 signals_predicted[lead] = vectorise_grid(
                     image_rotated,
                     mask,
@@ -853,9 +888,15 @@ def run(args):
         }
         num_samples = int(LONG_SIGNAL_LENGTH_SEC * FREQUENCY)
         signal_lengths = {lead: len(signal) for lead, signal in signals.items()}
-        offsets = compute_lead_offsets(
-            signal_positions_cropped, signal_lengths, sec_per_pixel, record
-        )
+        if g0 is not None:
+            # Place every lead in the column it was sampled from.
+            offsets = compute_grid_lead_offsets(
+                signal_positions_cropped, signal_lengths, long_leads, g0, P
+            )
+        else:
+            offsets = compute_lead_offsets(
+                signal_positions_cropped, signal_lengths, sec_per_pixel, record
+            )
         signals, sig_names = assemble_signals(
             signals, offsets, num_samples, args.lead_placement
         )

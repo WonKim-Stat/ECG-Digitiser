@@ -301,6 +301,39 @@ def test_parser_time_mapping_and_grid_pitch():
         parser.parse_args(["-d", "data", "-o", "out", "--time_mapping", "nope"])
 
 
+# ------------------------------------------------------- offsets and mask gaps
+def test_compute_grid_lead_offsets_uses_the_grid_columns():
+    # All leads of column 1 start 3 px late: the placement must stay at 2.5 s.
+    label = make_label_mask()
+    for lead in ["aVR", "aVL", "aVF"]:
+        label = shave_start(label, lead, 3)
+    masks, positions, _ = cut(label)
+    g0, P, long_leads, _ = digitize.fit_column_grid(masks, positions, HEIGHT)
+    lengths = {
+        lead: LONG_SAMPLES if lead in long_leads else SHORT_SAMPLES
+        for lead, mask in masks.items()
+        if mask is not None
+    }
+    offsets = digitize.compute_grid_lead_offsets(positions, lengths, long_leads, g0, P)
+
+    assert offsets[RHYTHM_LEAD] == {"raw": 0.0, "snapped": 0.0}
+    for lead, column in SHORT_COLUMNS.items():
+        assert offsets[lead]["snapped"] == pytest.approx(column * 2.5)
+        assert offsets[lead]["raw"] == pytest.approx(column * 2.5, abs=0.05)
+
+
+def test_max_mask_gap_counts_the_empty_columns():
+    label = make_label_mask()
+    masks, _, _ = cut(label)
+    assert digitize.max_mask_gap(masks["V5"]) == 0
+
+    is_lead = label == LEAD_LABEL_MAPPING["V5"]
+    first = np.flatnonzero(is_lead.any(axis=0))[0]
+    label[:, first + 100 : first + 112][is_lead[:, first + 100 : first + 112]] = 0
+    masks, _, _ = cut(label)
+    assert digitize.max_mask_gap(masks["V5"]) == 12
+
+
 # ------------------------------------------------------------------- end to end
 def _write_case(tmp_path, name, label):
     data_folder = tmp_path / f"{name}_data"
@@ -362,3 +395,13 @@ def test_run_falls_back_to_bbox_without_a_rhythm_strip(tmp_path, capsys):
     bbox = _run(tmp_path, "norhythm", label, "bbox")
     assert grid.sig_name == bbox.sig_name
     assert np.array_equal(grid.p_signal, bbox.p_signal, equal_nan=True)
+
+
+def test_run_reports_a_gap_in_a_lead(tmp_path, capsys):
+    label = make_label_mask()
+    is_lead = label == LEAD_LABEL_MAPPING["V5"]
+    first = np.flatnonzero(is_lead.any(axis=0))[0]
+    label[:, first + 100 : first + 112][is_lead[:, first + 100 : first + 112]] = 0
+    _run(tmp_path, "gap", label, "grid")
+    out = capsys.readouterr().out
+    assert "lead V5 of record gap has a gap of 12 px" in out
