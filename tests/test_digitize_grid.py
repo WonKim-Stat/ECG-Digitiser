@@ -188,6 +188,16 @@ def test_fit_column_grid_falls_back_to_the_fitted_pitch_on_a_page_mismatch(capsy
     assert "does not match the fitted pitch" in out
 
 
+def test_fit_column_grid_does_not_force_the_page_pitch_on_a_rescaled_page(capsys):
+    # A 0.2 % crop that keeps the image size rescales the page by about 0.4 %.
+    pitch = P_TRUE * 1.004
+    masks, positions, _ = cut(make_label_mask(pitch=pitch))
+    g0, P, _, reason = digitize.fit_column_grid(masks, positions, HEIGHT, "page")
+    assert reason == ""
+    assert P == pytest.approx(pitch, abs=0.5)
+    assert "does not match the fitted pitch" in capsys.readouterr().out
+
+
 def test_fit_column_grid_rejects_a_misplaced_column():
     shifts = {lead: 40 for lead in ("aVR", "aVL", "aVF")}
     masks, positions, _ = cut(make_label_mask(x_shifts=shifts))
@@ -288,8 +298,14 @@ def test_shaved_start_leaves_the_grid_output_almost_unchanged(lead, n_pixels):
 def test_parser_time_mapping_and_grid_pitch():
     parser = digitize.get_parser()
     args = parser.parse_args(["-d", "data", "-o", "out"])
-    assert args.time_mapping == "bbox"
+    assert args.time_mapping == "grid"
     assert args.grid_pitch == "page"
+    assert args.enable_tta is False
+    assert parser.parse_args(["-d", "data", "-o", "out", "--enable_tta"]).enable_tta
+    # The old flag is still accepted.
+    parser.parse_args(["-d", "data", "-o", "out", "--disable_tta"])
+    args = parser.parse_args(["-d", "data", "-o", "out", "--time_mapping", "bbox"])
+    assert args.time_mapping == "bbox"
 
     args = parser.parse_args(
         ["-d", "data", "-o", "out", "--time_mapping", "grid", "--grid_pitch", "fit"]

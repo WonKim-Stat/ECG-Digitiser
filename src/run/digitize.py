@@ -75,10 +75,19 @@ def get_parser():
         help="Device to run nnUNet inference on. 'auto' picks cuda, then mps, then cpu.",
     )
     parser.add_argument(
+        "--enable_tta",
+        action="store_true",
+        default=False,
+        help=(
+            "Enable test time augmentation (mirroring). About 2x slower and without "
+            "a measurable gain on the generated evaluation set, hence off by default."
+        ),
+    )
+    parser.add_argument(
         "--disable_tta",
         action="store_true",
         default=False,
-        help="Disable test time augmentation (faster, but less accurate).",
+        help="Deprecated, test time augmentation is off unless --enable_tta is given.",
     )
     parser.add_argument(
         "--fold",
@@ -113,11 +122,11 @@ def get_parser():
         "--time_mapping",
         type=str,
         choices=["bbox", "grid"],
-        default="bbox",
+        default="grid",
         help=(
-            "bbox = legacy, stretch the bounding box of every lead to its length; "
             "grid = sample all leads on one shared column grid (standard 3x4 layout "
-            "with rhythm strip only, falls back to bbox otherwise)."
+            "with rhythm strip only, falls back to bbox otherwise); "
+            "bbox = legacy, stretch the bounding box of every lead to its length."
         ),
     )
     parser.add_argument(
@@ -411,8 +420,9 @@ def vectorise(
 
 # Width of one 2.5 s column relative to the page height (62.5 mm of 215.9 mm).
 PAGE_PITCH_RATIO = 25 * SHORT_SIGNAL_LENGTH_SEC / 10 / 21.59
-# Maximal relative deviation between the page pitch and the fitted pitch.
-PAGE_PITCH_TOLERANCE = 0.005
+# Maximal relative deviation between the page pitch and the fitted pitch (about
+# 0.75 px). A slightly cropped or rescaled page is off by more, 0.5 % let those through.
+PAGE_PITCH_TOLERANCE = 0.0015
 # Gaps in a lead above this width, relative to the pitch, are reported (about 25 ms).
 GRID_GAP_TOLERANCE = 0.01
 # Maximal residual of a column edge to the fitted grid, relative to the pitch.
@@ -804,7 +814,7 @@ def run(args):
                 DATASET_NAME,
                 args.model_folder,
                 device=args.device,
-                disable_tta=args.disable_tta,
+                disable_tta=not args.enable_tta,
                 fold=args.fold,
             )
         if args.save_mask:
