@@ -152,6 +152,17 @@ def get_parser():
             "if the image shows no such lines; masks = from the mask edges only."
         ),
     )
+    # GRID_LINE_SNAP_OFFSET is defined below, get_parser() only runs after the import.
+    parser.add_argument(
+        "--grid_line_offset",
+        type=float,
+        default=GRID_LINE_SNAP_OFFSET,
+        help=(
+            "Only for --grid_origin lines. Pixels the printed grid lines sit right of "
+            "the traces; 0.5 = the matplotlib Agg snap of the generator images, "
+            "0 for scans or photographs."
+        ),
+    )
     parser.add_argument(
         "--baseline",
         type=str,
@@ -578,12 +589,14 @@ def _grid_line_comb(profiles, period):
     return (centred * np.hanning(width)) @ np.exp(-2j * np.pi * x / period)
 
 
-def refine_grid_from_lines(image_rotated, g0, P):
+def refine_grid_from_lines(image_rotated, g0, P, snap_offset=GRID_LINE_SNAP_OFFSET):
     """Refine the column grid with the printed 1 mm grid lines of the image.
 
     The vertical grid lines are a comb over the whole page width, whose period gives
     the pitch and whose phase gives the origin far below one pixel, while the mask
     edges are whole pixels. The origin is the grid line next to the mask origin.
+    snap_offset is how far in pixels the drawn lines sit right of the traces, 0.5 for
+    the matplotlib generator and 0 for a scanned page.
     Returns (g0, P, info). Without usable grid lines g0 and P come back unchanged and
     info["reason"] says why.
     """
@@ -628,7 +641,7 @@ def refine_grid_from_lines(image_rotated, g0, P):
 
     P_lines = period * GRID_LINES_PER_COLUMN
     phase = -np.angle(_grid_line_comb(profiles, period).sum()) / (2 * np.pi) * period
-    phase -= GRID_LINE_SNAP_OFFSET
+    phase -= snap_offset
     # A new pitch turns the mask grid about its centre, not about its origin.
     g0_masks = g0 + NUM_COLUMNS / 2 * (P - P_lines)
     g0_lines = phase + np.round((g0_masks - phase) / period) * period
@@ -1063,7 +1076,9 @@ def run(args):
                 )
             else:
                 if args.grid_origin == "lines":
-                    g0, P, grid_lines = refine_grid_from_lines(image_rotated, g0, P)
+                    g0, P, grid_lines = refine_grid_from_lines(
+                        image_rotated, g0, P, snap_offset=args.grid_line_offset
+                    )
                     if grid_lines["reason"]:
                         print(
                             f"WARNING: grid lines not used for record {record} "

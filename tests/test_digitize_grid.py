@@ -371,6 +371,19 @@ def test_refine_grid_from_lines_ignores_traces_and_text():
     assert P == pytest.approx(P_TRUE, abs=0.02)
 
 
+def test_refine_grid_from_lines_snap_offset_moves_the_origin():
+    # A scanned page draws its lines where they are: without the half pixel snap of
+    # the generator the same lines put the origin half a pixel further right.
+    image = _draw_grid_lines(_blank_page(), G0_LINES)
+    g0_snapped, P_snapped, _ = digitize.refine_grid_from_lines(image, G0_LINES, P_TRUE)
+    g0, P, info = digitize.refine_grid_from_lines(
+        image, G0_LINES, P_TRUE, snap_offset=0
+    )
+    assert info["reason"] == ""
+    assert g0 - g0_snapped == pytest.approx(digitize.GRID_LINE_SNAP_OFFSET, abs=1e-6)
+    assert P == pytest.approx(P_snapped, abs=1e-9)
+
+
 def test_refine_grid_from_lines_keeps_the_mask_grid_on_a_blank_page():
     g0, P, info = digitize.refine_grid_from_lines(_blank_page(), G0_TRUE, P_TRUE)
     assert (g0, P) == (G0_TRUE, P_TRUE)
@@ -608,6 +621,14 @@ def test_parser_grid_origin():
 
     with pytest.raises(SystemExit):
         parser.parse_args(["-d", "data", "-o", "out", "--grid_origin", "nope"])
+
+
+def test_parser_grid_line_offset():
+    parser = digitize.get_parser()
+    args = parser.parse_args(["-d", "data", "-o", "out"])
+    assert args.grid_line_offset == digitize.GRID_LINE_SNAP_OFFSET
+    args = parser.parse_args(["-d", "data", "-o", "out", "--grid_line_offset", "0"])
+    assert args.grid_line_offset == 0.0
 
 
 # ------------------------------------------------------- offsets and mask gaps
