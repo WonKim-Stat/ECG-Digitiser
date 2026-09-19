@@ -8,6 +8,7 @@ import os
 import shutil
 import subprocess
 import sys
+import tempfile
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
@@ -57,7 +58,30 @@ def get_parser():
         help="Folder to save the digitized images.",
     )
     parser.add_argument(
-        "-v", "--verbose", action="store_true", default=True, help="Verbose output."
+        "-v",
+        "--verbose",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Verbose output. Use --no-verbose to disable.",
+    )
+    parser.add_argument(
+        "--device",
+        type=str,
+        choices=["auto", "cuda", "mps", "cpu"],
+        default="auto",
+        help="Device to run nnUNet inference on. 'auto' picks cuda, then mps, then cpu.",
+    )
+    parser.add_argument(
+        "--disable_tta",
+        action="store_true",
+        default=False,
+        help="Disable test time augmentation (faster, but less accurate).",
+    )
+    parser.add_argument(
+        "--fold",
+        type=str,
+        default="all",
+        help="nnUNet fold(s) to use. Use --fold 0 for models/M1, which only ships fold_0.",
     )
     parser.add_argument(
         "--show_image",
@@ -155,39 +179,89 @@ def filter_lines(lines, degree_window=20, parallelism_count=0, parallelism_windo
     return parallel_lines
 
 
-def predict_mask_nnunet(image, dataset_name, model_folder):
+def resolve_device(device="auto"):
+    """Resolve the device to run inference on."""
+    if device != "auto":
+        return device
+    if torch.cuda.is_available():
+        return "cuda"
+    if torch.backends.mps.is_available():
+        return "mps"
+    return "cpu"
+
+
+def predict_mask_nnunet(
+    image, dataset_name, model_folder, device="auto", disable_tta=False, fold="all"
+):
     """Predict the mask using nnUNet."""
 
-    # Define temporary folders and paths
-    temp_folder_input = "data/temp_nnUNet_input"
-    temp_folder_output = "data/temp_nnUNet_output"
-    image_path_temp = os.path.join(temp_folder_input, "00000_temp_0000.png")
-    mask_path_temp = os.path.join(temp_folder_output, "00000_temp.png")
+    device_to_use = resolve_device(device)
+    print(
+        f"Running nnUNet on device {device_to_use} with TTA "
+        f"{'off' if disable_tta else 'on'} and fold {fold}."
+    )
 
     # Set env variabels (nnUNet needs them to be set)
     os.environ["nnUNet_results"] = os.path.join(model_folder, "nnUNet_results")
 
-    # Create temp folders and copy image
-    shutil.rmtree(temp_folder_input, ignore_errors=True)
-    shutil.rmtree(temp_folder_output, ignore_errors=True)
-    os.makedirs(temp_folder_input, exist_ok=True)
-    os.makedirs(temp_folder_output, exist_ok=True)
-    write_png(image, image_path_temp)
+    # Define temporary folders and paths
+    temp_folder_base = tempfile.mkdtemp(prefix="nnUNet_")
+    try:
+        temp_folder_input = os.path.join(temp_folder_base, "input")
+        temp_folder_output = os.path.join(temp_folder_base, "output")
+        image_path_temp = os.path.join(temp_folder_input, "00000_temp_0000.png")
+        mask_path_temp = os.path.join(temp_folder_output, "00000_temp.png")
 
-    # Run inference
-    if torch.cuda.is_available():
-        command_run = f"nnUNetv2_predict -d {dataset_name} -i {temp_folder_input} -o {temp_folder_output} -f all -tr nnUNetTrainer -c 2d -p nnUNetPlans"
-    else:
-        print("CUDA not available. Running on CPU.")
-        command_run = f"nnUNetv2_predict -d {dataset_name} -i {temp_folder_input} -o {temp_folder_output} -f all -tr nnUNetTrainer -c 2d -p nnUNetPlans -device cpu --verbose"
-    subprocess.run(command_run, shell=True)
+        # Create temp folders and copy image
+        os.makedirs(temp_folder_input, exist_ok=True)
+        os.makedirs(temp_folder_output, exist_ok=True)
+        write_png(image, image_path_temp)
 
-    # Get masks
-    mask = read_image(mask_path_temp)
+        # nnUNet also wants these to be set, but does not use them for inference.
+        # Only set them for the subprocess and only if the user did not set them.
+        env = os.environ.copy()
+        env.setdefault("nnUNet_raw", temp_folder_base)
+        env.setdefault("nnUNet_preprocessed", temp_folder_base)
 
-    # Delete all temporary folders and files
-    shutil.rmtree(temp_folder_input, ignore_errors=True)
-    shutil.rmtree(temp_folder_output, ignore_errors=True)
+        # Run inference
+        command_run = [
+            "nnUNetv2_predict",
+            "-d",
+            str(dataset_name),
+            "-i",
+            temp_folder_input,
+            "-o",
+            temp_folder_output,
+            "-f",
+            str(fold),
+            "-tr",
+            "nnUNetTrainer",
+            "-c",
+            "2d",
+            "-p",
+            "nnUNetPlans",
+            "-device",
+            device_to_use,
+        ]
+        if disable_tta:
+            command_run.append("--disable_tta")
+        try:
+            subprocess.run(command_run, check=True, env=env)
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"nnUNet inference failed with return code {e.returncode}: "
+                f"{' '.join(command_run)}"
+            )
+
+        # Get masks
+        if not os.path.exists(mask_path_temp):
+            raise RuntimeError(
+                f"nnUNet did not produce the expected mask file {mask_path_temp}."
+            )
+        mask = read_image(mask_path_temp)
+    finally:
+        # Delete all temporary folders and files
+        shutil.rmtree(temp_folder_base, ignore_errors=True)
 
     return mask
 
@@ -349,10 +423,22 @@ def run(args):
 
         # Rotate
         rot_angle = get_rotation_angle(image.permute(1, 2, 0).numpy().astype(np.uint8))
+        if rot_angle is None or np.isnan(rot_angle):
+            print(
+                f"No rotation angle found for record {record}, using 0.0 degrees instead."
+            )
+            rot_angle = 0.0
         image_rotated = rotate(image, rot_angle)
 
         # Segment
-        mask_to_use = predict_mask_nnunet(image_rotated, DATASET_NAME, args.model_folder)
+        mask_to_use = predict_mask_nnunet(
+            image_rotated,
+            DATASET_NAME,
+            args.model_folder,
+            device=args.device,
+            disable_tta=args.disable_tta,
+            fold=args.fold,
+        )
 
         # Use mask to cut into single, binary masks
         signal_masks_cropped, signal_positions_cropped, _ = cut_binary(
@@ -369,7 +455,6 @@ def run(args):
         )
         sec_per_pixel = 2.5 / x_pixel_list_below_2x_median_mean
         mm_per_pixel = 25 * sec_per_pixel
-        sec_per_pixel = mm_per_pixel / 25
         mV_per_pixel = mm_per_pixel / 10
         signals_predicted = {}
         for lead, mask in signal_masks_cropped.items():
