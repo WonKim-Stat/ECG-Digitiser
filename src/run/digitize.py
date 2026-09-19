@@ -144,12 +144,12 @@ def get_parser():
         "--grid_origin",
         type=str,
         choices=["masks", "lines"],
-        default="masks",
+        default="lines",
         help=(
-            "Only for --time_mapping grid. masks = origin and pitch of the column grid "
-            "from the mask edges; lines = refined to sub pixel accuracy with the printed "
-            "1 mm grid lines of the image (assumes that the first column starts on a "
-            "grid line), masks if the image shows no such lines."
+            "Only for --time_mapping grid. lines = origin and pitch of the column grid "
+            "refined to sub pixel accuracy with the printed 1 mm grid lines of the image "
+            "(assumes that the first column starts on a grid line), falls back to masks "
+            "if the image shows no such lines; masks = from the mask edges only."
         ),
     )
     parser.add_argument(

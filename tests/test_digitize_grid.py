@@ -602,9 +602,9 @@ def test_parser_baseline():
 
 def test_parser_grid_origin():
     parser = digitize.get_parser()
-    assert parser.parse_args(["-d", "data", "-o", "out"]).grid_origin == "masks"
-    args = parser.parse_args(["-d", "data", "-o", "out", "--grid_origin", "lines"])
-    assert args.grid_origin == "lines"
+    assert parser.parse_args(["-d", "data", "-o", "out"]).grid_origin == "lines"
+    args = parser.parse_args(["-d", "data", "-o", "out", "--grid_origin", "masks"])
+    assert args.grid_origin == "masks"
 
     with pytest.raises(SystemExit):
         parser.parse_args(["-d", "data", "-o", "out", "--grid_origin", "nope"])
