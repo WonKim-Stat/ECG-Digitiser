@@ -110,6 +110,28 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--time_mapping",
+        type=str,
+        choices=["bbox", "grid"],
+        default="bbox",
+        help=(
+            "bbox = legacy, stretch the bounding box of every lead to its length; "
+            "grid = sample all leads on one shared column grid (standard 3x4 layout "
+            "with rhythm strip only, falls back to bbox otherwise)."
+        ),
+    )
+    parser.add_argument(
+        "--grid_pitch",
+        type=str,
+        choices=["page", "fit"],
+        default="page",
+        help=(
+            "Only for --time_mapping grid. page = column pitch from the page height "
+            "(same page assumption as Y_SHIFT_RATIO), checked against the fitted one; "
+            "fit = pitch from the least squares fit of the column edges."
+        ),
+    )
+    parser.add_argument(
         "--save_mask",
         action="store_true",
         default=False,
@@ -385,6 +407,103 @@ def vectorise(
     predicted_signal_sampled = resampled_data.view(-1)
 
     return predicted_signal_sampled
+
+
+# Width of one 2.5 s column relative to the page height (62.5 mm of 215.9 mm).
+PAGE_PITCH_RATIO = 25 * SHORT_SIGNAL_LENGTH_SEC / 10 / 21.59
+# Maximal relative deviation between the page pitch and the fitted pitch.
+PAGE_PITCH_TOLERANCE = 0.005
+# Maximal residual of a column edge to the fitted grid, relative to the pitch.
+GRID_RESIDUAL_TOLERANCE = 0.02
+NUM_COLUMNS = int(LONG_SIGNAL_LENGTH_SEC / SHORT_SIGNAL_LENGTH_SEC)
+
+
+def fit_column_grid(signal_masks, signal_positions, image_height, pitch="page"):
+    """Fit the shared column grid of the standard 3x4 layout with rhythm strip.
+
+    Returns (g0, P, long_leads, reason). g0 is the x position of the left edge of
+    the first column, P the width of one 2.5 s column in pixels. If the layout is
+    not the expected one, g0 and P are None and reason says why.
+    """
+    widths = {
+        lead: mask.shape[2] for lead, mask in signal_masks.items() if mask is not None
+    }
+    if not widths:
+        return None, None, [], "no leads found"
+    median_width = np.median(list(widths.values()))
+    long_leads = [lead for lead, width in widths.items() if width >= 2 * median_width]
+    if not long_leads:
+        return None, None, [], "no rhythm strip found"
+    # Two merged short leads must not pass as a rhythm strip.
+    if any(widths[lead] < (NUM_COLUMNS - 0.5) * median_width for lead in long_leads):
+        return None, None, long_leads, "rhythm strip does not span all columns"
+
+    # Column starts = min x1 per column, column ends = max x-end per column.
+    # The rhythm strip gives the start of the first and the end of the last column.
+    starts, ends = {}, {}
+    for lead, width in widths.items():
+        x1 = signal_positions[lead]["x1"]
+        if lead in long_leads:
+            first_column, last_column = 0, NUM_COLUMNS - 1
+        elif lead in STANDARD_LEAD_OFFSETS_SEC:
+            first_column = int(STANDARD_LEAD_OFFSETS_SEC[lead] / SHORT_SIGNAL_LENGTH_SEC)
+            last_column = first_column
+        else:
+            return None, None, long_leads, f"unknown lead {lead}"
+        starts[first_column] = min(starts.get(first_column, np.inf), x1)
+        ends[last_column] = max(ends.get(last_column, -np.inf), x1 + width)
+    short_columns = {
+        int(STANDARD_LEAD_OFFSETS_SEC[lead] / SHORT_SIGNAL_LENGTH_SEC)
+        for lead in widths
+        if lead not in long_leads
+    }
+    if short_columns != set(range(NUM_COLUMNS)):
+        return None, None, long_leads, "not every column has a short lead"
+
+    # Pixel c covers [c, c+1), so starts and ends are both column boundaries.
+    boundaries = np.array(list(starts.keys()) + [c + 1 for c in ends.keys()], float)
+    edges = np.array(list(starts.values()) + list(ends.values()), float)
+    P_fit, g0 = np.polyfit(boundaries, edges, 1)
+    P = P_fit
+    if pitch == "page":
+        P_page = image_height * PAGE_PITCH_RATIO
+        if abs(P_fit - P_page) <= PAGE_PITCH_TOLERANCE * P_page:
+            # With a fixed pitch no single edge pixel moves the origin by more than 1/n.
+            P = P_page
+            g0 = np.mean(edges - boundaries * P)
+        else:
+            print(
+                f"Page pitch {P_page:.2f} px does not match the fitted pitch "
+                f"{P_fit:.2f} px, using the fitted one."
+            )
+    residual = np.max(np.abs(edges - (g0 + boundaries * P)))
+    if residual > GRID_RESIDUAL_TOLERANCE * P:
+        return None, None, long_leads, f"column edges are {residual:.1f} px off the grid"
+
+    return float(g0), float(P), long_leads, ""
+
+
+def vectorise_grid(image_rotated, mask, position, g0, P, column, is_long, y_shift_ratio, lead):
+    """Vectorise one lead by sampling it on the shared column grid."""
+    total_seconds = LONG_SIGNAL_LENGTH_SEC if is_long else SHORT_SIGNAL_LENGTH_SEC
+    y_shift_ratio_ = y_shift_ratio["full"] if is_long else y_shift_ratio[lead]
+    values_needed = int(total_seconds * FREQUENCY)
+    samples_per_column = SHORT_SIGNAL_LENGTH_SEC * FREQUENCY
+    mV_per_pixel = 25 * SHORT_SIGNAL_LENGTH_SEC / P / 10
+
+    # Mean row of the mask in every column, in image coordinates.
+    binary = mask[0].numpy() > 0
+    count = binary.sum(axis=0)
+    filled = np.flatnonzero(count > 0)
+    rows = np.arange(binary.shape[0])[:, None]
+    profile = position["y1"] + (binary * rows).sum(axis=0)[filled] / count[filled]
+
+    # Pixel c covers [c, c+1), so its centre is at c + 0.5. np.interp holds the edges.
+    x = g0 + column * P + np.arange(values_needed) * P / samples_per_column - 0.5
+    sampled = np.interp(x, position["x1"] + filled, profile)
+    baseline = (1 - y_shift_ratio_) * image_rotated.shape[1]
+
+    return torch.from_numpy(((baseline - sampled) * mV_per_pixel).astype(np.float32))
 
 
 def compute_lead_offsets(signal_positions, signal_lengths, sec_per_pixel, record=""):
@@ -678,11 +797,44 @@ def run(args):
             [v for v in x_pixel_list if v < 2 * x_pixel_list_median]
         )
         sec_per_pixel = 2.5 / x_pixel_list_below_2x_median_mean
+        g0, P = None, None
+        if args.time_mapping == "grid":
+            g0, P, long_leads, reason = fit_column_grid(
+                signal_masks_cropped,
+                signal_positions_cropped,
+                image_rotated.shape[1],
+                args.grid_pitch,
+            )
+            if g0 is None:
+                print(
+                    f"WARNING: no column grid for record {record} ({reason}), "
+                    f"falling back to --time_mapping bbox."
+                )
+            else:
+                sec_per_pixel = SHORT_SIGNAL_LENGTH_SEC / P
+                if args.verbose:
+                    print(f"Column grid for record {record}: g0 {g0:.2f} px, P {P:.2f} px")
         mm_per_pixel = 25 * sec_per_pixel
         mV_per_pixel = mm_per_pixel / 10
         signals_predicted = {}
         for lead, mask in signal_masks_cropped.items():
-            if mask is not None:
+            if mask is None:
+                signals_predicted[lead] = None
+            elif g0 is not None:
+                signals_predicted[lead] = vectorise_grid(
+                    image_rotated,
+                    mask,
+                    signal_positions_cropped[lead],
+                    g0,
+                    P,
+                    0
+                    if lead in long_leads
+                    else int(STANDARD_LEAD_OFFSETS_SEC[lead] / SHORT_SIGNAL_LENGTH_SEC),
+                    lead in long_leads,
+                    Y_SHIFT_RATIO,
+                    lead,
+                )
+            else:
                 signals_predicted[lead] = vectorise(
                     image_rotated,
                     mask,
@@ -692,8 +844,6 @@ def run(args):
                     Y_SHIFT_RATIO,
                     lead,
                 )
-            else:
-                signals_predicted[lead] = None
 
         # Save Challenge outputs.
         signals = {
