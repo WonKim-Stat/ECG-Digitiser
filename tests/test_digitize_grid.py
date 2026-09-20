@@ -118,6 +118,14 @@ def shave_start(label, lead, n_pixels):
     return label
 
 
+def punch_gap(label, lead, x, width=12):
+    """Erase width pixel columns of a lead from the label mask, from column x on."""
+    label = label.copy()
+    is_lead = label == LEAD_LABEL_MAPPING[lead]
+    label[:, x : x + width][is_lead[:, x : x + width]] = 0
+    return label
+
+
 def extend_end(label, lead, x_end):
     """Continue a lead's trace to the right, up to pixel column x_end exclusive."""
     label = label.copy()
@@ -133,6 +141,15 @@ def extend_start(label, lead, x_start):
     value = LEAD_LABEL_MAPPING[lead]
     first = np.flatnonzero((label == value).any(axis=0))[0]
     label[np.flatnonzero(label[:, first] == value)[0], x_start:first] = value
+    return label
+
+
+def add_stray_blob(label, lead, x):
+    """Label a single pixel of a lead in column x, as the model does at a page edge."""
+    label = label.copy()
+    value = LEAD_LABEL_MAPPING[lead]
+    last = np.flatnonzero((label == value).any(axis=0))[-1]
+    label[np.flatnonzero(label[:, last] == value)[-1], x] = value
     return label
 
 
@@ -664,6 +681,80 @@ def test_max_mask_gap_counts_the_empty_columns():
     assert digitize.max_mask_gap(masks["V5"]) == 12
 
 
+def _column_window(column, n_columns=1, g0=G0_TRUE, pitch=P_TRUE):
+    """The image x range the grid sampling of a lead of that column reads."""
+    return g0 + column * pitch, g0 + (column + n_columns) * pitch
+
+
+def test_max_mask_gap_ignores_a_blob_outside_the_window():
+    masks, positions, _ = cut(add_stray_blob(make_label_mask(), "V5", WIDTH - 1))
+    window = _column_window(SHORT_COLUMNS["V5"])
+    x1 = positions["V5"]["x1"]
+
+    # Without a window the empty stretch up to the blob passes as a gap in the lead.
+    assert digitize.max_mask_gap(masks["V5"]) > 100
+    assert digitize.max_mask_gap(masks["V5"], x1, window) == 0
+
+
+def test_max_mask_gap_still_counts_a_gap_inside_the_window():
+    label = make_label_mask()
+    first = np.flatnonzero((label == LEAD_LABEL_MAPPING["V5"]).any(axis=0))[0]
+    label = add_stray_blob(punch_gap(label, "V5", first + 100), "V5", WIDTH - 1)
+    masks, positions, _ = cut(label)
+    window = _column_window(SHORT_COLUMNS["V5"])
+
+    assert digitize.max_mask_gap(masks["V5"], positions["V5"]["x1"], window) == 12
+
+
+def test_max_mask_gap_counts_an_early_end_bridged_towards_a_blob():
+    # V5 stops at pixel column 2000 and is interpolated on towards the blob, so the
+    # empty columns up to the end of its window at 2086.5 are read after all.
+    label = punch_gap(make_label_mask(), "V5", 2001, width=86)
+    masks, positions, _ = cut(add_stray_blob(label, "V5", WIDTH - 1))
+    window = _column_window(SHORT_COLUMNS["V5"])
+
+    assert digitize.max_mask_gap(masks["V5"]) == 198
+    assert digitize.max_mask_gap(masks["V5"], positions["V5"]["x1"], window) == 85
+
+
+def test_max_mask_gap_with_a_window_beside_the_lead():
+    label = make_label_mask()
+    first = np.flatnonzero((label == LEAD_LABEL_MAPPING["V5"]).any(axis=0))[0]
+    masks, positions, _ = cut(punch_gap(label, "V5", first + 100))
+    # The gap of V5 is in the last column of the page, none of it in the first.
+    window = _column_window(0)
+
+    assert digitize.max_mask_gap(masks["V5"], positions["V5"]["x1"], window) == 0
+
+
+def test_max_mask_gap_spans_every_column_of_the_long_lead():
+    label = make_label_mask()
+    first = np.flatnonzero((label == LEAD_LABEL_MAPPING[RHYTHM_LEAD]).any(axis=0))[0]
+    label = punch_gap(label, RHYTHM_LEAD, first + int(3 * P_TRUE) + 100)
+    masks, positions, _ = cut(label)
+    x1 = positions[RHYTHM_LEAD]["x1"]
+
+    # The gap is in the last column, which only the four column window covers.
+    assert digitize.max_mask_gap(masks[RHYTHM_LEAD], x1, _column_window(0, 4)) == 12
+    assert digitize.max_mask_gap(masks[RHYTHM_LEAD], x1, _column_window(0)) == 0
+
+
+def test_mask_overhang_measures_the_pixels_outside_the_window():
+    label = make_label_mask()
+    window = _column_window(SHORT_COLUMNS["V5"])
+    masks, positions, _ = cut(label)
+    assert digitize.mask_overhang(masks["V5"], positions["V5"]["x1"], window) == 0.0
+
+    # Pixel c covers [c, c + 1), so a blob in column c reaches out to c + 0.5.
+    masks, positions, _ = cut(add_stray_blob(label, "V5", WIDTH - 1))
+    overhang = digitize.mask_overhang(masks["V5"], positions["V5"]["x1"], window)
+    assert overhang == pytest.approx(WIDTH - 0.5 - window[1])
+
+    masks, positions, _ = cut(add_stray_blob(label, "V5", 5))
+    overhang = digitize.mask_overhang(masks["V5"], positions["V5"]["x1"], window)
+    assert overhang == pytest.approx(window[0] - 5.5)
+
+
 # ------------------------------------------------------------------- end to end
 def _write_case(tmp_path, name, label, image=None):
     data_folder = tmp_path / f"{name}_data"
@@ -682,7 +773,10 @@ def _output_folder(tmp_path, name, time_mapping, baseline=None, grid_origin=None
     return tmp_path / f"{name}_{suffix}_out"
 
 
-def _run(tmp_path, name, label, time_mapping, baseline=None, image=None, grid_origin=None):
+def _run(
+    tmp_path, name, label, time_mapping, baseline=None, image=None, grid_origin=None,
+    verbose=False,
+):
     data_folder, mask_folder = _write_case(tmp_path, name, label, image)
     output_folder = _output_folder(tmp_path, name, time_mapping, baseline, grid_origin)
     argv = [
@@ -690,7 +784,7 @@ def _run(tmp_path, name, label, time_mapping, baseline=None, image=None, grid_or
         "-o", str(output_folder),
         "--mask_folder", str(mask_folder),
         "--time_mapping", time_mapping,
-        "--no-verbose",
+        "--verbose" if verbose else "--no-verbose",
     ]
     if baseline is not None:
         argv += ["--baseline", baseline]
@@ -744,6 +838,22 @@ def test_run_reports_a_gap_in_a_lead(tmp_path, capsys):
     _run(tmp_path, "gap", label, "grid")
     out = capsys.readouterr().out
     assert "lead V5 of record gap has a gap of 12 px" in out
+
+
+def test_run_does_not_report_a_blob_outside_the_column_as_a_gap(tmp_path, capsys):
+    label = make_label_mask()
+    blob = _run(
+        tmp_path, "blob", add_stray_blob(label, "V4", WIDTH - 1), "grid", verbose=True
+    )
+    out = capsys.readouterr().out
+    assert "has a gap of" not in out
+    assert "Lead V4 of record blob has mask pixels up to 113 px outside" in out
+
+    # The blob is never sampled, so the lead comes out as it does without it.
+    clean = _run(tmp_path, "noblob", label, "grid")
+    channel = blob.p_signal[:, blob.sig_name.index("V4")]
+    expected = clean.p_signal[:, clean.sig_name.index("V4")]
+    assert np.array_equal(channel, expected, equal_nan=True)
 
 
 def _lead_median(record, lead):

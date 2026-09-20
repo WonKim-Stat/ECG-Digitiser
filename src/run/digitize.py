@@ -1044,12 +1044,35 @@ def compute_grid_lead_offsets(signal_positions, signal_lengths, long_leads, g0, 
     return offsets
 
 
-def max_mask_gap(mask):
-    """Longest run of empty columns inside the cropped mask of one lead, in pixels."""
+def max_mask_gap(mask, x1=0, window=None):
+    """Longest run of empty columns inside the cropped mask of one lead, in pixels.
+
+    x1 is the image x of the first column of the mask. With a window (start, end)
+    in image coordinates only the part of a run inside the window counts, as that
+    is all the grid sampling reads: a stray label beside the lead is no gap by
+    itself, but the sampling does interpolate over the empty columns leading to it.
+    """
     filled = np.flatnonzero(mask[0].numpy().sum(axis=0) > 0)
     if filled.size < 2:
         return 0
-    return int(np.max(np.diff(filled)) - 1)
+    if window is None:
+        return int(np.max(np.diff(filled)) - 1)
+    # Pixel c covers [c, c+1), so an empty run reaches from the right edge of the
+    # filled column before it to the left edge of the one after, and of that only
+    # the whole pixels inside the window are sampled.
+    overlaps = np.minimum(x1 + filled[1:], window[1]) - np.maximum(
+        x1 + filled[:-1] + 1, window[0]
+    )
+    return int(max(np.max(overlaps), 0.0))
+
+
+def mask_overhang(mask, x1, window):
+    """Largest distance in pixels of a filled column beyond the window of a lead."""
+    filled = np.flatnonzero(mask[0].numpy().sum(axis=0) > 0)
+    if filled.size == 0:
+        return 0.0
+    centres = x1 + filled + 0.5
+    return float(max(window[0] - centres[0], centres[-1] - window[1], 0.0))
 
 
 def compute_lead_offsets(signal_positions, signal_lengths, sec_per_pixel, record=""):
@@ -1406,22 +1429,38 @@ def run(args):
             if mask is None:
                 signals_predicted[lead] = None
             elif g0 is not None:
-                # The grid sampling interpolates over gaps, so report them.
-                gap = max_mask_gap(mask)
+                # The rhythm strip spans all columns, a short lead only its own.
+                if lead in long_leads:
+                    column, n_columns = 0, NUM_COLUMNS
+                else:
+                    column = int(
+                        STANDARD_LEAD_OFFSETS_SEC[lead] / SHORT_SIGNAL_LENGTH_SEC
+                    )
+                    n_columns = 1
+                window = (g0 + column * P, g0 + (column + n_columns) * P)
+                x1 = signal_positions_cropped[lead]["x1"]
+                # The grid sampling interpolates over gaps, so report them, as far as
+                # they reach into the window it reads the lead over.
+                gap = max_mask_gap(mask, x1, window)
                 if gap > GRID_GAP_TOLERANCE * P:
                     print(
                         f"WARNING: lead {lead} of record {record} has a gap of "
                         f"{gap} px in its mask, interpolated linearly."
                     )
+                if args.verbose:
+                    overhang = mask_overhang(mask, x1, window)
+                    if overhang > GRID_RESIDUAL_TOLERANCE * P:
+                        print(
+                            f"Lead {lead} of record {record} has mask pixels up to "
+                            f"{overhang:.0f} px outside its column, ignored."
+                        )
                 signals_predicted[lead] = vectorise_grid(
                     image_rotated,
                     mask,
                     signal_positions_cropped[lead],
                     g0,
                     P,
-                    0
-                    if lead in long_leads
-                    else int(STANDARD_LEAD_OFFSETS_SEC[lead] / SHORT_SIGNAL_LENGTH_SEC),
+                    column,
                     lead in long_leads,
                     Y_SHIFT_RATIO,
                     lead,
