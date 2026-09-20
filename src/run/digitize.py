@@ -175,6 +175,17 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--rotation",
+        type=str,
+        choices=["hough", "lines"],
+        default="hough",
+        help=(
+            "hough = angle from the Hough transform of the page, in whole degrees; "
+            "lines = a 0.1 degree Hough transform refined with the phase drift of the "
+            "printed 1 mm grid lines, which resolves fractions of a degree."
+        ),
+    )
+    parser.add_argument(
         "--save_mask",
         action="store_true",
         default=False,
@@ -219,6 +230,50 @@ def get_rotation_angle(np_image):
     return rot_angle
 
 
+# Theta step of the fine Hough transform, in degrees. A tenth of a degree is far
+# below the half degree a page has to be straightened to for the grid line phase.
+ROTATION_HOUGH_THETA_STEP_DEG = 0.1
+# Vote threshold of the fine Hough transform, relative to the image width. The 1200
+# votes of get_rotation_angle are 0.55 of the width of a 2200 px generator page.
+ROTATION_HOUGH_THRESHOLD_RATIO = 1200 / 2200
+# Factor and floor of the stepwise lowering of the threshold. A page with faint or
+# short lines needs fewer votes, but a floor keeps noise from passing as a line.
+ROTATION_HOUGH_THRESHOLD_STEP = 0.8
+ROTATION_HOUGH_THRESHOLD_FLOOR = 0.25
+# Lines further than this from the horizontal are dropped, as in get_rotation_angle.
+# The accumulator gets one degree more so that its border never reaches the window.
+ROTATION_HOUGH_DEGREE_WINDOW = 30
+
+
+def get_rotation_angle_fine(np_image):
+    """Get the rotation angle of the image with a tenth of a degree resolution.
+
+    Same lines as get_rotation_angle, but the theta step is ten times finer and the
+    vote threshold scales with the image width instead of being the absolute 1200 of
+    a 2200 px page. A fine theta step splits a thick line into many near duplicate
+    hits, which the median over the filtered lines takes care of.
+    """
+    threshold = ROTATION_HOUGH_THRESHOLD_RATIO * np_image.shape[1]
+    floor = ROTATION_HOUGH_THRESHOLD_FLOOR * np_image.shape[1]
+    while threshold >= floor:
+        lines = get_lines(
+            np_image,
+            threshold_HoughLines=int(round(threshold)),
+            theta_resolution=np.deg2rad(ROTATION_HOUGH_THETA_STEP_DEG),
+            theta_window=np.deg2rad(ROTATION_HOUGH_DEGREE_WINDOW + 1),
+        )
+        filtered_lines = filter_lines(
+            lines,
+            degree_window=ROTATION_HOUGH_DEGREE_WINDOW,
+            parallelism_count=3,
+            parallelism_window=2,
+        )
+        if filtered_lines is not None:
+            return get_median_degrees(filtered_lines)
+        threshold *= ROTATION_HOUGH_THRESHOLD_STEP
+    return np.nan
+
+
 def get_median_degrees(lines):
     """Get the median angle of the lines."""
     lines = lines[:, 0, :]
@@ -233,7 +288,13 @@ def is_within_x_degrees_of_horizontal(theta, degree_window):
     return deviation_from_horizontal < degree_window
 
 
-def get_lines(np_image, threshold_HoughLines=1380, rho_resolution=1):
+def get_lines(
+    np_image,
+    threshold_HoughLines=1380,
+    rho_resolution=1,
+    theta_resolution=np.pi / 180,
+    theta_window=None,
+):
     """Get the lines in the image."""
     # Convert the image to a grayscale NumPy array
     image = cv2.cvtColor(np_image, cv2.COLOR_RGB2BGR)
@@ -243,9 +304,24 @@ def get_lines(np_image, threshold_HoughLines=1380, rho_resolution=1):
     edges = cv2.Canny(gray_image, 50, 150, apertureSize=3)
 
     # Use HoughLines to find lines in the edge-detected image
-    lines = cv2.HoughLines(
-        edges, rho_resolution, np.pi / 180, threshold_HoughLines, None, 0, 0
-    )
+    if theta_window is None:
+        lines = cv2.HoughLines(
+            edges, rho_resolution, theta_resolution, threshold_HoughLines, None, 0, 0
+        )
+    else:
+        # Accumulating only around the horizontal is what makes a fine theta step
+        # affordable, and the lines it leaves out are dropped by filter_lines anyway.
+        lines = cv2.HoughLines(
+            edges,
+            rho_resolution,
+            theta_resolution,
+            threshold_HoughLines,
+            None,
+            0,
+            0,
+            np.pi / 2 - theta_window,
+            np.pi / 2 + theta_window,
+        )
 
     return lines
 
@@ -580,6 +656,25 @@ GRID_LINE_SHIFT_TOLERANCE = 0.004
 GRID_LINE_SNAP_OFFSET = 0.5
 
 
+def _darkness(image):
+    """Darkness of a CHW image, 0 = white and 255 = black, as the grid lines show up."""
+    array = image.numpy() if torch.is_tensor(image) else image
+    return 255.0 - array.min(axis=0).astype(float)
+
+
+def _band_profiles(darkness, band_height=GRID_LINE_BAND_HEIGHT):
+    """Median darkness profile of every band of rows, plus the centre row of each.
+
+    The median over a band drops the traces and the text, so only the printed grid
+    lines are left. Returns profiles of shape [bands, width] and the band centres.
+    """
+    starts = np.arange(0, darkness.shape[0] - band_height + 1, band_height)
+    profiles = np.array(
+        [np.median(darkness[start : start + band_height], axis=0) for start in starts]
+    )
+    return profiles, starts + band_height / 2
+
+
 def _grid_line_comb(profiles, period):
     """Complex amplitude of the comb with this period in every band profile."""
     width = profiles.shape[1]
@@ -600,21 +695,11 @@ def refine_grid_from_lines(image_rotated, g0, P, snap_offset=GRID_LINE_SNAP_OFFS
     Returns (g0, P, info). Without usable grid lines g0 and P come back unchanged and
     info["reason"] says why.
     """
-    image = image_rotated.numpy() if torch.is_tensor(image_rotated) else image_rotated
-    darkness = 255.0 - image.min(axis=0).astype(float)
-    band_starts = range(
-        0, darkness.shape[0] - GRID_LINE_BAND_HEIGHT + 1, GRID_LINE_BAND_HEIGHT
-    )
+    profiles, _ = _band_profiles(_darkness(image_rotated))
     info = {"contrast": float("nan"), "shift": float("nan"), "reason": ""}
-    if len(band_starts) == 0:
+    if profiles.shape[0] == 0:
         info["reason"] = "image too small for the grid line profile"
         return g0, P, info
-    profiles = np.array(
-        [
-            np.median(darkness[start : start + GRID_LINE_BAND_HEIGHT], axis=0)
-            for start in band_starts
-        ]
-    )
 
     def amplitude(period):
         return np.abs(_grid_line_comb(profiles, period).sum())
@@ -652,6 +737,211 @@ def refine_grid_from_lines(image_rotated, g0, P, snap_offset=GRID_LINE_SNAP_OFFS
         )
         return g0, P, info
     return float(g0_lines), float(P_lines), info
+
+
+# Period range of the printed 1 mm grid lines in pixels, 1 mm at about 90 to 430 dpi.
+# The pitch of the masks is not known yet, so the period is searched in the image.
+GRID_LINE_PERIOD_RANGE = (3.5, 17.0)
+# Zero padding of the profile spectrum, which sets the resolution of the period.
+GRID_LINE_PERIOD_PADDING = 8
+# Bands whose comb amplitude is below this fraction of the median are left out of the
+# slope fit: the borders and the black corners of a rotated page carry no grid lines.
+GRID_LINE_MIN_BAND_AMPLITUDE = 0.3
+# Bands further than this many robust sigmas off the fitted line are dropped once.
+GRID_LINE_OUTLIER_SIGMA = 3.0
+# Floor of that sigma in pixels, so that a near perfect fit keeps all its bands.
+GRID_LINE_SIGMA_FLOOR = 0.05
+# Fewest bands the slope fit needs, and the largest residual it accepts relative to
+# the period. Above it the phase unwrapping is unreliable and the slope meaningless.
+GRID_LINE_MIN_SLOPE_BANDS = 5
+GRID_LINE_MAX_SLOPE_RESIDUAL = 0.1
+
+
+def _grid_line_period(profiles):
+    """Period in pixels of the strongest comb in the band profiles, NaN if none.
+
+    The pitch of the masks is not known when the page is straightened, so the period
+    comes from the profiles themselves. Rotation moves the comb phase from band to
+    band, so the power is summed over the bands, not the complex spectra. Picking a
+    harmonic of the 1 mm comb does not change the phase slope, only its unit.
+    """
+    width = profiles.shape[1]
+    centred = profiles - profiles.mean(axis=1, keepdims=True)
+    padded = GRID_LINE_PERIOD_PADDING * width
+    spectrum = np.fft.rfft(centred * np.hanning(width), n=padded)
+    power = (np.abs(spectrum) ** 2).sum(axis=0)
+    frequencies = np.fft.rfftfreq(padded)
+    low, high = GRID_LINE_PERIOD_RANGE
+    inside = np.flatnonzero((frequencies >= 1 / high) & (frequencies <= 1 / low))
+    if inside.size == 0 or not np.any(power[inside] > 0):
+        return float("nan")
+    best = int(inside[np.argmax(power[inside])])
+    frequency = frequencies[best]
+    if 0 < best < power.size - 1:
+        left, peak, right = power[best - 1 : best + 2]
+        curvature = left - 2 * peak + right
+        if curvature < 0:
+            frequency += (
+                0.5 * (left - right) / curvature * (frequencies[1] - frequencies[0])
+            )
+    return float(1 / frequency)
+
+
+def grid_line_slope(image, axis=0):
+    """Rotation angle of the page from the phase drift of the printed grid lines.
+
+    With the page rotated, the vertical grid lines cross the bands of rows at a
+    slight angle, so the phase of the grid line comb drifts linearly with the band.
+    The slope of that drift resolves far smaller angles than the Hough transform.
+    axis=0 uses the vertical lines over bands of rows, axis=1 the horizontal lines
+    over bands of columns; both return the angle that rotate() has to undo the tilt.
+    Returns an info dict whose "angle" is NaN when "reason" says why it is unusable.
+    """
+    darkness = _darkness(image)
+    if axis == 1:
+        darkness = darkness.T
+    profiles, centres = _band_profiles(darkness)
+    info = {
+        "angle": float("nan"),
+        "period": float("nan"),
+        "contrast": float("nan"),
+        "residual": float("nan"),
+        "bands": 0,
+        "reason": "",
+    }
+    if profiles.shape[0] < GRID_LINE_MIN_SLOPE_BANDS:
+        info["reason"] = "image too small for the grid line profile"
+        return info
+
+    period = _grid_line_period(profiles)
+    if not np.isfinite(period):
+        info["reason"] = "no grid line period found"
+        return info
+    info["period"] = period
+
+    def amplitude(candidate):
+        # Non-coherent sum: the bands of a rotated page have different phases.
+        return np.abs(_grid_line_comb(profiles, candidate)).sum()
+
+    background = np.mean([amplitude(period * f) for f in (0.93, 0.96, 1.04, 1.07)])
+    comb = _grid_line_comb(profiles, period)
+    info["contrast"] = float(np.abs(comb).sum() / max(background, 1e-9))
+    if info["contrast"] < GRID_LINE_MIN_CONTRAST:
+        info["reason"] = f"no grid lines found (contrast {info['contrast']:.1f})"
+        return info
+
+    # Position of the comb in every band, unwrapped so that it drifts continuously.
+    # A band without grid lines has a random phase, so it must not take part in the
+    # unwrapping, or every band after it ends up a whole period off.
+    weights = np.abs(comb)
+    keep = weights >= GRID_LINE_MIN_BAND_AMPLITUDE * np.median(weights)
+    positions = np.zeros(len(comb))
+    positions[keep] = -np.unwrap(np.angle(comb[keep])) / (2 * np.pi) * period
+    for step in range(2):
+        if np.count_nonzero(keep) < GRID_LINE_MIN_SLOPE_BANDS:
+            info["reason"] = f"only {np.count_nonzero(keep)} bands with grid lines"
+            return info
+        # np.polyfit weighs the residuals, so sqrt() makes the weight an amplitude.
+        slope, offset = np.polyfit(
+            centres[keep], positions[keep], 1, w=np.sqrt(weights[keep])
+        )
+        residuals = positions - (offset + slope * centres)
+        if step == 0:
+            # Drop the bands off the line once, then refit on the rest.
+            kept = residuals[keep]
+            sigma = max(
+                1.4826 * np.median(np.abs(kept - np.median(kept))),
+                GRID_LINE_SIGMA_FLOOR,
+            )
+            keep = keep & (np.abs(residuals) <= GRID_LINE_OUTLIER_SIGMA * sigma)
+    info["bands"] = int(np.count_nonzero(keep))
+    info["residual"] = float(np.sqrt(np.mean(residuals[keep] ** 2)))
+    if info["residual"] > GRID_LINE_MAX_SLOPE_RESIDUAL * period:
+        info["reason"] = f"grid line phase is {info['residual']:.2f} px off a line"
+        return info
+
+    # Verified on rotated synthetic pages: a page that rotate(image, +a) straightens
+    # has its vertical lines drifting left with the row and its horizontal ones down
+    # with the column, so axis 0 and axis 1 need opposite signs.
+    info["angle"] = float(np.degrees(np.arctan((-slope) if axis == 0 else slope)))
+    return info
+
+
+# Below this the refinement is within the noise, and an integer angle page keeps the
+# Hough angle it was rotated by, so masks saved with that angle stay valid.
+ROTATION_REFINE_MIN_DEG = 0.02
+# A refinement above this rotates the page again and measures a second time, because
+# the first measurement was made on a page that was still noticeably tilted.
+ROTATION_REFINE_REPEAT_DEG = 0.2
+# A refinement above this is not a residual tilt any more, so the coarse angle stands.
+ROTATION_REFINE_MAX_DEG = 3.0
+# Largest disagreement in degrees between a saved mask and the angle used now.
+ROTATION_MASK_ANGLE_TOLERANCE = 0.005
+
+
+def estimate_rotation(image, method="hough"):
+    """Get the rotation angle of a page image, as read by read_image ([3, H, W]).
+
+    method "hough" is the Hough transform in whole degrees, method "lines" refines a
+    tenth of a degree Hough transform with the phase drift of the printed grid lines.
+    Returns (rot_angle, info), rot_angle is NaN when no angle could be found.
+    """
+    np_image = image.permute(1, 2, 0).numpy().astype(np.uint8)
+    info = {
+        "coarse": float("nan"),
+        "deltas": [],
+        "period": float("nan"),
+        "contrast": float("nan"),
+        "residual": float("nan"),
+        "reason": "",
+    }
+    if method != "lines":
+        info["coarse"] = get_rotation_angle(np_image)
+        return info["coarse"], info
+
+    coarse = get_rotation_angle_fine(np_image)
+    info["coarse"] = coarse
+    # Without a coarse angle the grid lines still measure a tilt of a few degrees.
+    total = 0.0 if np.isnan(coarse) else coarse
+    for _ in range(2):
+        lines = grid_line_slope(rotate(image, total), axis=0)
+        info["period"] = lines["period"]
+        info["contrast"] = lines["contrast"]
+        info["residual"] = lines["residual"]
+        if lines["reason"]:
+            info["reason"] = lines["reason"]
+            return coarse, info
+        delta = lines["angle"]
+        if abs(delta) > ROTATION_REFINE_MAX_DEG:
+            info["reason"] = f"grid lines ask for {delta:+.2f} degrees"
+            return coarse, info
+        info["deltas"].append(float(delta))
+        total += delta
+        if abs(delta) <= ROTATION_REFINE_REPEAT_DEG:
+            break
+
+    total = round(total, 4)
+    if not np.isnan(coarse) and abs(total - coarse) < ROTATION_REFINE_MIN_DEG:
+        return coarse, info
+    return total, info
+
+
+def check_mask_rotation(mask_folder, record, rot_angle):
+    """Warn when a saved mask was predicted at another rotation angle than now."""
+    meta_path = os.path.join(mask_folder, f"{record}_mask.json")
+    if not os.path.exists(meta_path):
+        return float("nan")
+    with open(meta_path) as f:
+        saved = json.load(f).get("rot_angle")
+    if saved is None:
+        return float("nan")
+    if abs(saved - rot_angle) > ROTATION_MASK_ANGLE_TOLERANCE:
+        print(
+            f"WARNING: mask of record {record} was predicted at rot_angle "
+            f"{saved:.4f}, the image is now rotated by {rot_angle:.4f}; "
+            f"the mask does not fit."
+        )
+    return float(saved)
 
 
 def baseline_row(ratio, image_height, scale=1.0):
@@ -928,6 +1218,9 @@ def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
         "baseline_disagreement_px",
         "grid_line_contrast",
         "grid_line_shift_px",
+        "rotation_angle",
+        "rotation_coarse",
+        "rotation_residual_px",
     ]
     write_header = not os.path.exists(qc_path)
     with open(qc_path, "a", newline="") as f:
@@ -1016,7 +1309,22 @@ def run(args):
         image = image[:3]
 
         # Rotate
-        rot_angle = get_rotation_angle(image.permute(1, 2, 0).numpy().astype(np.uint8))
+        rot_angle, rotation_info = estimate_rotation(image, args.rotation)
+        if args.rotation == "lines":
+            if rotation_info["reason"]:
+                print(
+                    f"WARNING: grid lines not used for the rotation of record {record} "
+                    f"({rotation_info['reason']}), keeping the Hough angle."
+                )
+            if args.verbose:
+                deltas = ", ".join(f"{d:+.3f}" for d in rotation_info["deltas"])
+                print(
+                    f"Rotation for record {record}: {rot_angle} deg, coarse "
+                    f"{rotation_info['coarse']} deg, deltas [{deltas}], "
+                    f"period {rotation_info['period']:.2f} px, "
+                    f"contrast {rotation_info['contrast']:.1f}, "
+                    f"residual {rotation_info['residual']:.3f} px"
+                )
         if rot_angle is None or np.isnan(rot_angle):
             print(
                 f"No rotation angle found for record {record}, using 0.0 degrees instead."
@@ -1026,6 +1334,8 @@ def run(args):
 
         # Segment
         if args.mask_folder is not None:
+            # A mask only fits the frame it was predicted in, so check its angle.
+            check_mask_rotation(args.mask_folder, record, rot_angle)
             mask_path = os.path.join(args.mask_folder, f"{record}_mask.png")
             if not os.path.exists(mask_path):
                 raise FileNotFoundError(
@@ -1200,6 +1510,9 @@ def run(args):
         qc["baseline_disagreement_px"] = baseline_disagreement
         qc["grid_line_contrast"] = grid_lines["contrast"]
         qc["grid_line_shift_px"] = grid_lines["shift"]
+        qc["rotation_angle"] = rot_angle
+        qc["rotation_coarse"] = rotation_info["coarse"]
+        qc["rotation_residual_px"] = rotation_info["residual"]
         append_qc_row(
             args.output_folder, record, args.lead_placement, qc, max_offset_deviation
         )
