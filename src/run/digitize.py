@@ -186,6 +186,17 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--perspective",
+        type=str,
+        choices=["off", "lines"],
+        default="off",
+        help=(
+            "lines = after the rotation, take out the shear and the perspective that "
+            "the printed 1 mm grid lines show, in the same interpolation as the "
+            "rotation; meant to follow --rotation lines. off = keep the rotated page."
+        ),
+    )
+    parser.add_argument(
         "--save_mask",
         action="store_true",
         default=False,
@@ -926,13 +937,19 @@ def estimate_rotation(image, method="hough"):
     return total, info
 
 
-def check_mask_rotation(mask_folder, record, rot_angle):
-    """Warn when a saved mask was predicted at another rotation angle than now."""
+def check_mask_rotation(mask_folder, record, rot_angle, homography=None):
+    """Warn when a saved mask was predicted in another frame than the one used now.
+
+    homography is the map from the image to the frame of this run, None when the page
+    is only rotated. A mask saved without one was predicted in the rotated frame of
+    its angle, so both frames can be compared where they put the image corners.
+    """
     meta_path = os.path.join(mask_folder, f"{record}_mask.json")
     if not os.path.exists(meta_path):
         return float("nan")
     with open(meta_path) as f:
-        saved = json.load(f).get("rot_angle")
+        meta = json.load(f)
+    saved = meta.get("rot_angle")
     if saved is None:
         return float("nan")
     if abs(saved - rot_angle) > ROTATION_MASK_ANGLE_TOLERANCE:
@@ -941,7 +958,446 @@ def check_mask_rotation(mask_folder, record, rot_angle):
             f"{saved:.4f}, the image is now rotated by {rot_angle:.4f}; "
             f"the mask does not fit."
         )
+    saved_frame = meta.get("homography")
+    if saved_frame is None and homography is None:
+        return float(saved)
+    # A frame stored without a homography is the plain rotation by its angle.
+    height, width = meta["height"], meta["width"]
+    then = np.array(
+        saved_frame
+        if saved_frame is not None
+        else rotation_homography(saved, width, height)
+    )
+    now = (
+        homography
+        if homography is not None
+        else rotation_homography(rot_angle, width, height)
+    )
+    corners = np.array([[0.0, 0.0], [width, 0.0], [width, height], [0.0, height]])
+    moved = _apply_homography(then, corners) - _apply_homography(now, corners)
+    distance = float(np.max(np.hypot(*moved.T)))
+    if distance > PERSPECTIVE_MASK_SHIFT_TOLERANCE:
+        print(
+            f"WARNING: mask of record {record} was predicted in a frame whose corners "
+            f"are {distance:.1f} px off the one used now; the mask does not fit."
+        )
     return float(saved)
+
+
+# Length of one window of the phase field, in printed grid lines. Over 32 lines the
+# period of a mildly warped page is constant to a thousandth of a line, while the comb
+# of a faint grid still stands out of the noise; over the whole page it does not.
+PERSPECTIVE_WINDOW_LINES = 32
+# Half range of the phase gradient search: a period mismatch relative to the carrier
+# and a tilt of the line family in degrees. Both are far above what a page that came
+# through estimate_rotation shows, and both stay inside the grating lobes of the
+# window lattice (one lobe every half cycle per window step).
+PERSPECTIVE_GRADIENT_RANGE = 0.03
+PERSPECTIVE_GRADIENT_TILT_DEG = 1.5
+# Steps of the coarse and of the fine gradient search. The coarse step stays below the
+# width of the peak (one cycle over the page), the fine one leaves a fiftieth of a
+# cycle over the page, far below the half cycle the unwrapping needs.
+PERSPECTIVE_SEARCH_STEPS = 41
+# Blocks per axis the phase gradient is measured in for the start of the fit. Over a
+# third of a page the gradient is constant enough for its peak to be sharp, while one
+# gradient for the whole page is a cycle off in the corners of a strongly warped one
+# (measured: 1.4 cycles on the worst persp15 page), which no unwrapping can repair.
+PERSPECTIVE_START_BLOCKS = 3
+# Fewest windows before the gradient of a block is used, and fewest blocks before the
+# start follows the drift of the gradient instead of being one plane over the page.
+PERSPECTIVE_MIN_BLOCK_WINDOWS = 12
+PERSPECTIVE_MIN_BLOCKS = 4
+# Rounds of unwrapping, inlier selection and fit. The first round fits an affine map,
+# which needs no good start, the rounds after it the full homography.
+PERSPECTIVE_FIT_ROUNDS = 4
+# Fewest inlier windows one line family needs, a tenth of what a 200 dpi page gives.
+PERSPECTIVE_MIN_WINDOWS = 24
+# Fraction of the page width and height the inlier windows have to span. The
+# projective terms of a fit that only saw one half of the page are extrapolation.
+PERSPECTIVE_MIN_SPAN = 0.5
+# Largest displacement the rectification may ask for, relative to the page width.
+# More than that is not the perspective of a page any more but a misread grid.
+PERSPECTIVE_MAX_SHIFT = 0.05
+# A correction above this many pixels is measured a second time on the warped page,
+# where the windows of the corners are no longer washed out by the period drift.
+PERSPECTIVE_REPEAT_SHIFT_PX = 1.0
+# Below this displacement the page counts as straight and is left alone, so that masks
+# saved for it stay valid. Undistorted pages ask for at most 0.09 px, which is the
+# noise of the measurement, and the mildest perspective of the quasi real set for
+# 2.4 px. A correction of 1 px in the corners is about 0.3 px rms over the leads, which
+# costs decibels, while a needless bicubic warp costs less than 0.1 dB, so the band
+# sits just above the noise. It does take in generator pages whose augmentation
+# cropped whole pixels off the sides and rescaled them: they are squashed by up to a
+# thousandth (0.3 to 0.65 px), which is a distortion as real as any other.
+PERSPECTIVE_MIN_SHIFT_PX = 0.3
+# Largest disagreement in pixels between the frame a mask was predicted in and the
+# frame used now, measured at the image corners.
+PERSPECTIVE_MASK_SHIFT_TOLERANCE = 0.1
+
+
+def _grid_phase_field(darkness, period, axis):
+    """Complex amplitude of the grid line comb in half overlapping local windows.
+
+    axis=0 cuts the median profile of every band of rows into windows along x and so
+    measures the vertical lines, axis=1 does the same on the transposed page for the
+    horizontal ones. Under a perspective the line period drifts across the page, so
+    the comb is only coherent over a short window, but every window still reports the
+    phase against the absolute image coordinate. Returns the amplitudes
+    [bands, windows] and the x and y of the window centres, of the same shape.
+    """
+    profiles, centres = _band_profiles(darkness.T if axis == 1 else darkness)
+    length = int(round(PERSPECTIVE_WINDOW_LINES * period))
+    if profiles.shape[0] == 0 or length < 2 or profiles.shape[1] < length:
+        empty = np.zeros((0, 0))
+        return empty.astype(complex), empty, empty
+
+    starts = np.arange(0, profiles.shape[1] - length + 1, max(length // 2, 1))
+    windows = profiles[:, starts[:, None] + np.arange(length)]
+    # The mean of the single window, not of the page: uneven light is a slow ramp.
+    centred = windows - windows.mean(axis=2, keepdims=True)
+    # Pixel c covers [c, c+1). The Hann window leaves no side lobes, as in the comb.
+    coordinates = starts[:, None] + np.arange(length) + 0.5
+    kernel = np.hanning(length) * np.exp(-2j * np.pi * coordinates / period)
+    amplitudes = np.einsum("bwl,wl->bw", centred, kernel)
+
+    along, across = np.meshgrid(starts + length / 2, centres)
+    return (amplitudes, along, across) if axis == 0 else (amplitudes, across, along)
+
+
+def _phase_gradient(amplitudes, x, y, ranges):
+    """Phase gradient in cycles per pixel that these windows agree on best.
+
+    The measured phases are only known modulo a line, so the fit cannot start from
+    unwrapped numbers. The coherent sum of the amplitudes against a linear model
+    peaks at the gradient of the model they all follow, with no unwrapping at all.
+    Returns (fx, fy, peak), the gradient relative to the carrier and the complex sum
+    at it, whose size says how well the windows agree and whose angle is the offset.
+    """
+    fx, fy = 0.0, 0.0
+    half_x, half_y = ranges
+    for _ in range(2):
+        grid_x = np.linspace(-half_x, half_x, PERSPECTIVE_SEARCH_STEPS)
+        grid_y = np.linspace(-half_y, half_y, PERSPECTIVE_SEARCH_STEPS)
+        along_x = np.exp(-2j * np.pi * np.outer(fx + grid_x, x))
+        along_y = np.exp(-2j * np.pi * np.outer(fy + grid_y, y))
+        sums = np.einsum("w,iw,jw->ij", amplitudes, along_x, along_y)
+        peak = np.unravel_index(np.argmax(np.abs(sums)), sums.shape)
+        fx, fy = fx + grid_x[peak[0]], fy + grid_y[peak[1]]
+        # The second pass searches one coarse step around the peak, twenty times finer.
+        half_x, half_y = grid_x[1] - grid_x[0], grid_y[1] - grid_y[0]
+    return fx, fy, sums[peak]
+
+
+def _phase_model_start(amplitudes, x, y, ranges):
+    """Start of the phase model of one line family, without unwrapping anything.
+
+    A perspective drifts the line period across the page, so the phase follows a
+    quadratic and a single gradient cannot describe it. The gradient of a block of
+    windows is unambiguous, and a plane laid through the block gradients integrates
+    to that quadratic. Returns the model at every window, relative to the carrier and
+    in cycles, close enough that every measurement unwraps against it.
+    """
+
+    def blocks(values):
+        span = values.max() - values.min()
+        edges = (values - values.min()) / max(span, 1e-9) * PERSPECTIVE_START_BLOCKS
+        return np.clip(edges.astype(int), 0, PERSPECTIVE_START_BLOCKS - 1)
+
+    index = blocks(x) * PERSPECTIVE_START_BLOCKS + blocks(y)
+    # The whole page first, so that there is always one gradient to fall back on.
+    parts = [np.ones(len(x), bool)] + [
+        index == block
+        for block in np.unique(index)
+        if np.count_nonzero(index == block) >= PERSPECTIVE_MIN_BLOCK_WINDOWS
+    ]
+    rows, gradients, weights = [], [], []
+    for inside in parts:
+        fx, fy, peak = _phase_gradient(amplitudes[inside], x[inside], y[inside], ranges)
+        centre_x, centre_y = x[inside].mean(), y[inside].mean()
+        # The gradient of a + b x + c y + d x^2 + e x y + f y^2 at the block centre.
+        rows += [[1, 0, 2 * centre_x, centre_y, 0], [0, 1, 0, centre_x, 2 * centre_y]]
+        gradients += [fx, fy]
+        weights += [np.abs(peak)] * 2
+    terms = 5 if len(parts) > PERSPECTIVE_MIN_BLOCKS else 2
+    root = np.sqrt(weights)[:, None]
+    solution = np.linalg.lstsq(
+        np.array(rows)[:, :terms] * root, np.array(gradients) * root[:, 0], rcond=None
+    )[0]
+    model = np.stack([x, y, x**2, x * y, y**2][:terms], axis=1) @ solution
+    # The constant the gradients say nothing about, from the coherent sum again.
+    offset = np.angle(np.sum(amplitudes * np.exp(-2j * np.pi * model))) / (2 * np.pi)
+    return model + offset
+
+
+def _apply_homography(homography, points):
+    """Map points of shape [n, 2] through a 3x3 homography."""
+    mapped = points @ homography[:, :2].T + homography[:, 2]
+    return mapped[:, :2] / mapped[:, 2:3]
+
+
+def _homography_shift(homography, width, height):
+    """Largest displacement in pixels a homography causes on the page rectangle.
+
+    A homography is at its most extreme on the border, so the corners, the edge
+    midpoints and the centre bound the displacement over the whole page.
+    """
+    x, y = np.meshgrid([0.0, width / 2, width], [0.0, height / 2, height])
+    points = np.stack([x.ravel(), y.ravel()], axis=1)
+    return float(np.max(np.hypot(*(_apply_homography(homography, points) - points).T)))
+
+
+def _unwrap_windows(values, model, period):
+    """Unwrap the window measurements against a model and flag the ones that agree.
+
+    A measurement only says where the lines of its window sit modulo one line, so it
+    is put on the line of the model it is nearest to. The inliers are picked from
+    scratch every time: a window the last model put a whole line off comes back as
+    soon as the model is right. Returns (unwrapped, residuals, inliers) in cycles.
+    """
+    unwrapped = values - np.round(values - model)
+    residuals = unwrapped - model
+    deviation = np.abs(residuals - np.median(residuals))
+    sigma = max(1.4826 * np.median(deviation), GRID_LINE_SIGMA_FLOOR / period)
+    return unwrapped, residuals, deviation <= GRID_LINE_OUTLIER_SIGMA * sigma
+
+
+def _grid_map_least_squares(points, values, weights, axes, projective):
+    """Weighted least squares fit of the grid map to the unwrapped windows.
+
+    points are the window centres in normalised coordinates, values their unwrapped
+    grid coordinate and axes which of the two coordinates a window measured, 0 for u
+    and 1 for v. The DLT form u (g x + h y + 1) = a x + b y + c is linear in the eight
+    parameters and fits both line families at once, which is what ties g and h down.
+    The values are centred first, as a constant in u only moves a, b and c.
+    """
+    centre = np.array(
+        [
+            np.average(values[axes == axis], weights=weights[axes == axis])
+            for axis in (0, 1)
+        ]
+    )
+    centred = values - centre[axes]
+    linear = np.stack([points[:, 0], points[:, 1], np.ones(len(points))], axis=1)
+    blank = np.zeros_like(linear)
+    is_u = (axes == 0)[:, None]
+    columns = [np.where(is_u, linear, blank), np.where(is_u, blank, linear)]
+    if projective:
+        columns.append(-centred[:, None] * points)
+    # A least squares over squared residuals weighs the rows by the square root.
+    root = np.sqrt(weights)[:, None]
+    solution = np.linalg.lstsq(
+        np.hstack(columns) * root, centred * root[:, 0], rcond=None
+    )[0]
+    projection = solution[6:] if projective else [0.0, 0.0]
+    matrix = np.array([solution[:3], solution[3:6], [*projection, 1.0]])
+    return np.array([[1, 0, centre[0]], [0, 1, centre[1]], [0, 0, 1]]) @ matrix
+
+
+def _perspective_grid_map(darkness, width, height):
+    """Projective map from image pixels to the units of the printed grid lines.
+
+    Both line families are measured with one carrier period, the vertical one giving
+    the grid coordinate u of a window modulo a line and the horizontal one its v, and
+    both are fitted jointly. Every measurement is unwrapped against the current model
+    rather than against its neighbours, so a single bad window cannot break a whole
+    row, and the inliers are picked again in every round so that a window the first
+    model put a line off comes back. Returns (M, info), M is None when info["reason"]
+    says why the page gives no usable map.
+    """
+    info = {"period": float("nan"), "residual": float("nan"), "windows": 0, "reason": ""}
+    profiles, _ = _band_profiles(darkness)
+    if profiles.shape[0] == 0:
+        info["reason"] = "image too small for the grid line profile"
+        return None, info
+
+    # One carrier for both families: the printed grid is square, so the unit of the
+    # grid coordinates cancels in the rectification, even if this is a harmonic.
+    period = _grid_line_period(profiles)
+    if not np.isfinite(period):
+        info["reason"] = "no grid line period found"
+        return None, info
+    info["period"] = period
+    background = np.mean(
+        [
+            np.abs(_grid_line_comb(profiles, period * f)).sum()
+            for f in (0.93, 0.96, 1.04, 1.07)
+        ]
+    )
+    comb = np.abs(_grid_line_comb(profiles, period)).sum()
+    contrast = float(comb / max(background, 1e-9))
+    if contrast < GRID_LINE_MIN_CONTRAST:
+        info["reason"] = f"no grid lines found (contrast {contrast:.1f})"
+        return None, info
+
+    mismatch = PERSPECTIVE_GRADIENT_RANGE / period
+    tilt = np.tan(np.radians(PERSPECTIVE_GRADIENT_TILT_DEG)) / period
+    points, values, weights, axes, model = [], [], [], [], []
+    for axis in (0, 1):
+        amplitudes, x, y = _grid_phase_field(darkness, period, axis)
+        if amplitudes.size == 0:
+            info["reason"] = "image too small for the grid line windows"
+            return None, info
+        amplitude = np.abs(amplitudes).ravel()
+        # Borders, black wedges and blocks of text leave windows without a comb. The
+        # cut is strict so that a page without this family, whose windows all have an
+        # amplitude of zero, drops out instead of agreeing on a phase of zero.
+        keep = amplitude > GRID_LINE_MIN_BAND_AMPLITUDE * np.median(amplitude)
+        if np.count_nonzero(keep) < PERSPECTIVE_MIN_WINDOWS:
+            info["reason"] = f"only {np.count_nonzero(keep)} windows with grid lines"
+            return None, info
+        amplitude, x, y = amplitude[keep], x.ravel()[keep], y.ravel()[keep]
+        # The lines of a window sit at (psi + k) * period, so the grid coordinate of
+        # its centre is x / period - psi for the vertical family, modulo one line.
+        psi = -np.angle(amplitudes).ravel()[keep] / (2 * np.pi)
+        carrier = (x if axis == 0 else y) / period
+        start = _phase_model_start(
+            amplitudes.ravel()[keep],
+            x,
+            y,
+            (mismatch, tilt) if axis == 0 else (tilt, mismatch),
+        )
+        points.append(np.stack([x, y], axis=1))
+        values.append(carrier - psi)
+        weights.append(amplitude)
+        axes.append(np.full(x.shape, axis))
+        model.append(carrier + start)
+
+    points = np.concatenate(points)
+    values, weights = np.concatenate(values), np.concatenate(weights)
+    axes, model = np.concatenate(axes), np.concatenate(model)
+    # Centred and scaled coordinates, or the projective terms drown in the linear ones.
+    scale = max(width, height) / 2
+    normalised = (points - [width / 2, height / 2]) / scale
+    for round_ in range(PERSPECTIVE_FIT_ROUNDS):
+        unwrapped, _, keep = _unwrap_windows(values, model, period)
+        for axis in (0, 1):
+            if np.count_nonzero(keep & (axes == axis)) < PERSPECTIVE_MIN_WINDOWS:
+                info["reason"] = (
+                    f"only {np.count_nonzero(keep & (axes == axis))} windows agree "
+                    f"on the {'vertical' if axis == 0 else 'horizontal'} grid lines"
+                )
+                return None, info
+        matrix = _grid_map_least_squares(
+            normalised[keep], unwrapped[keep], weights[keep], axes[keep], round_ > 0
+        )
+        model = _apply_homography(matrix, normalised)[np.arange(len(axes)), axes]
+
+    _, residuals, keep = _unwrap_windows(values, model, period)
+    info["windows"] = int(np.count_nonzero(keep))
+    info["residual"] = float(np.sqrt(np.mean(residuals[keep] ** 2)) * period)
+    if info["residual"] > GRID_LINE_MAX_SLOPE_RESIDUAL * period:
+        info["reason"] = f"grid line phase is {info['residual']:.2f} px off the fit"
+        return None, info
+    span = points[keep].max(axis=0) - points[keep].min(axis=0)
+    if span[0] < PERSPECTIVE_MIN_SPAN * width or span[1] < PERSPECTIVE_MIN_SPAN * height:
+        info["reason"] = f"grid lines only span {span[0]:.0f} x {span[1]:.0f} px"
+        return None, info
+
+    # Back to pixel coordinates, so that the map reads the image as it is.
+    normalise = np.array(
+        [
+            [1 / scale, 0, -width / (2 * scale)],
+            [0, 1 / scale, -height / (2 * scale)],
+            [0, 0, 1],
+        ]
+    )
+    return matrix @ normalise, info
+
+
+def _rectify_homography(matrix, width, height):
+    """Pixel homography that straightens the grid, keeping the centre and the scale.
+
+    The grid map is only known up to the unit of its coordinates and where its origin
+    sits, so it is followed by the scale that keeps the area at the image centre and
+    the shift that keeps the centre where it is. The same scale for x and y, the
+    printed grid being square, also undoes the anisotropic foreshortening.
+    """
+    centre = np.array([width / 2, height / 2, 1.0])
+    mapped = matrix @ centre
+    grid = mapped[:2] / mapped[2]
+    jacobian = (matrix[:2, :2] - np.outer(grid, matrix[2, :2])) / mapped[2]
+    scale = 1 / np.sqrt(abs(np.linalg.det(jacobian)))
+    similarity = np.array(
+        [
+            [scale, 0, centre[0] - scale * grid[0]],
+            [0, scale, centre[1] - scale * grid[1]],
+            [0, 0, 1],
+        ]
+    )
+    rectified = similarity @ matrix
+    return rectified / rectified[2, 2]
+
+
+def rotation_homography(angle, width, height):
+    """The 3x3 matrix of what rotate(image, angle) does, pixel centres at i + 0.5.
+
+    torchvision turns the page counter-clockwise about its centre and keeps its size,
+    which is what cv2.getRotationMatrix2D builds; the centre of a page of W columns
+    lies at W / 2 in this convention. Verified against rotate() in the tests.
+    """
+    matrix = cv2.getRotationMatrix2D((width / 2, height / 2), angle, 1.0)
+    return np.vstack([matrix, [0.0, 0.0, 1.0]])
+
+
+def warp_page(image, homography):
+    """Warp a page tensor [3, H, W] through a homography, in one bicubic pass."""
+    array = np.ascontiguousarray(image.permute(1, 2, 0).numpy())
+    # cv2 puts the pixel centres at integers and the pipeline at i + 0.5.
+    half = np.array([[1, 0, -0.5], [0, 1, -0.5], [0, 0, 1]], float)
+    warped = cv2.warpPerspective(
+        array,
+        half @ homography @ np.linalg.inv(half),
+        (array.shape[1], array.shape[0]),
+        flags=cv2.INTER_CUBIC,
+        borderMode=cv2.BORDER_CONSTANT,
+        # The black of a rotated page, so that both stages leave the same border.
+        borderValue=(0, 0, 0),
+    )
+    return torch.from_numpy(warped.transpose(2, 0, 1).copy())
+
+
+def estimate_perspective(image):
+    """Homography that takes the shear and the perspective out of a page image.
+
+    image is the rotation corrected page as read_image gives it ([3, H, W]) or the
+    same as a numpy array. The printed 1 mm grid is a dense calibration target: the
+    local phase of its two line families gives the grid coordinate of every window,
+    and the homography through those coordinates rectifies the page. A correction of
+    more than PERSPECTIVE_REPEAT_SHIFT_PX is measured again on the warped page, where
+    the corners are no longer washed out, and the two are composed.
+    Returns (H_rect, info). H_rect is None when info["reason"] says why the grid lines
+    gave no homography, and also, with an empty reason, when the page is straight
+    enough to be left alone.
+    """
+    if not torch.is_tensor(image):
+        image = torch.from_numpy(np.ascontiguousarray(image))
+    height, width = image.shape[1], image.shape[2]
+    info = {
+        "shift": float("nan"),
+        "residual": float("nan"),
+        "period": float("nan"),
+        "windows": 0,
+        "reason": "",
+    }
+    total = None
+    for _ in range(2):
+        page = image if total is None else warp_page(image, total)
+        matrix, fit = _perspective_grid_map(_darkness(page), width, height)
+        info.update({key: fit[key] for key in ("period", "residual", "windows")})
+        if matrix is None:
+            info["reason"] = fit["reason"]
+            return None, info
+        rectified = _rectify_homography(matrix, width, height)
+        total = rectified if total is None else rectified @ total
+        info["shift"] = _homography_shift(total, width, height)
+        if info["shift"] > PERSPECTIVE_MAX_SHIFT * width:
+            info["reason"] = f"grid lines ask for a {info['shift']:.0f} px correction"
+            return None, info
+        if info["shift"] <= PERSPECTIVE_REPEAT_SHIFT_PX:
+            break
+    if info["shift"] < PERSPECTIVE_MIN_SHIFT_PX:
+        return None, info
+    return total, info
 
 
 def baseline_row(ratio, image_height, scale=1.0):
@@ -1208,8 +1664,12 @@ def write_record(record, signals, sig_names, output_folder, placement):
                 wfdb.wrsamp(record, p_signal=signals, **kwargs)
 
 
-def save_mask_files(mask, record, output_folder, rot_angle):
-    """Save the predicted mask as PNG plus a small JSON with the frame info."""
+def save_mask_files(mask, record, output_folder, rot_angle, homography=None):
+    """Save the predicted mask as PNG plus a small JSON with the frame info.
+
+    homography is the map from the image to the frame the mask lives in, written out
+    only when the page was warped: a file without one means the rotation alone.
+    """
     mask_to_save = mask.to(torch.uint8)
     write_png(mask_to_save, os.path.join(output_folder, f"{record}_mask.png"))
     meta = {
@@ -1217,6 +1677,8 @@ def save_mask_files(mask, record, output_folder, rot_angle):
         "height": int(mask_to_save.shape[1]),
         "width": int(mask_to_save.shape[2]),
     }
+    if homography is not None:
+        meta["homography"] = np.asarray(homography).tolist()
     with open(os.path.join(output_folder, f"{record}_mask.json"), "w") as f:
         json.dump(meta, f)
 
@@ -1244,6 +1706,8 @@ def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
         "rotation_angle",
         "rotation_coarse",
         "rotation_residual_px",
+        "perspective_shift_px",
+        "perspective_residual_px",
     ]
     write_header = not os.path.exists(qc_path)
     with open(qc_path, "a", newline="") as f:
@@ -1355,10 +1819,36 @@ def run(args):
             rot_angle = 0.0
         image_rotated = rotate(image, rot_angle)
 
+        # Rectify
+        homography = None
+        perspective_info = {"shift": float("nan"), "residual": float("nan")}
+        if args.perspective == "lines":
+            rotation = rotation_homography(rot_angle, image.shape[2], image.shape[1])
+            # rotate() interpolates nearest, which below a twentieth of a degree moves
+            # no pixel at all, so the page is measured in the frame of the final warp.
+            H_rect, perspective_info = estimate_perspective(warp_page(image, rotation))
+            if perspective_info["reason"]:
+                print(
+                    f"WARNING: grid lines not used for the perspective of record "
+                    f"{record} ({perspective_info['reason']}), keeping the rotated page."
+                )
+            if args.verbose:
+                print(
+                    f"Perspective for record {record}: shift "
+                    f"{perspective_info['shift']:.2f} px, residual "
+                    f"{perspective_info['residual']:.3f} px, period "
+                    f"{perspective_info['period']:.2f} px, "
+                    f"windows {perspective_info['windows']}"
+                )
+            if H_rect is not None:
+                # From the image, so that the page is interpolated only once.
+                homography = H_rect @ rotation
+                image_rotated = warp_page(image, homography)
+
         # Segment
         if args.mask_folder is not None:
             # A mask only fits the frame it was predicted in, so check its angle.
-            check_mask_rotation(args.mask_folder, record, rot_angle)
+            check_mask_rotation(args.mask_folder, record, rot_angle, homography)
             mask_path = os.path.join(args.mask_folder, f"{record}_mask.png")
             if not os.path.exists(mask_path):
                 raise FileNotFoundError(
@@ -1375,7 +1865,9 @@ def run(args):
                 fold=args.fold,
             )
         if args.save_mask:
-            save_mask_files(mask_to_use, record, args.output_folder, rot_angle)
+            save_mask_files(
+                mask_to_use, record, args.output_folder, rot_angle, homography
+            )
 
         # Use mask to cut into single, binary masks
         signal_masks_cropped, signal_positions_cropped, _ = cut_binary(
@@ -1552,6 +2044,8 @@ def run(args):
         qc["rotation_angle"] = rot_angle
         qc["rotation_coarse"] = rotation_info["coarse"]
         qc["rotation_residual_px"] = rotation_info["residual"]
+        qc["perspective_shift_px"] = perspective_info["shift"]
+        qc["perspective_residual_px"] = perspective_info["residual"]
         append_qc_row(
             args.output_folder, record, args.lead_placement, qc, max_offset_deviation
         )
