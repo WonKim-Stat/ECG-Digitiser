@@ -500,12 +500,12 @@ def test_check_mask_rotation_is_quiet_without_a_json(tmp_path, capsys):
 
 
 # --------------------------------------------------------------------- parser and qc
-def test_parser_rotation_defaults_to_hough():
+def test_parser_rotation_defaults_to_lines():
     parser = digitize.get_parser()
     args = parser.parse_args(["-d", "data", "-o", "out"])
-    assert args.rotation == "hough"
-    args = parser.parse_args(["-d", "data", "-o", "out", "--rotation", "lines"])
     assert args.rotation == "lines"
+    args = parser.parse_args(["-d", "data", "-o", "out", "--rotation", "hough"])
+    assert args.rotation == "hough"
 
 
 def test_parser_interpolation_defaults_to_nearest():
@@ -646,10 +646,14 @@ def _qc_angle(tmp_path):
 
 
 def test_run_with_nearest_turns_the_page_with_rotate(tmp_path, monkeypatch):
-    # --rotation hough is the default and rotates nothing itself, so the one call is
-    # the page; the whole degree Hough transform reads this page as -2.0.
+    # All three stages resample the page themselves, which the spies would count, so
+    # the interpolation tests keep them as they were: --rotation hough rotates nothing
+    # of its own, and the whole degree Hough transform reads this page as -2.0.
     rotates, warps = _spy(monkeypatch, "rotate"), _spy(monkeypatch, "warp_page")
-    _run_page(tmp_path, _page(2.0))
+    _run_page(
+        tmp_path, _page(2.0), "--rotation", "hough", "--perspective", "off",
+        "--resolution", "keep",
+    )
     assert _qc_angle(tmp_path) == pytest.approx(-2.0)
     assert len(rotates) == 1 and rotates[0][1] == pytest.approx(-2.0)
     assert warps == []
@@ -657,7 +661,10 @@ def test_run_with_nearest_turns_the_page_with_rotate(tmp_path, monkeypatch):
 
 def test_run_with_bicubic_warps_the_page_once(tmp_path, monkeypatch):
     rotates, warps = _spy(monkeypatch, "rotate"), _spy(monkeypatch, "warp_page")
-    _run_page(tmp_path, _page(2.0), "--interpolation", "bicubic")
+    _run_page(
+        tmp_path, _page(2.0), "--interpolation", "bicubic", "--rotation", "hough",
+        "--perspective", "off", "--resolution", "keep",
+    )
     angle = _qc_angle(tmp_path)
     assert len(warps) == 1
     assert np.allclose(warps[0][1], digitize.rotation_homography(angle, WIDTH, HEIGHT))
@@ -666,7 +673,10 @@ def test_run_with_bicubic_warps_the_page_once(tmp_path, monkeypatch):
 
 def test_run_with_bicubic_leaves_a_straight_page_alone(tmp_path, monkeypatch):
     rotates, warps = _spy(monkeypatch, "rotate"), _spy(monkeypatch, "warp_page")
-    _run_page(tmp_path, _page(), "--interpolation", "bicubic")
+    _run_page(
+        tmp_path, _page(), "--interpolation", "bicubic", "--rotation", "hough",
+        "--perspective", "off", "--resolution", "keep",
+    )
     # An angle of zero keeps the old path, so the page is not resampled at all.
     assert _qc_angle(tmp_path) == 0.0
     assert warps == []
@@ -688,3 +698,25 @@ def test_run_with_perspective_does_not_warp_a_straight_page(tmp_path, monkeypatc
     _run_page(tmp_path, _page(), "--perspective", "lines")
     # The measurement would only warp by the identity, so it takes the image itself.
     assert warps == []
+
+
+# ---------------------------------------------------------- the stages by default
+def test_run_uses_all_three_stages_by_default(tmp_path):
+    """What the three defaults are for, with no stage flag given at all.
+
+    A page tilted by a fraction of a degree is what the whole degree Hough transform
+    of --rotation hough cannot read, and the perspective and the resolution leave
+    their QC columns at NaN as long as they do not run.
+    """
+    _run_page(tmp_path, _page(0.37))
+    with open(tmp_path / "out" / "qc.csv", newline="") as f:
+        row = next(csv.DictReader(f))
+
+    assert float(row["rotation_angle"]) == pytest.approx(-0.37, abs=0.01)
+    assert float(row["rotation_coarse"]) == pytest.approx(-0.4, abs=1e-9)
+    assert float(row["rotation_residual_px"]) < 1.0
+    assert np.isfinite(float(row["perspective_shift_px"]))
+    assert float(row["perspective_residual_px"]) < 0.5
+    assert float(row["grid_period_px"]) == pytest.approx(PERIOD, rel=1e-3)
+    # The page is drawn at the 200 dpi scale, so the stage ran and kept its pixels.
+    assert float(row["resolution_scale"]) == 1.0

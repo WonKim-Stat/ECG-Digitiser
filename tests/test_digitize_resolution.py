@@ -353,12 +353,12 @@ def test_save_mask_files_stores_the_scale_only_when_the_page_was_resampled(tmp_p
         assert json.load(f)["scale"] == 2.0
 
 
-def test_parser_resolution_defaults_to_keep():
+def test_parser_resolution_defaults_to_lines():
     parser = digitize.get_parser()
     args = parser.parse_args(["-d", "data", "-o", "out"])
-    assert args.resolution == "keep"
-    args = parser.parse_args(["-d", "data", "-o", "out", "--resolution", "lines"])
     assert args.resolution == "lines"
+    args = parser.parse_args(["-d", "data", "-o", "out", "--resolution", "keep"])
+    assert args.resolution == "keep"
 
 
 def test_append_qc_row_writes_the_resolution_columns(tmp_path):
@@ -429,7 +429,9 @@ def test_run_with_resolution_lines_brings_a_100_dpi_page_up(tmp_path, capsys):
 def test_run_without_the_resolution_stage_leaves_its_qc_columns_empty(
     tmp_path, capsys
 ):
-    _run_half_size_page(tmp_path, _label_mask(HEIGHT // 2, WIDTH // 2))
+    _run_half_size_page(
+        tmp_path, _label_mask(HEIGHT // 2, WIDTH // 2), "--resolution", "keep"
+    )
 
     assert "Resolution for record rec:" not in capsys.readouterr().out
     row = _qc_row(tmp_path)

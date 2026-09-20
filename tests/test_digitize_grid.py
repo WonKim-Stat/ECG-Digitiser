@@ -779,11 +779,17 @@ def _run(
 ):
     data_folder, mask_folder = _write_case(tmp_path, name, label, image)
     output_folder = _output_folder(tmp_path, name, time_mapping, baseline, grid_origin)
+    # The stages under test are the column grid and the baseline: the pages here show
+    # the vertical lines of that grid and nothing else, which leaves the rotation, the
+    # perspective and the resolution nothing to correct, only seconds and warnings.
     argv = [
         "-d", str(data_folder),
         "-o", str(output_folder),
         "--mask_folder", str(mask_folder),
         "--time_mapping", time_mapping,
+        "--rotation", "hough",
+        "--perspective", "off",
+        "--resolution", "keep",
         "--verbose" if verbose else "--no-verbose",
     ]
     if baseline is not None:

@@ -178,11 +178,12 @@ def get_parser():
         "--rotation",
         type=str,
         choices=["hough", "lines"],
-        default="hough",
+        default="lines",
         help=(
-            "hough = angle from the Hough transform of the page, in whole degrees; "
             "lines = a 0.1 degree Hough transform refined with the phase drift of the "
-            "printed 1 mm grid lines, which resolves fractions of a degree."
+            "printed 1 mm grid lines, which resolves fractions of a degree, falls back "
+            "to the whole degree angle if the image shows no such lines; hough = angle "
+            "from the Hough transform of the page, in whole degrees only."
         ),
     )
     parser.add_argument(
@@ -205,22 +206,24 @@ def get_parser():
         "--perspective",
         type=str,
         choices=["off", "lines"],
-        default="off",
+        default="lines",
         help=(
             "lines = after the rotation, take out the shear and the perspective that "
             "the printed 1 mm grid lines show, in the same interpolation as the "
-            "rotation; meant to follow --rotation lines. off = keep the rotated page."
+            "rotation, leaves the page as it is if the image shows no such lines or is "
+            "straight enough already; off = keep the rotated page."
         ),
     )
     parser.add_argument(
         "--resolution",
         type=str,
         choices=["keep", "lines"],
-        default="keep",
+        default="lines",
         help=(
             "lines = resample the page so that the printed 1 mm grid lines have the "
-            "period of a 200 dpi page, which is the scale the model was trained on; "
-            "a page within about a tenth of it keeps its pixels, because resampling it "
+            "period of a 200 dpi page, which is the scale the model was trained on, "
+            "keeps the page if the image shows no such lines; a page within about a "
+            "tenth of that scale keeps its pixels as well, because resampling it "
             "costs more than the model loses to the scale. Everything after it, "
             "the rotation and the perspective included, sees the resampled "
             "page, and --grid_line_offset is a page unit, so its default stays right "
@@ -231,7 +234,7 @@ def get_parser():
         "--save_mask",
         action="store_true",
         default=False,
-        help="Save the predicted label mask (rotation-corrected frame) as PNG plus JSON.",
+        help="Save the predicted label mask (corrected frame) as PNG plus JSON.",
     )
     parser.add_argument(
         "--mask_folder",

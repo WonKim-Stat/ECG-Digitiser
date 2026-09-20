@@ -346,12 +346,12 @@ def test_check_mask_rotation_keeps_its_old_behaviour(tmp_path, capsys):
     assert capsys.readouterr().out == ""
 
 
-def test_parser_perspective_defaults_to_off():
+def test_parser_perspective_defaults_to_lines():
     parser = digitize.get_parser()
     args = parser.parse_args(["-d", "data", "-o", "out"])
-    assert args.perspective == "off"
-    args = parser.parse_args(["-d", "data", "-o", "out", "--perspective", "lines"])
     assert args.perspective == "lines"
+    args = parser.parse_args(["-d", "data", "-o", "out", "--perspective", "off"])
+    assert args.perspective == "off"
 
 
 def test_append_qc_row_writes_the_perspective_columns(tmp_path):
@@ -427,6 +427,7 @@ def test_run_without_the_stage_leaves_the_qc_columns_empty(tmp_path, capsys):
             "-o", str(tmp_path / "out"),
             "--mask_folder", str(mask_folder),
             "--time_mapping", "bbox",
+            "--perspective", "off",
         ]
     )
     digitize.run(args)
