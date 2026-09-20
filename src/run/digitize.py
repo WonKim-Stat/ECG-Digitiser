@@ -1094,12 +1094,12 @@ PERSPECTIVE_REPEAT_SHIFT_PX = 1.0
 # Below this displacement the page counts as straight and is left alone, so that masks
 # saved for it stay valid. Undistorted pages ask for at most 0.09 px, which is the
 # noise of the measurement, and the mildest perspective of the quasi real set for
-# 2.4 px. A correction of 1 px in the corners is about 0.3 px rms over the leads, which
-# costs decibels, while a needless bicubic warp costs less than 0.1 dB, so the band
-# sits just above the noise. It does take in generator pages whose augmentation
-# cropped whole pixels off the sides and rescaled them: they are squashed by up to a
-# thousandth (0.3 to 0.65 px), which is a distortion as real as any other.
-PERSPECTIVE_MIN_SHIFT_PX = 0.3
+# 2.4 px. In between lie generator pages whose augmentation cropped whole pixels off
+# the sides and rescaled them, squashed by up to a thousandth (0.3 to 0.65 px on 15 of
+# the 32 rotated pages). Warping those is a wash: a bicubic warp takes a sharp page
+# off its pixel lattice, which costs about what so small a correction gains (mean
+# change 0.00 dB, 40 leads worse by 1 dB and 38 better), so the band ends above them.
+PERSPECTIVE_MIN_SHIFT_PX = 1.0
 # Largest disagreement in pixels between the frame a mask was predicted in and the
 # frame used now, measured at the image corners.
 PERSPECTIVE_MASK_SHIFT_TOLERANCE = 0.1
