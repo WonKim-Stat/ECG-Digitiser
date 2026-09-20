@@ -53,16 +53,21 @@ def _page(angle_deg=0.0, period=PERIOD):
         )
     cv2.rectangle(image, (100, 60), (500, 110), (0, 0, 0), -1)
     if angle_deg:
-        matrix = cv2.getRotationMatrix2D((WIDTH / 2, HEIGHT / 2), angle_deg, 1.0)
-        image = cv2.warpAffine(
-            image,
-            matrix,
-            (WIDTH, HEIGHT),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=(255, 255, 255),
-        )
+        image = _tilt(image, angle_deg)
     return image
+
+
+def _tilt(image, angle_deg):
+    """Turn the content of a page by angle_deg, about its centre and onto white."""
+    matrix = cv2.getRotationMatrix2D((WIDTH / 2, HEIGHT / 2), angle_deg, 1.0)
+    return cv2.warpAffine(
+        image,
+        matrix,
+        (WIDTH, HEIGHT),
+        flags=cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT,
+        borderValue=(255, 255, 255),
+    )
 
 
 def _tensor(np_image):
@@ -72,6 +77,27 @@ def _tensor(np_image):
 
 def _blank():
     return np.full((HEIGHT, WIDTH, 3), 255, dtype=np.uint8)
+
+
+@lru_cache(maxsize=None)
+def _vertical_lines_page(angle_deg=0.0, period=PERIOD):
+    """The vertical family of _page() alone: no horizontal lines, traces or text.
+
+    The bare page of tests/test_digitize_grid.py, and the one the fine Hough
+    transform stumbles over: with no other line family to outvote them, the
+    collinear alignments across the edge pixels of the 1 mm lines gather enough
+    votes to pass as a line family of their own.
+    """
+    image = np.full((HEIGHT, WIDTH, 3), 255, dtype=np.uint8)
+    for k in range(int(WIDTH / period) + 1):
+        x = int(round(k * period))
+        if x < WIDTH:
+            heavy = k % 5 == 0
+            cv2.line(image, (x, 0), (x, HEIGHT - 1),
+                     (120, 120, 255) if heavy else (190, 190, 255), 2 if heavy else 1)
+    if angle_deg:
+        image = _tilt(image, angle_deg)
+    return image
 
 
 def _no_grid_page():
@@ -383,11 +409,67 @@ def test_estimate_rotation_lines_is_nan_on_a_blank_page():
     assert info["reason"] != ""
 
 
-def test_estimate_rotation_lines_keeps_the_coarse_angle_without_grid_lines():
-    page = _no_grid_page()
+def test_estimate_rotation_lines_drops_a_coarse_angle_the_grid_lines_reject():
+    """The degenerate page: a straight one the fine Hough transform reads as tilted.
+
+    Turning the page by that angle smears its comb, so the grid lines cannot veto it
+    where they are asked first; measured on the page as it came they can, and they
+    read the page for what it is.
+    """
+    page = _vertical_lines_page()
+    fine = digitize.get_rotation_angle_fine(page)
+    # Measured at 16.7 degrees, while the whole degree transform leaves the page be.
+    assert abs(fine) > 1.0
+    assert np.isnan(digitize.get_rotation_angle(page))
+
     angle, info = digitize.estimate_rotation(_tensor(page), "lines")
-    assert angle == digitize.get_rotation_angle_fine(page)
+    assert angle == pytest.approx(0.0, abs=0.05)
+    assert info["reason"] == ""
+    # The rejected angle is still what the QC column has to show.
+    assert info["coarse"] == fine
+
+
+def test_estimate_rotation_lines_finds_the_tilt_under_a_spurious_coarse_angle():
+    page = _vertical_lines_page(0.3)
+    # Measured at 21.8 degrees, nowhere near the tilt the page really has.
+    assert abs(digitize.get_rotation_angle_fine(page)) > 1.0
+    angle, info = digitize.estimate_rotation(_tensor(page), "lines")
+    assert info["reason"] == ""
+    # Not the spurious angle but the tilt the grid lines measure on the page itself.
+    assert angle == pytest.approx(-0.3, abs=0.01)
+
+
+def test_estimate_rotation_lines_falls_back_to_the_whole_degree_angle(monkeypatch):
+    """With no grid lines to ask, "lines" answers what "hough" would have answered."""
+    page = _tilt(_no_grid_page(), 2.0)
+    fine = digitize.get_rotation_angle_fine(page)
+    calls = _spy(monkeypatch, "get_rotation_angle")
+    angle, info = digitize.estimate_rotation(_tensor(page), "lines")
+    # Both transforms read this page, and the answer is the whole degree one, asked
+    # once and only because the grid lines were unreadable on either page.
+    assert len(calls) == 1
+    assert angle == digitize.get_rotation_angle(page)
+    assert not np.isnan(angle)
     assert "no grid lines found" in info["reason"]
+    assert info["coarse"] == fine
+
+
+def test_estimate_rotation_lines_is_nan_when_neither_transform_is_trusted(monkeypatch):
+    """The fine angle is spurious and the whole degree one finds nothing: no angle."""
+    monkeypatch.setattr(digitize, "get_rotation_angle_fine", lambda image: 12.0)
+    monkeypatch.setattr(digitize, "get_rotation_angle", lambda image: np.nan)
+    angle, info = digitize.estimate_rotation(_tensor(_no_grid_page()), "lines")
+    assert np.isnan(angle)
+    assert info["coarse"] == 12.0
+    assert "no grid lines found" in info["reason"]
+
+
+def test_estimate_rotation_lines_does_not_ask_the_whole_degree_transform(monkeypatch):
+    """The common path pays for the grid lines only, not for a second transform."""
+    calls = _spy(monkeypatch, "get_rotation_angle")
+    angle, info = digitize.estimate_rotation(_tensor(_page(0.37)), "lines")
+    assert info["reason"] == "" and angle == pytest.approx(-0.37, abs=0.01)
+    assert calls == []
 
 
 # --------------------------------------------------------------- check_mask_rotation
@@ -492,6 +574,19 @@ def test_run_with_rotation_lines_reports_the_angle(tmp_path, capsys):
     assert float(row["rotation_angle"]) == pytest.approx(-0.37, abs=0.01)
     assert float(row["rotation_coarse"]) == pytest.approx(-0.4, abs=1e-9)
     assert float(row["rotation_residual_px"]) < 1.0
+
+
+def test_run_with_rotation_lines_leaves_a_page_alone_without_an_angle(
+    tmp_path, monkeypatch, capsys
+):
+    """What the fallback means downstream: the page is left alone, not turned by 12."""
+    monkeypatch.setattr(digitize, "get_rotation_angle_fine", lambda image: 12.0)
+    monkeypatch.setattr(digitize, "get_rotation_angle", lambda image: np.nan)
+    _run_page(tmp_path, _no_grid_page(), "--rotation", "lines")
+    out = capsys.readouterr().out
+    assert "keeping the whole degree Hough angle" in out
+    assert "No rotation angle found for record rec" in out
+    assert _qc_angle(tmp_path) == 0.0
 
 
 # ------------------------------------------------------ interpolation of the page

@@ -936,6 +936,10 @@ def estimate_rotation(image, method="hough"):
 
     method "hough" is the Hough transform in whole degrees, method "lines" refines a
     tenth of a degree Hough transform with the phase drift of the printed grid lines.
+    Grid lines that cannot confirm that coarse angle get a second say on the page as
+    it came, because a page turned by a spurious angle no longer shows the comb that
+    would have vetoed it; with no grid lines either way the whole degree angle is
+    returned, so that "lines" is never worse than "hough".
     Returns (rot_angle, info), rot_angle is NaN when no angle could be found.
     """
     np_image = image.permute(1, 2, 0).numpy().astype(np.uint8)
@@ -953,26 +957,51 @@ def estimate_rotation(image, method="hough"):
 
     coarse = get_rotation_angle_fine(np_image)
     info["coarse"] = coarse
-    # Without a coarse angle the grid lines still measure a tilt of a few degrees.
-    total = 0.0 if np.isnan(coarse) else coarse
-    for _ in range(2):
-        lines = grid_line_slope(rotate(image, total), axis=0)
-        info["period"] = lines["period"]
-        info["contrast"] = lines["contrast"]
-        info["residual"] = lines["residual"]
-        if lines["reason"]:
-            info["reason"] = lines["reason"]
-            return coarse, info
-        delta = lines["angle"]
-        if abs(delta) > ROTATION_REFINE_MAX_DEG:
-            info["reason"] = f"grid lines ask for {delta:+.2f} degrees"
-            return coarse, info
-        info["deltas"].append(float(delta))
-        total += delta
-        if abs(delta) <= ROTATION_REFINE_REPEAT_DEG:
-            break
 
-    total = round(total, 4)
+    def refine(start):
+        """Straighten the page by start degrees and let the grid lines finish it.
+
+        Returns the angle the page needs altogether, or None with a reason in info
+        when the grid lines of the straightened page cannot be read.
+        """
+        total = start
+        for _ in range(2):
+            lines = grid_line_slope(rotate(image, total), axis=0)
+            info["period"] = lines["period"]
+            info["contrast"] = lines["contrast"]
+            info["residual"] = lines["residual"]
+            if lines["reason"]:
+                info["reason"] = lines["reason"]
+                return None
+            delta = lines["angle"]
+            if abs(delta) > ROTATION_REFINE_MAX_DEG:
+                info["reason"] = f"grid lines ask for {delta:+.2f} degrees"
+                return None
+            info["deltas"].append(float(delta))
+            total += delta
+            if abs(delta) <= ROTATION_REFINE_REPEAT_DEG:
+                break
+        return round(total, 4)
+
+    # Without a coarse angle the grid lines still measure a tilt of a few degrees.
+    total = refine(0.0 if np.isnan(coarse) else coarse)
+    if total is None and not np.isnan(coarse) and coarse != 0.0:
+        # The fine Hough transform passes fainter line families than the whole degree
+        # one and reads an angle off the pixel lattice of a page it should have left
+        # alone, and turning the page by it smears the very comb that would have said
+        # no. So the page as it came gets a second say, as it does without any coarse
+        # angle at all; if its grid lines are readable, the coarse one was spurious.
+        info["deltas"] = []
+        info["reason"] = ""
+        total = refine(0.0)
+        # An angle the grid lines threw out must not come back through the dead band
+        # below either; info keeps it, it is what the QC column has to show.
+        coarse = float("nan")
+    if total is None:
+        # No grid lines either way, so hand back what --rotation hough would have
+        # found: its vote threshold is the higher one, and the fine angle here is
+        # exactly the one nothing could confirm.
+        return get_rotation_angle(np_image), info
     if not np.isnan(coarse) and abs(total - coarse) < ROTATION_REFINE_MIN_DEG:
         return coarse, info
     return total, info
@@ -2097,7 +2126,7 @@ def run(args):
             if rotation_info["reason"]:
                 print(
                     f"WARNING: grid lines not used for the rotation of record {record} "
-                    f"({rotation_info['reason']}), keeping the Hough angle."
+                    f"({rotation_info['reason']}), keeping the whole degree Hough angle."
                 )
             if args.verbose:
                 deltas = ", ".join(f"{d:+.3f}" for d in rotation_info["deltas"])
