@@ -213,6 +213,21 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--resolution",
+        type=str,
+        choices=["keep", "lines"],
+        default="keep",
+        help=(
+            "lines = resample the page so that the printed 1 mm grid lines have the "
+            "period of a 200 dpi page, which is the scale the model was trained on; "
+            "a page within about a tenth of it keeps its pixels, because resampling it "
+            "costs more than the model loses to the scale. Everything after it, "
+            "the rotation and the perspective included, sees the resampled "
+            "page, and --grid_line_offset is a page unit, so its default stays right "
+            "for generator pages of any resolution. keep = take the page as it is."
+        ),
+    )
+    parser.add_argument(
         "--save_mask",
         action="store_true",
         default=False,
@@ -1426,6 +1441,233 @@ def estimate_perspective(image):
     return total, info
 
 
+# Period in pixels of the printed 1 mm grid lines of a 200 dpi page, which is the
+# scale the generator draws at and the only one the model was trained on.
+GRID_LINE_PERIOD_200DPI = 200 / 25.4
+# Period range in pixels the 1 mm lines are searched in, 1 mm at about 75 to 1000 dpi.
+# Far wider than GRID_LINE_PERIOD_RANGE of the rotation, which only needs some comb to
+# follow the phase of: here the period sets the scale of the whole page, so the 5 mm
+# lines of even a 1000 dpi page have to be a candidate of their own.
+RESOLUTION_PERIOD_RANGE = (3.0, 40.0)
+# Length in pixels of one window of the spectrum and how far the window is zero padded.
+# Over 512 px the line period of a warped page is constant enough to leave its peak
+# narrow, while the window still holds 65 lines of a 100 dpi page. The padding leaves
+# about 30 samples over the main lobe, which is what the parabola is fitted to.
+RESOLUTION_WINDOW = 512
+RESOLUTION_PADDING = 8
+# Half width in cycles per pixel of the running median that gives the local floor of
+# the spectrum. Wider than the main lobe of a peak (0.008 at this window length), so
+# that the floor steps over the comb instead of following it, and narrow enough to
+# follow the broadband hump that noise and paper texture leave.
+RESOLUTION_FLOOR_HALF_WIDTH = 0.01
+# Harmonics of the 5 mm comb one period hypothesis is scored on: the four lines below
+# the 1 mm fundamental, the fundamental itself and its second harmonic. A page whose
+# 5 mm lines are darker shows all of them, a wrong hypothesis only some.
+RESOLUTION_HARMONICS = (1, 2, 3, 4, 5, 10)
+# Largest 5 mm harmonic the strongest peak is tried as. Above the tenth the 1 mm lines
+# would be more than twice the period of the peak, which no printed grid shows.
+RESOLUTION_MAX_HARMONIC = 10
+# Half width of the window one harmonic is looked for in, relative to its frequency.
+# It covers the period drift of a warped page, and the 5 mm series is 20 % apart.
+RESOLUTION_HARMONIC_TOLERANCE = 0.004
+# How much a hypothesis has to beat the one that takes the strongest peak for the 1 mm
+# line itself. A grid whose 5 mm lines are not darker has no sub-harmonics to vote
+# with, so every hypothesis below it scores the same and none may win on a tie.
+RESOLUTION_HARMONIC_MARGIN = 1.2
+# Half width in bins of the window the 1 mm fundamental is refined in, half the main
+# lobe of the Hann window. It covers the bin quantisation of the strongest peak, which
+# the lowest hypothesis multiplies by five, and stops well short of the next harmonic.
+RESOLUTION_REFINE_BINS = 2 * RESOLUTION_PADDING
+# Relative scale change below which the page keeps its pixels. Resampling by a factor
+# that does not put every pixel back where it was blurs the page, and that blur costs
+# about what the wrong scale does: over 8 records a condition, scans at 0.92 and 0.88 of
+# the 200 dpi size read about a dB better kept (19.4 and 19.7 dB against 18.5 and 18.6),
+# while 0.80, 1.15 and 1.25 read better resampled, 1.25 collapsing to -5 dB kept and
+# 1.15 leaving single leads at -20 dB. The band is on the scale asked for, the inverse
+# of the page scale: 0.88 asks for 1.136 and 1.15 for 0.870, as far off as each other,
+# so no one band keeps the first and resamples the second. It ends between them and the
+# 0.92 page, which gives the 0.88 page its dB away rather than risk the leads at 1.15,
+# and it still leaves generator pages, 2 % off at most, untouched.
+RESOLUTION_DEAD_BAND = 0.12
+# A scale outside this is not a page of another resolution any more but a misread
+# grid, so the page is left alone and the reason says so.
+RESOLUTION_SCALE_RANGE = (0.2, 3.0)
+
+
+def _welch_spectrum(profiles):
+    """Frequencies and amplitude of the band profiles, summed over local windows.
+
+    One window over the whole page smears the peak of a page whose period drifts, and
+    it smears it in proportion to the frequency, which is what lets a harmonic of the
+    5 mm lines look sharper than the 1 mm lines themselves. Half overlapping windows
+    of RESOLUTION_WINDOW px keep every peak narrow. The phase of a window is its own,
+    so the powers are summed over windows and bands and the amplitude is their root.
+    """
+    width = profiles.shape[1]
+    length = min(RESOLUTION_WINDOW, width)
+    padded = RESOLUTION_PADDING * length
+    starts = np.arange(0, width - length + 1, max(length // 2, 1))
+    power = np.zeros(padded // 2 + 1)
+    for start in starts:
+        window = profiles[:, start : start + length]
+        # The mean of the single window, not of the page: uneven light is a slow ramp.
+        centred = window - window.mean(axis=1, keepdims=True)
+        spectrum = np.fft.rfft(centred * np.hanning(length), n=padded)
+        power += (np.abs(spectrum) ** 2).sum(axis=0)
+    return np.fft.rfftfreq(padded), np.sqrt(power)
+
+
+def _spectral_prominence(amplitude, bin_width):
+    """Spectrum amplitude above its local floor, clipped at zero.
+
+    The floor is a running median, which steps over the narrow peaks of a comb instead
+    of following them. Broadband noise raises the floor with the peak and so scores
+    nothing, while the grid lines of the same page still stand out of it.
+    """
+    half = max(int(round(RESOLUTION_FLOOR_HALF_WIDTH / bin_width)), 1)
+    # The edges of the spectrum have no window of their own, so they borrow one.
+    windows = np.lib.stride_tricks.sliding_window_view(
+        np.pad(amplitude, half, mode="edge"), 2 * half + 1
+    )
+    return np.clip(amplitude - np.median(windows, axis=-1), 0.0, None)
+
+
+def _harmonic_score(frequencies, prominence, period):
+    """How much of the 5 mm comb of a 1 mm period the page really shows.
+
+    The 5 mm lines sit at every fifth 1 mm line, so a page drawn with this period has
+    peaks at RESOLUTION_HARMONICS fifths of its fundamental. Each one is looked for in
+    a window around where it belongs, and a harmonic above Nyquist simply votes zero.
+    """
+    score = 0.0
+    for harmonic in RESOLUTION_HARMONICS:
+        frequency = harmonic / (5 * period)
+        if frequency >= 0.5:
+            continue
+        inside = np.abs(frequencies / frequency - 1) <= RESOLUTION_HARMONIC_TOLERANCE
+        if np.any(inside):
+            score += prominence[inside].max()
+    return score
+
+
+def measure_grid_period(image):
+    """Period in pixels of the printed 1 mm grid lines of a page, NaN if there is none.
+
+    image is the page as read_image gives it ([3, H, W]) or the same as a numpy array.
+    The page is straightened first: a tilt of two degrees drags a line across almost a
+    whole period of a 100 dpi page over one band of rows and washes the comb out.
+    The strongest peak of the spectrum is not the 1 mm line by itself, as blur favours
+    the low frequencies and leaves a photographed page with its 5 mm lines or their
+    second harmonic on top. Every harmonic of the 5 mm comb the peak could be is
+    therefore put up as a hypothesis and scored by how much of that comb the page
+    shows, and only then is the 1 mm fundamental of the winner refined.
+    Returns (period, info); info["harmonic"] is which 5 mm harmonic the strongest peak
+    turned out to be and info["reason"] says why a period came back NaN.
+    """
+    if not torch.is_tensor(image):
+        image = torch.from_numpy(np.ascontiguousarray(image))
+    info = {
+        "period": float("nan"),
+        "contrast": float("nan"),
+        "harmonic": 0,
+        "reason": "",
+    }
+    coarse = get_rotation_angle_fine(image.permute(1, 2, 0).numpy().astype(np.uint8))
+    # A page whose lines the Hough transform cannot find is taken as straight.
+    straight = rotate(image, 0.0 if np.isnan(coarse) else float(coarse))
+    profiles, _ = _band_profiles(_darkness(straight))
+    if profiles.shape[0] == 0:
+        info["reason"] = "image too small for the grid line profile"
+        return float("nan"), info
+
+    frequencies, amplitude = _welch_spectrum(profiles)
+    bin_width = frequencies[1] - frequencies[0]
+    prominence = _spectral_prominence(amplitude, bin_width)
+    low, high = RESOLUTION_PERIOD_RANGE
+    inside = np.flatnonzero((frequencies >= 1 / high) & (frequencies <= 1 / low))
+    if inside.size == 0 or not np.any(prominence[inside] > 0):
+        info["reason"] = "no grid line period found"
+        return float("nan"), info
+    peak = frequencies[inside[np.argmax(prominence[inside])]]
+
+    # The peak is the m-th harmonic of a 5 mm comb of the period m / (5 peak).
+    scores = {}
+    for harmonic in range(1, RESOLUTION_MAX_HARMONIC + 1):
+        candidate = harmonic / (5 * peak)
+        if low <= candidate <= high:
+            scores[harmonic] = _harmonic_score(frequencies, prominence, candidate)
+    best = max(scores, key=scores.get)
+    if scores[best] < RESOLUTION_HARMONIC_MARGIN * scores[5]:
+        best = 5
+    info["harmonic"] = best
+
+    # Parabolic interpolation of the power peak at the 1 mm fundamental of the winner.
+    centre = int(round(5 * peak / best / bin_width))
+    first = max(centre - RESOLUTION_REFINE_BINS, 1)
+    last = min(centre + RESOLUTION_REFINE_BINS + 1, amplitude.size - 1)
+    top = first + int(np.argmax(amplitude[first:last]))
+    frequency = frequencies[top]
+    # Through the power, as _grid_line_period does it, not through the amplitude.
+    left, middle, right = amplitude[top - 1 : top + 2] ** 2
+    curvature = left - 2 * middle + right
+    if curvature < 0:
+        frequency += 0.5 * (left - right) / curvature * bin_width
+    info["period"] = float(1 / frequency)
+
+    def comb(candidate):
+        # Non-coherent sum: the bands of a page that is still a little tilted differ.
+        return np.abs(_grid_line_comb(profiles, candidate)).sum()
+
+    background = np.mean([comb(info["period"] * f) for f in (0.93, 0.96, 1.04, 1.07)])
+    info["contrast"] = float(comb(info["period"]) / max(background, 1e-9))
+    if info["contrast"] < GRID_LINE_MIN_CONTRAST:
+        info["reason"] = f"no grid lines found (contrast {info['contrast']:.1f})"
+        return float("nan"), info
+    return info["period"], info
+
+
+def normalise_resolution(image):
+    """Resample a page so that its printed 1 mm grid has the period of a 200 dpi page.
+
+    The model only segments pages near the scale it was trained on, and the width of a
+    page is no scale: it can be cropped, photographed or printed on another paper size.
+    The printed grid is. Inside RESOLUTION_DEAD_BAND the very image object comes back,
+    so that a page near enough to that scale keeps every one of its pixels: resampling
+    a page that is only a little off costs more than being off the scale does.
+    Returns (image, info), a tensor [3, H, W] uint8 in and out as warp_page. info is
+    the measurement plus the scale the page was resampled by, 1.0 when it was left
+    alone, and info["reason"] says why it was left alone, if there is a why.
+    """
+    if not torch.is_tensor(image):
+        image = torch.from_numpy(np.ascontiguousarray(image))
+    period, measured = measure_grid_period(image)
+    # The whole measurement, but with the period of a rejected grid left at NaN.
+    info = {**measured, "period": period, "scale": 1.0}
+    if not np.isfinite(period):
+        return image, info
+
+    scale = GRID_LINE_PERIOD_200DPI / period
+    low, high = RESOLUTION_SCALE_RANGE
+    if not low <= scale <= high:
+        info["reason"] = f"grid lines ask for a scale of {scale:.2f}"
+        return image, info
+    if abs(scale - 1) <= RESOLUTION_DEAD_BAND:
+        return image, info
+
+    array = np.ascontiguousarray(image.permute(1, 2, 0).numpy())
+    height, width = array.shape[:2]
+    resized = cv2.resize(
+        array,
+        (int(round(width * scale)), int(round(height * scale))),
+        # Thin lines fall between the samples of a page that is shrunk by picking
+        # pixels, so a shrinking page is averaged over and only a growing one is
+        # interpolated, which keeps its traces smooth instead of blocky.
+        interpolation=cv2.INTER_AREA if scale < 1 else cv2.INTER_CUBIC,
+    )
+    info["scale"] = float(scale)
+    return torch.from_numpy(resized.transpose(2, 0, 1).copy()), info
+
+
 def baseline_row(ratio, image_height, scale=1.0):
     """Row of the zero line of one lead, for a page rescaled about its centre."""
     centre = image_height / 2
@@ -1690,11 +1932,15 @@ def write_record(record, signals, sig_names, output_folder, placement):
                 wfdb.wrsamp(record, p_signal=signals, **kwargs)
 
 
-def save_mask_files(mask, record, output_folder, rot_angle, homography=None):
+def save_mask_files(
+    mask, record, output_folder, rot_angle, homography=None, scale=1.0
+):
     """Save the predicted mask as PNG plus a small JSON with the frame info.
 
     homography is the map from the image to the frame the mask lives in, written out
     only when the page was warped: a file without one means the rotation alone.
+    scale is what --resolution resampled the page by before all of that, written out
+    only when it did: a file without one means the page at the size it came in.
     """
     mask_to_save = mask.to(torch.uint8)
     write_png(mask_to_save, os.path.join(output_folder, f"{record}_mask.png"))
@@ -1705,6 +1951,9 @@ def save_mask_files(mask, record, output_folder, rot_angle, homography=None):
     }
     if homography is not None:
         meta["homography"] = np.asarray(homography).tolist()
+    # NaN is the stage being off, 1.0 the page having been left at its own scale.
+    if np.isfinite(scale) and scale != 1.0:
+        meta["scale"] = float(scale)
     with open(os.path.join(output_folder, f"{record}_mask.json"), "w") as f:
         json.dump(meta, f)
 
@@ -1734,6 +1983,8 @@ def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
         "rotation_residual_px",
         "perspective_shift_px",
         "perspective_residual_px",
+        "grid_period_px",
+        "resolution_scale",
     ]
     write_header = not os.path.exists(qc_path)
     with open(qc_path, "a", newline="") as f:
@@ -1821,6 +2072,25 @@ def run(args):
         image = read_image(image_file_path)
         image = image[:3]
 
+        # Rescale
+        resolution_info = {"period": float("nan"), "scale": float("nan")}
+        if args.resolution == "lines":
+            image, resolution_info = normalise_resolution(image)
+            if resolution_info["reason"]:
+                print(
+                    f"WARNING: grid lines not used for the resolution of "
+                    f"record {record} ({resolution_info['reason']}), keeping "
+                    f"the page as it is."
+                )
+            if args.verbose:
+                print(
+                    f"Resolution for record {record}: period "
+                    f"{resolution_info['period']:.3f} px, harmonic "
+                    f"{resolution_info['harmonic']}, scale "
+                    f"{resolution_info['scale']:.4f}, size "
+                    f"{image.shape[2]} x {image.shape[1]} px"
+                )
+
         # Rotate
         rot_angle, rotation_info = estimate_rotation(image, args.rotation)
         if args.rotation == "lines":
@@ -1894,6 +2164,15 @@ def run(args):
                     f"No mask found for record {record} at {mask_path}."
                 )
             mask_to_use = read_image(mask_path)
+            # A mask of another size cannot be laid over this page at all, and the
+            # only thing that changes the size of a page is the resolution stage.
+            if mask_to_use.shape[1:] != image_rotated.shape[1:]:
+                raise ValueError(
+                    f"Mask of record {record} is {mask_to_use.shape[2]} x "
+                    f"{mask_to_use.shape[1]} px, the page is "
+                    f"{image_rotated.shape[2]} x {image_rotated.shape[1]} px; "
+                    f"the mask was predicted for another --resolution."
+                )
         else:
             mask_to_use = predict_mask_nnunet(
                 image_rotated,
@@ -1905,7 +2184,12 @@ def run(args):
             )
         if args.save_mask:
             save_mask_files(
-                mask_to_use, record, args.output_folder, rot_angle, homography
+                mask_to_use,
+                record,
+                args.output_folder,
+                rot_angle,
+                homography,
+                resolution_info["scale"],
             )
 
         # Use mask to cut into single, binary masks
@@ -2085,6 +2369,8 @@ def run(args):
         qc["rotation_residual_px"] = rotation_info["residual"]
         qc["perspective_shift_px"] = perspective_info["shift"]
         qc["perspective_residual_px"] = perspective_info["residual"]
+        qc["grid_period_px"] = resolution_info["period"]
+        qc["resolution_scale"] = resolution_info["scale"]
         append_qc_row(
             args.output_folder, record, args.lead_placement, qc, max_offset_deviation
         )
