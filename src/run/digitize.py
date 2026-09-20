@@ -370,14 +370,24 @@ def filter_lines(lines, degree_window=20, parallelism_count=0, parallelism_windo
     # Further filter lines based on parallelism
     parallel_lines = []
     if len(filtered_lines) > 0:
-        for rho, theta in filtered_lines:
-            count = 0
-            for comp_rho, comp_theta in filtered_lines:
-                if (
-                    abs(theta - comp_theta) < parallelism_radian
-                    or abs((theta - comp_theta) - np.pi) < parallelism_radian
-                ):
-                    count += 1
+        # Counting the angles inside the window of every line pair by pair is
+        # quadratic, and a fine theta step leaves tens of thousands of lines. Over the
+        # sorted angles the count is two lookups per line: "right" at the lower edge
+        # and "left" at the upper one leave out an angle sitting exactly on an edge, as
+        # the strict comparisons did, and a line still counts itself. Carrying the
+        # window to the angles in float64 decides every pair as the float32 difference
+        # did: angles this close subtract exactly, and an edge that float64 places 1e-16
+        # off still falls between two float32 angles, which lie 1e-7 apart.
+        angles = np.array(line_angles, dtype=np.float64)
+        ordered = np.sort(angles)
+        counts = np.searchsorted(ordered, angles + parallelism_radian, side="left")
+        counts -= np.searchsorted(ordered, angles - parallelism_radian, side="right")
+        # The second branch of the pair count, one-sided as it was: the angles a whole
+        # pi below this one, never the ones a whole pi above it.
+        turned = angles - np.pi
+        counts += np.searchsorted(ordered, turned + parallelism_radian, side="left")
+        counts -= np.searchsorted(ordered, turned - parallelism_radian, side="right")
+        for (rho, theta), count in zip(filtered_lines, counts):
             if count >= parallelism_count:
                 parallel_lines.append((rho, theta))
 

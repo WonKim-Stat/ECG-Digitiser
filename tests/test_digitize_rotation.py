@@ -4,6 +4,7 @@ No model, no data files: every page is synthesised with numpy/cv2/torch.
 """
 import csv
 import json
+import time
 from functools import lru_cache
 
 import cv2
@@ -128,6 +129,154 @@ def test_get_lines_keeps_its_default_behaviour():
     # every line into several near duplicate hits.
     assert np.all(np.abs(fine[:, 0, 1] - np.pi / 2) <= np.deg2rad(31))
     assert near_horizontal(fine) > near_horizontal(default)
+
+
+# -------------------------------------------------------------------- filter_lines
+def _filter_lines_pair_by_pair(
+    lines, degree_window=20, parallelism_count=0, parallelism_window=2
+):
+    """The reference: filter_lines as it counted the pairs one by one."""
+    parallelism_radian = np.deg2rad(parallelism_window)
+    filtered_lines = []
+
+    if lines is not None:
+        for line in lines:
+            for rho, theta in line:
+                if digitize.is_within_x_degrees_of_horizontal(theta, degree_window):
+                    filtered_lines.append((rho, theta))
+
+    parallel_lines = []
+    if len(filtered_lines) > 0:
+        for rho, theta in filtered_lines:
+            count = 0
+            for comp_rho, comp_theta in filtered_lines:
+                if (
+                    abs(theta - comp_theta) < parallelism_radian
+                    or abs((theta - comp_theta) - np.pi) < parallelism_radian
+                ):
+                    count += 1
+            if count >= parallelism_count:
+                parallel_lines.append((rho, theta))
+
+    if len(parallel_lines) == 0:
+        parallel_lines = None
+    else:
+        parallel_lines = np.array(parallel_lines)[:, np.newaxis, :]
+
+    return parallel_lines
+
+
+def _hough_lines(thetas, rng):
+    """The angles as cv2 hands them over: a float32 [n, 1, 2] array, rho and theta."""
+    rho = rng.uniform(-2000, 2000, len(thetas))
+    return np.stack([rho, thetas], axis=1).astype(np.float32)[:, np.newaxis, :]
+
+
+def _thetas(rng, n, kind, parallelism_window):
+    """n angles of the given kind, in radians."""
+    if kind == "horizontal":
+        return np.pi / 2 + rng.normal(0, np.deg2rad(3), n)
+    if kind == "spread":
+        return rng.uniform(0, np.pi, n)
+    if kind == "wrap":
+        # Half of them just above zero, half just below pi, which is the only way the
+        # second branch of the count sees anything. They sit on a grid of a thousandth
+        # of a radian: that branch rounds its difference to float32 around pi, where a
+        # step is 2e-7 wide, and no difference of this grid comes that close to a
+        # window edge, so the rounding cannot decide a pair either way.
+        grid = rng.integers(0, 60, n) / 1000.0
+        return np.where(rng.random(n) < 0.5, grid, np.pi - grid)
+    if kind == "window_apart":
+        # Whole multiples of the window apart, where the open edge has to decide.
+        return np.pi / 2 + np.deg2rad(parallelism_window) * rng.integers(-3, 4, n)
+    if kind == "duplicates":
+        return np.repeat(rng.uniform(0, np.pi, max(n // 4, 1)), 4)[:n]
+    raise ValueError(kind)
+
+
+# The two combinations the code base uses, one of them the defaults, and wider ones
+# on top: a degree window beyond 90 is what leaves angles a whole pi apart in at all.
+_FILTER_CASES = [
+    (30, 3, 2),
+    (20, 0, 2),
+    (95, 4, 2),
+    (20, 5, 0.5),
+    (5, 2, 10),
+    (30, 3, 0),
+]
+
+
+@pytest.mark.parametrize(
+    "degree_window,parallelism_count,parallelism_window", _FILTER_CASES
+)
+def test_filter_lines_keeps_what_the_pair_by_pair_count_kept(
+    degree_window, parallelism_count, parallelism_window
+):
+    """The sorted count is the old double loop, line for line and bit for bit."""
+    rng = np.random.default_rng(20250919)
+    for kind in ("horizontal", "spread", "wrap", "window_apart", "duplicates"):
+        for n in (0, 1, 2, 5, 40, 200):
+            lines = _hough_lines(_thetas(rng, n, kind, parallelism_window), rng)
+            expected = _filter_lines_pair_by_pair(
+                lines, degree_window, parallelism_count, parallelism_window
+            )
+            kept = digitize.filter_lines(
+                lines, degree_window, parallelism_count, parallelism_window
+            )
+            if expected is None:
+                assert kept is None, (kind, n)
+            else:
+                assert kept is not None, (kind, n)
+                assert (kept.dtype, kept.shape) == (expected.dtype, expected.shape)
+                assert np.array_equal(kept, expected), (kind, n)
+
+
+def test_filter_lines_keeps_the_empty_answers():
+    rng = np.random.default_rng(1)
+    assert digitize.filter_lines(None) is None
+    assert digitize.filter_lines(_hough_lines(np.array([]), rng)) is None
+    # Nothing inside the degree window, and nothing with enough parallel lines.
+    vertical = _hough_lines(np.array([0.0, 0.05]), rng)
+    assert digitize.filter_lines(vertical, degree_window=2) is None
+    assert (
+        digitize.filter_lines(vertical, degree_window=95, parallelism_count=3) is None
+    )
+
+
+def test_filter_lines_counts_the_wrap_around_in_one_direction_only():
+    """Two lines a whole pi apart are the same line, but the count is one-sided.
+
+    It only ever tested theta - comp_theta - pi, so the upper of the two sees the
+    lower one below it while the lower one sees nothing, and that stays that way.
+    """
+    rng = np.random.default_rng(2)
+    lines = _hough_lines(np.array([0.01, np.pi - 0.01]), rng)
+    kept = digitize.filter_lines(lines, degree_window=95, parallelism_count=2)
+    assert kept.shape == (1, 1, 2)
+    assert kept[0, 0, 1] == pytest.approx(np.pi - 0.01, abs=1e-6)
+    # And the lower line alone counts itself only, so nothing is left.
+    assert (
+        digitize.filter_lines(lines[:1], degree_window=95, parallelism_count=2) is None
+    )
+
+
+def test_filter_lines_takes_the_lines_of_a_vector_page_in_a_moment():
+    """What the sorted count is for: a noise-free page floods the fine accumulator.
+
+    A vector rendered page leaves tens of thousands of near duplicate lines where a
+    scan leaves a few hundred, and counting those pair by pair is quadratic: 4000
+    lines already took 15 s, the 18000 of such a page took over seven minutes.
+    """
+    rng = np.random.default_rng(3)
+    lines = _hough_lines(np.pi / 2 + rng.normal(0, np.deg2rad(2), 20000), rng)
+    start = time.perf_counter()
+    kept = digitize.filter_lines(
+        lines, degree_window=30, parallelism_count=3, parallelism_window=2
+    )
+    elapsed = time.perf_counter() - start
+    assert kept.shape == (20000, 1, 2)
+    # Measured at 0.12 s, with room for a machine that has other work to do.
+    assert elapsed < 2.0
 
 
 # ---------------------------------------------------------------- grid_line_slope
