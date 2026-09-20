@@ -186,6 +186,22 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--interpolation",
+        type=str,
+        choices=["nearest", "bicubic"],
+        default="nearest",
+        help=(
+            "How the page is resampled when it is turned by the rotation angle. "
+            "nearest = rotate() as before, which keeps every pixel as sharp as it was; "
+            "bicubic = one cv2 warp that keeps thin traces and grid lines in one piece "
+            "instead of breaking them into steps, at the price of a little blur. Not a "
+            "clear gain: +0.5 to +0.8 dB on synthetic pages whose exact derotation lands "
+            "back on their own pixel lattice, -0.3 dB on the rotated generator set, "
+            "where it cannot. A page that --perspective lines rectifies is resampled "
+            "bicubically either way."
+        ),
+    )
+    parser.add_argument(
         "--perspective",
         type=str,
         choices=["off", "lines"],
@@ -1817,16 +1833,29 @@ def run(args):
                 f"No rotation angle found for record {record}, using 0.0 degrees instead."
             )
             rot_angle = 0.0
-        image_rotated = rotate(image, rot_angle)
+        rotation = rotation_homography(rot_angle, image.shape[2], image.shape[1])
+        # Both interpolations put the page in the same frame, only the resampling
+        # differs; a straight page keeps its pixels and is never warped.
+        if args.interpolation == "bicubic" and rot_angle != 0.0:
+            image_rotated = warp_page(image, rotation)
+        else:
+            image_rotated = rotate(image, rot_angle)
 
         # Rectify
         homography = None
         perspective_info = {"shift": float("nan"), "residual": float("nan")}
         if args.perspective == "lines":
-            rotation = rotation_homography(rot_angle, image.shape[2], image.shape[1])
+            # The page has to be measured in the frame of the final warp, because
             # rotate() interpolates nearest, which below a twentieth of a degree moves
-            # no pixel at all, so the page is measured in the frame of the final warp.
-            H_rect, perspective_info = estimate_perspective(warp_page(image, rotation))
+            # no pixel at all. The bicubic page already is that frame and the warp of a
+            # straight page gives its own pixels back, so neither is warped twice.
+            if rot_angle == 0.0:
+                measured = image
+            elif args.interpolation == "bicubic":
+                measured = image_rotated
+            else:
+                measured = warp_page(image, rotation)
+            H_rect, perspective_info = estimate_perspective(measured)
             if perspective_info["reason"]:
                 print(
                     f"WARNING: grid lines not used for the perspective of record "

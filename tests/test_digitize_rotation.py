@@ -277,6 +277,14 @@ def test_parser_rotation_defaults_to_hough():
     assert args.rotation == "lines"
 
 
+def test_parser_interpolation_defaults_to_nearest():
+    parser = digitize.get_parser()
+    args = parser.parse_args(["-d", "data", "-o", "out"])
+    assert args.interpolation == "nearest"
+    args = parser.parse_args(["-d", "data", "-o", "out", "--interpolation", "bicubic"])
+    assert args.interpolation == "bicubic"
+
+
 def test_append_qc_row_writes_the_rotation_columns(tmp_path):
     qc = {"rotation_angle": -0.37, "rotation_coarse": -0.4, "rotation_residual_px": 0.1}
     digitize.append_qc_row(str(tmp_path), "rec", "column", qc, 0.0)
@@ -335,3 +343,104 @@ def test_run_with_rotation_lines_reports_the_angle(tmp_path, capsys):
     assert float(row["rotation_angle"]) == pytest.approx(-0.37, abs=0.01)
     assert float(row["rotation_coarse"]) == pytest.approx(-0.4, abs=1e-9)
     assert float(row["rotation_residual_px"]) < 1.0
+
+
+# ------------------------------------------------------ interpolation of the page
+def test_bicubic_leaves_the_grid_lines_straighter_than_rotate():
+    """What the flag is for, measured without a model.
+
+    rotate() interpolates nearest, so the vertical lines of a turned page step from
+    one column to the next instead of leaning. grid_line_slope fits a straight phase
+    drift through the bands and its residual is what those steps leave behind, while
+    the bicubic warp moves the same lines smoothly.
+    """
+    page = _tensor(_page(0.3))
+    rotation = digitize.rotation_homography(-0.3, WIDTH, HEIGHT)
+    nearest = digitize.grid_line_slope(rotate(page, -0.3))["residual"]
+    bicubic = digitize.grid_line_slope(digitize.warp_page(page, rotation))["residual"]
+    # Measured: 0.169 px of steps against 0.015 px, an order of magnitude apart.
+    assert nearest > 0.1
+    assert bicubic < nearest / 5
+
+
+def _spy(monkeypatch, name):
+    """Count the calls of digitize.<name> and keep their arguments, behaviour as is."""
+    calls = []
+    real = getattr(digitize, name)
+
+    def spy(*args, **kwargs):
+        calls.append(args)
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(digitize, name, spy)
+    return calls
+
+
+def _run_page(tmp_path, page, *flags):
+    """run() over one synthetic page with the flat mask, no model and no data files."""
+    data_folder, mask_folder = tmp_path / "data", tmp_path / "masks"
+    data_folder.mkdir()
+    mask_folder.mkdir()
+    write_png(_tensor(page), str(data_folder / "rec.png"))
+    write_png(torch.from_numpy(_label_mask())[None], str(mask_folder / "rec_mask.png"))
+    digitize.run(
+        digitize.get_parser().parse_args(
+            [
+                "-d", str(data_folder),
+                "-o", str(tmp_path / "out"),
+                "--mask_folder", str(mask_folder),
+                "--time_mapping", "bbox",
+                *flags,
+            ]
+        )
+    )
+
+
+def _qc_angle(tmp_path):
+    with open(tmp_path / "out" / "qc.csv", newline="") as f:
+        return float(next(csv.DictReader(f))["rotation_angle"])
+
+
+def test_run_with_nearest_turns_the_page_with_rotate(tmp_path, monkeypatch):
+    # --rotation hough is the default and rotates nothing itself, so the one call is
+    # the page; the whole degree Hough transform reads this page as -2.0.
+    rotates, warps = _spy(monkeypatch, "rotate"), _spy(monkeypatch, "warp_page")
+    _run_page(tmp_path, _page(2.0))
+    assert _qc_angle(tmp_path) == pytest.approx(-2.0)
+    assert len(rotates) == 1 and rotates[0][1] == pytest.approx(-2.0)
+    assert warps == []
+
+
+def test_run_with_bicubic_warps_the_page_once(tmp_path, monkeypatch):
+    rotates, warps = _spy(monkeypatch, "rotate"), _spy(monkeypatch, "warp_page")
+    _run_page(tmp_path, _page(2.0), "--interpolation", "bicubic")
+    angle = _qc_angle(tmp_path)
+    assert len(warps) == 1
+    assert np.allclose(warps[0][1], digitize.rotation_homography(angle, WIDTH, HEIGHT))
+    assert rotates == []
+
+
+def test_run_with_bicubic_leaves_a_straight_page_alone(tmp_path, monkeypatch):
+    rotates, warps = _spy(monkeypatch, "rotate"), _spy(monkeypatch, "warp_page")
+    _run_page(tmp_path, _page(), "--interpolation", "bicubic")
+    # An angle of zero keeps the old path, so the page is not resampled at all.
+    assert _qc_angle(tmp_path) == 0.0
+    assert warps == []
+    assert len(rotates) == 1 and rotates[0][1] == 0.0
+
+
+def test_run_with_perspective_reuses_the_bicubic_page(tmp_path, monkeypatch):
+    warps = _spy(monkeypatch, "warp_page")
+    _run_page(
+        tmp_path, _page(2.0), "--interpolation", "bicubic", "--perspective", "lines"
+    )
+    # One warp for both purposes: the perspective is measured on the turned page, and
+    # a page whose grid is straight again needs no rectifying warp on top.
+    assert len(warps) == 1
+
+
+def test_run_with_perspective_does_not_warp_a_straight_page(tmp_path, monkeypatch):
+    warps = _spy(monkeypatch, "warp_page")
+    _run_page(tmp_path, _page(), "--perspective", "lines")
+    # The measurement would only warp by the identity, so it takes the image itself.
+    assert warps == []
