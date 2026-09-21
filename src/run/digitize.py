@@ -164,6 +164,19 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--trace_estimator",
+        type=str,
+        choices=["mask", "ink"],
+        default="mask",
+        help=(
+            "Only for --time_mapping grid. mask = the row of a column is the mean row "
+            "of the binary mask; ink = the mean row is weighted by the ink of the page "
+            "under the mask, which puts the row on the core of the stroke instead of "
+            "in the middle of the mask, and keeps the mask mean for a lead whose "
+            "stroke is too faint to weigh with."
+        ),
+    )
+    parser.add_argument(
         "--baseline",
         type=str,
         choices=["page", "leads"],
@@ -715,6 +728,19 @@ def _darkness(image):
     """Darkness of a CHW image, 0 = white and 255 = black, as the grid lines show up."""
     array = image.numpy() if torch.is_tensor(image) else image
     return 255.0 - array.min(axis=0).astype(float)
+
+
+def _ink(image):
+    """Ink of a CHW image, 0 = white and 255 = black, as only the traces show up.
+
+    _darkness takes the darkest channel, so that a coloured grid line counts as dark
+    as a trace, which is what the grid measurements want. Here the opposite is
+    wanted: the lightest channel leaves a red grid line, which is bright in its own
+    channel, as white as the paper and keeps only the black trace. On a grey page
+    the two are the same.
+    """
+    array = image.numpy() if torch.is_tensor(image) else image
+    return 255.0 - array.max(axis=0).astype(float)
 
 
 def _band_profiles(darkness, band_height=GRID_LINE_BAND_HEIGHT):
@@ -1706,10 +1732,74 @@ def baseline_row(ratio, image_height, scale=1.0):
     return centre + scale * ((1 - ratio) * image_height - centre)
 
 
+# Steepness of the ink weights, which trades the timing bias of a resampled page
+# against the noise of a soft or a grainy one. The square takes out a fifth of the
+# bias (+0.9 dB on resampled pages), the fourth power a third (+1.6 dB) with one
+# generator lead of 1152 losing more than 1 dB, the eighth more still (+2.2 dB) but
+# dozens of leads on the augmented and the blurred pages lose more than 1 dB.
+INK_WEIGHT_POWER = 4
+# Minimal 95th percentile of the ink under a mask, relative to black, for the weights
+# to say anything; below it the lead keeps the mask mean. It separates a blurred
+# stroke, which spreads its ink over more and lighter pixels (p95 137 to 224, median
+# 170) and only loses by being weighted, from a crisp or resampled one (200 to 255).
+INK_MIN_CONTRAST = 0.75
+
+
+def _ink_profile(ink_map, binary, position, mean_profile, filled, info=None):
+    """Ink weighted mean row of every filled column of one lead, in image coordinates.
+
+    A resampled page moves the mask and the ink apart: on a steep flank the binary
+    mask sits 0.2 to 0.3 px left of the ink, while the ink itself is still where the
+    grid says it is. Weighting the mask rows by the ink to a high power keeps the
+    support of the mask, which follows the trace through a sharp peak better than the
+    ink blob does, but lets the core of the stroke decide the row. A soft page is the
+    other way round: blur fills a narrow peak with ink, so a lead whose stroke is too
+    pale for the weights keeps the mask mean, whole and for all of its columns.
+    info, if given, is filled with the measurement of this lead.
+    """
+    height, width = binary.shape
+    patch = ink_map[
+        position["y1"] : position["y1"] + height,
+        position["x1"] : position["x1"] + width,
+    ]
+    p95 = float(np.percentile(patch[binary], 95))
+    if info is not None:
+        info["ink_p95"] = p95
+        info["ink_used"] = p95 >= INK_MIN_CONTRAST * 255
+    if p95 < INK_MIN_CONTRAST * 255:
+        return mean_profile
+
+    # Not clipped at 1: the darkest pixels of a crisp stroke are meant to outweigh.
+    weight = binary * (patch / p95) ** INK_WEIGHT_POWER
+    rows = np.arange(height)[:, None]
+    total = weight.sum(axis=0)[filled]
+    centroid = (weight * rows).sum(axis=0)[filled] / np.where(total > 0, total, 1)
+    # A column that is pure white under its mask has no centroid, so it alone keeps
+    # the mask mean instead of turning into a NaN.
+    return np.where(total > 0, position["y1"] + centroid, mean_profile)
+
+
 def vectorise_grid(
-    image_rotated, mask, position, g0, P, column, is_long, y_shift_ratio, lead, scale=1.0
+    image_rotated,
+    mask,
+    position,
+    g0,
+    P,
+    column,
+    is_long,
+    y_shift_ratio,
+    lead,
+    scale=1.0,
+    ink_map=None,
+    info=None,
 ):
-    """Vectorise one lead by sampling it on the shared column grid."""
+    """Vectorise one lead by sampling it on the shared column grid.
+
+    ink_map is the ink of the whole page from _ink(), which weighs the mask rows by
+    the ink under them; None is the mask on its own. The return value stays the
+    signal, because that is what every caller reads, so info, if given, is the dict
+    the ink measurement of this lead is reported in.
+    """
     total_seconds = LONG_SIGNAL_LENGTH_SEC if is_long else SHORT_SIGNAL_LENGTH_SEC
     y_shift_ratio_ = y_shift_ratio["full"] if is_long else y_shift_ratio[lead]
     values_needed = int(total_seconds * FREQUENCY)
@@ -1722,9 +1812,13 @@ def vectorise_grid(
     filled = np.flatnonzero(count > 0)
     rows = np.arange(binary.shape[0])[:, None]
     profile = position["y1"] + (binary * rows).sum(axis=0)[filled] / count[filled]
+    if ink_map is not None:
+        profile = _ink_profile(ink_map, binary, position, profile, filled, info)
 
     # Pixel c covers [c, c+1), so its centre is at c + 0.5. np.interp holds the edges.
     x = g0 + column * P + np.arange(values_needed) * P / samples_per_column - 0.5
+    # The lead is read where its ink is, so the shift moves the columns of the
+    # profile and not the sampling grid, which belongs to the printed grid.
     sampled = np.interp(x, position["x1"] + filled, profile)
     baseline = baseline_row(y_shift_ratio_, image_rotated.shape[1], scale)
 
@@ -2017,6 +2111,9 @@ def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
         "perspective_residual_px",
         "grid_period_px",
         "resolution_scale",
+        "trace_estimator",
+        "ink_leads",
+        "ink_p95",
     ]
     write_header = not os.path.exists(qc_path)
     with open(qc_path, "a", newline="") as f:
@@ -2271,6 +2368,12 @@ def run(args):
                     print(f"Column grid for record {record}: g0 {g0:.2f} px, P {P:.2f} px")
         mm_per_pixel = 25 * sec_per_pixel
         mV_per_pixel = mm_per_pixel / 10
+        # The ink of the page, read once for all its leads. Only the grid sampling
+        # knows what to do with it, so a page that falls back to bbox is left alone.
+        ink_map = None
+        if args.trace_estimator == "ink" and g0 is not None:
+            ink_map = _ink(image_rotated)
+        ink_measured = []
         signals_predicted = {}
         for lead, mask in signal_masks_cropped.items():
             if mask is None:
@@ -2301,6 +2404,7 @@ def run(args):
                             f"Lead {lead} of record {record} has mask pixels up to "
                             f"{overhang:.0f} px outside its column, ignored."
                         )
+                ink = {}
                 signals_predicted[lead] = vectorise_grid(
                     image_rotated,
                     mask,
@@ -2312,7 +2416,11 @@ def run(args):
                     Y_SHIFT_RATIO,
                     lead,
                     baseline_scale,
+                    ink_map=ink_map,
+                    info=ink,
                 )
+                if ink:
+                    ink_measured.append(ink)
             else:
                 signals_predicted[lead] = vectorise(
                     image_rotated,
@@ -2323,6 +2431,18 @@ def run(args):
                     Y_SHIFT_RATIO,
                     lead,
                 )
+
+        # One number for the ink of the page: the median over the leads that were
+        # measured, the gated ones included, so that a page that is too pale shows.
+        ink_leads = sum(ink["ink_used"] for ink in ink_measured)
+        ink_p95 = float("nan")
+        if ink_measured:
+            ink_p95 = float(np.median([ink["ink_p95"] for ink in ink_measured]))
+        if args.trace_estimator == "ink" and args.verbose:
+            print(
+                f"Trace estimator for record {record}: ink on {ink_leads}/"
+                f"{len(ink_measured)} leads, ink p95 {ink_p95:.0f}"
+            )
 
         # Put the baseline of the whole record where the limb lead sums vanish.
         baseline_shift, baseline_disagreement = 0.0, float("nan")
@@ -2403,6 +2523,9 @@ def run(args):
         qc["perspective_residual_px"] = perspective_info["residual"]
         qc["grid_period_px"] = resolution_info["period"]
         qc["resolution_scale"] = resolution_info["scale"]
+        qc["trace_estimator"] = args.trace_estimator
+        qc["ink_leads"] = ink_leads
+        qc["ink_p95"] = ink_p95
         append_qc_row(
             args.output_folder, record, args.lead_placement, qc, max_offset_deviation
         )

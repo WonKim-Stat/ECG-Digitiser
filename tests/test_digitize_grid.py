@@ -475,6 +475,157 @@ def test_vectorise_grid_pixel_centre_convention_has_no_lag(lead):
     assert abs(best) < 0.25, f"best lag {best:.2f} samples"
 
 
+# -------------------------------------------------------------- trace estimator
+# A flat lead for the ink weights, far enough from the page edges to draw around.
+FLAT_ROW = 900
+
+
+def _inked_page(label, value=0):
+    """The page of a label mask: every labelled pixel drawn in grey, the rest white."""
+    page = np.full((3, HEIGHT, WIDTH), 255, dtype=np.uint8)
+    page[:, label > 0] = value
+    return torch.from_numpy(page)
+
+
+def _flat_lead(band, ink_rows, ink_value=0, red_row=None, white_column=None):
+    """One flat lead of V5: a mask band of rows and the ink drawn under it.
+
+    band and ink_rows are row offsets from FLAT_ROW, ink_value the grey level the
+    ink is drawn in, red_row an offset drawn as a coloured grid line instead and
+    white_column a column of the lead left without any ink at all.
+    Returns (mask, position, image), as run() hands them to vectorise_grid.
+    """
+    column = SHORT_COLUMNS["V5"]
+    start = int(np.ceil(G0_TRUE + column * P_TRUE - 0.5))
+    end = int(np.ceil(G0_TRUE + (column + 1) * P_TRUE - 0.5))
+    label = np.zeros((HEIGHT, WIDTH), dtype=np.uint8)
+    label[[FLAT_ROW + offset for offset in band], start:end] = LEAD_LABEL_MAPPING["V5"]
+    image = torch.full((3, HEIGHT, WIDTH), 255, dtype=torch.uint8)
+    for offset in ink_rows:
+        image[:, FLAT_ROW + offset, start:end] = ink_value
+    if red_row is not None:
+        image[0, FLAT_ROW + red_row, start:end] = 255
+        image[1:, FLAT_ROW + red_row, start:end] = 0
+    if white_column is not None:
+        image[:, :, start + white_column] = 255
+    masks, positions, _ = digitize.cut_binary(torch.from_numpy(label)[None], image)
+    return masks["V5"], positions["V5"], image
+
+
+def _flat_signal(mask, position, image, ink_map=None, info=None):
+    """The one value of a flat lead, in mV, as vectorise_grid reads it."""
+    out = digitize.vectorise_grid(
+        image, mask, position, G0_TRUE, P_TRUE,
+        SHORT_COLUMNS["V5"], False, Y_SHIFT_RATIO, "V5", 1.0,
+        ink_map=ink_map, info=info,
+    )
+    return float(np.median(out.numpy()))
+
+
+def _row_in_mV(row):
+    """The value vectorise_grid gives a short lead of V5 read on this row."""
+    # Pixel row r covers [r, r + 1), so the trace on it sits at row + 0.5.
+    return (_baseline_row("V5", False) - (row + 0.5)) * MV_PER_PIXEL
+
+
+def _mask_mean_profile(mask, position):
+    """The mask mean profile of one lead, as vectorise_grid computes it."""
+    binary = mask[0].numpy() > 0
+    count = binary.sum(axis=0)
+    filled = np.flatnonzero(count > 0)
+    rows = np.arange(binary.shape[0])[:, None]
+    mean = position["y1"] + (binary * rows).sum(axis=0)[filled] / count[filled]
+    return binary, filled, mean
+
+
+def test_vectorise_grid_without_an_ink_map_never_looks_at_the_page():
+    """The default estimator reads the mask alone, to the bit."""
+    label = make_label_mask()
+    masks, positions, blank = cut(label)
+    arguments = (
+        positions["V5"], G0_TRUE, P_TRUE,
+        SHORT_COLUMNS["V5"], False, Y_SHIFT_RATIO, "V5",
+    )
+    default = digitize.vectorise_grid(blank, masks["V5"], *arguments).numpy()
+    explicit = digitize.vectorise_grid(
+        blank, masks["V5"], *arguments, 1.0, ink_map=None
+    ).numpy()
+    inked = digitize.vectorise_grid(
+        _inked_page(label), masks["V5"], *arguments
+    ).numpy()
+    assert np.array_equal(default, explicit)
+    assert np.array_equal(default, inked)
+
+
+def test_vectorise_grid_ink_keeps_the_time_of_a_mask_that_is_too_wide():
+    """A mask a pixel wider on the left reads a sloped trace too early.
+
+    The ink is where it always was, so the weights hold the trace in place while
+    the mask mean of every column is pulled halfway to its right hand neighbour.
+    """
+    label = make_label_mask(leads=["V5"])
+    page = _inked_page(label)
+    wide = np.maximum(label, np.roll(label, -1, axis=1))
+    masks, positions, _ = digitize.cut_binary(torch.from_numpy(wide)[None], page)
+
+    def best_lag(ink_map):
+        out = digitize.vectorise_grid(
+            page, masks["V5"], positions["V5"], G0_TRUE, P_TRUE,
+            SHORT_COLUMNS["V5"], False, Y_SHIFT_RATIO, "V5", 1.0, ink_map=ink_map,
+        ).numpy()
+        samples = np.arange(SHORT_SAMPLES)
+        lags = np.arange(-4.0, 4.0001, 0.05)
+        errors = [
+            np.mean((out - analytic_signal((samples + lag) / FREQUENCY, "V5")) ** 2)
+            for lag in lags
+        ]
+        return lags[int(np.argmin(errors))]
+
+    ink = best_lag(digitize._ink(page))
+    mask = best_lag(None)
+    assert abs(ink) < abs(mask), f"ink {ink:.2f}, mask {mask:.2f} samples"
+    # Half a pixel of the extra width, which is 1.02 samples wide here.
+    assert abs(mask) > 0.4
+    assert abs(ink) < 0.25
+
+
+def test_ink_ignores_a_coloured_grid_line_that_darkness_would_follow():
+    # A symmetric band, so the mask mean is the row of the trace as well.
+    mask, position, image = _flat_lead(band=(-2, -1, 0, 1, 2), ink_rows=(0,), red_row=2)
+    assert _flat_signal(mask, position, image) == pytest.approx(_row_in_mV(FLAT_ROW))
+
+    ink = _flat_signal(mask, position, image, digitize._ink(image))
+    assert ink == pytest.approx(_row_in_mV(FLAT_ROW))
+    # _darkness counts the red line as ink, which drags the row halfway onto it.
+    darkness = _flat_signal(mask, position, image, digitize._darkness(image))
+    assert darkness == pytest.approx(_row_in_mV(FLAT_ROW + 1))
+
+
+def test_ink_keeps_the_mask_mean_of_a_lead_whose_stroke_is_too_faint():
+    # An off centre band, so a weighted row cannot come out as the mask mean.
+    band, faint = (-1, 0, 1, 2, 3), int(0.5 * 255)
+    mask, position, image = _flat_lead(band, ink_rows=(0,), ink_value=faint)
+    info = {}
+    ink = _flat_signal(mask, position, image, digitize._ink(image), info)
+    assert info["ink_used"] is False
+    assert info["ink_p95"] == pytest.approx(255 - faint, abs=1)
+    assert ink == _flat_signal(mask, position, image)
+    assert ink == pytest.approx(_row_in_mV(FLAT_ROW + 1))
+
+
+def test_ink_falls_back_to_the_mask_mean_in_a_column_without_ink():
+    band, white_column = (-1, 0, 1, 2, 3), 100
+    mask, position, image = _flat_lead(band, ink_rows=(0,), white_column=white_column)
+    binary, filled, mean = _mask_mean_profile(mask, position)
+    profile = digitize._ink_profile(
+        digitize._ink(image), binary, position, mean, filled
+    )
+    assert np.all(np.isfinite(profile))
+    # Only the white column keeps the mask mean, every other one follows the ink.
+    assert list(np.flatnonzero(profile != FLAT_ROW)) == [white_column]
+    assert profile[white_column] == FLAT_ROW + 1
+
+
 # --------------------------------------------------------------- page baseline
 def test_y_shift_ratios_match_the_generator_row_geometry():
     # The generator puts 4 rows on a page of rows + 2 = 6 row heights, the short
@@ -775,7 +926,7 @@ def _output_folder(tmp_path, name, time_mapping, baseline=None, grid_origin=None
 
 def _run(
     tmp_path, name, label, time_mapping, baseline=None, image=None, grid_origin=None,
-    verbose=False,
+    verbose=False, trace_estimator=None,
 ):
     data_folder, mask_folder = _write_case(tmp_path, name, label, image)
     output_folder = _output_folder(tmp_path, name, time_mapping, baseline, grid_origin)
@@ -796,6 +947,8 @@ def _run(
         argv += ["--baseline", baseline]
     if grid_origin is not None:
         argv += ["--grid_origin", grid_origin]
+    if trace_estimator is not None:
+        argv += ["--trace_estimator", trace_estimator]
     args = digitize.get_parser().parse_args(argv)
     digitize.run(args)
     with warnings.catch_warnings():
@@ -921,3 +1074,50 @@ def test_run_with_grid_origin_lines_keeps_the_masks_without_grid_lines(tmp_path,
     masks = _run(tmp_path, "nolines", label, "grid", grid_origin="masks")
     assert lines.sig_name == masks.sig_name
     assert np.allclose(lines.p_signal, masks.p_signal, equal_nan=True)
+
+
+def test_parser_trace_estimator_defaults_to_mask():
+    parser = digitize.get_parser()
+    args = parser.parse_args(["-d", "data", "-o", "out"])
+    assert args.trace_estimator == "mask"
+    args = parser.parse_args(["-d", "data", "-o", "out", "--trace_estimator", "ink"])
+    assert args.trace_estimator == "ink"
+
+
+def test_append_qc_row_writes_the_trace_estimator_columns(tmp_path):
+    qc = {"trace_estimator": "ink", "ink_leads": 13, "ink_p95": 232.0}
+    digitize.append_qc_row(str(tmp_path), "rec", "column", qc, 0.0)
+    with open(tmp_path / "qc.csv", newline="") as f:
+        reader = csv.DictReader(f)
+        row = next(reader)
+        # The new columns are appended, the old ones keep their order.
+        assert reader.fieldnames[:2] == ["record", "placement"]
+        assert reader.fieldnames[-3:] == ["trace_estimator", "ink_leads", "ink_p95"]
+    assert row["trace_estimator"] == "ink"
+    assert int(row["ink_leads"]) == 13
+    assert float(row["ink_p95"]) == pytest.approx(232.0)
+
+
+def test_run_with_trace_estimator_ink_reads_every_lead(tmp_path, capsys):
+    label = make_label_mask()
+    page = _inked_page(label)
+    ink = _run(
+        tmp_path, "ink", label, "grid", image=page, verbose=True,
+        trace_estimator="ink",
+    )
+    out = capsys.readouterr().out
+    leads = len(LEAD_ORDER)
+    assert f"Trace estimator for record ink: ink on {leads}/{leads} leads" in out
+    assert "ink p95 255" in out
+
+    # The mask is drawn from the ink here, so the weights have nothing to move.
+    mask = _run(tmp_path, "inkmask", label, "grid", image=page, verbose=True)
+    assert "Trace estimator for record" not in capsys.readouterr().out
+    assert ink.sig_name == mask.sig_name
+    assert np.array_equal(ink.p_signal, mask.p_signal, equal_nan=True)
+
+    with open(_output_folder(tmp_path, "ink", "grid") / "qc.csv", newline="") as f:
+        row = next(csv.DictReader(f))
+    assert row["trace_estimator"] == "ink"
+    assert int(row["ink_leads"]) == leads
+    assert float(row["ink_p95"]) == pytest.approx(255.0)
