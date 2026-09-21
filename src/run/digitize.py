@@ -177,6 +177,18 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--trace_shift",
+        type=str,
+        choices=["off", "page"],
+        default="off",
+        help=(
+            "Only for --time_mapping grid. page = measure, once per page, how far the "
+            "ink of the steep strokes sits right of the lead masks and read every "
+            "lead on a column axis moved by that, which takes the timing error out of "
+            "a resampled page; off = read every lead where its mask is."
+        ),
+    )
+    parser.add_argument(
         "--baseline",
         type=str,
         choices=["page", "leads"],
@@ -1779,6 +1791,147 @@ def _ink_profile(ink_map, binary, position, mean_profile, filled, info=None):
     return np.where(total > 0, position["y1"] + centroid, mean_profile)
 
 
+# Mask pixels a column needs for the stroke in it to count as steep. A flat stroke
+# says nothing about the time axis: a shift along it costs slope times dx.
+TRACE_SHIFT_MIN_RUN = 6
+# Rows dropped at each end of such a column, where the stroke turns into its corner
+# and the mask holds the pixels of the flat part as well.
+TRACE_SHIFT_CORNER_ROWS = 2
+# Columns added at each side of a row segment, so that the window holds the whole
+# stroke and the paper it is drawn on, not the segment the mask happens to claim.
+TRACE_SHIFT_PAD = 2
+# The peak ink of a window has to reach this share of the lead's p95, otherwise the
+# window sits on a gap the mask bridged rather than on the stroke.
+TRACE_SHIFT_MIN_PEAK = 0.5
+# Steepness of the ink weights inside a window. The square is flat enough to find
+# the centre of a stroke a few pixels wide without the noise of a steeper one.
+TRACE_SHIFT_WEIGHT_POWER = 2
+# Samples a page needs before its median means anything; below it the shift is 0.
+TRACE_SHIFT_MIN_ROWS = 30
+# Share of the measured offset that is taken out under --trace_estimator ink. The
+# ink weights already remove about a third of it, and the row wise centre of the
+# weighted stroke is nearly the mask's, so the full offset overcorrects: the timing
+# error of the AREA shrunk pages, +0.39 samples without a shift, goes to -0.15 with
+# all of it and to 0.00 with two thirds. The optimum is broad, 0.5 to 0.8 all stay
+# within 0.4 dB.
+TRACE_SHIFT_INK_SHARE = 0.67
+# Shifts below this are set to 0, which is what keeps a page that needs no shift
+# byte identical: the measurement itself is noisy to about 0.02 px.
+TRACE_SHIFT_DEAD_BAND = 0.05
+
+
+def _lead_runs(sub, steep):
+    """Start and end column of every horizontal run of one lead that is steep.
+
+    Returns (rows, starts, ends), all relative to the lead's bounding box and all
+    inclusive, of the maximal runs of sub that hold at least one steep pixel.
+    """
+    edges = np.diff(np.pad(sub, ((0, 0), (1, 1))).astype(np.int8), axis=1)
+    rows, starts = np.nonzero(edges > 0)
+    ends = np.nonzero(edges < 0)[1] - 1
+    # Steep pixels left of every column, so a run is looked up in constant time.
+    steep_before = np.zeros((steep.shape[0], steep.shape[1] + 1), dtype=np.int32)
+    np.cumsum(steep, axis=1, out=steep_before[:, 1:])
+    keep = steep_before[rows, ends + 1] > steep_before[rows, starts]
+    return rows[keep], starts[keep], ends[keep]
+
+
+def measure_trace_shift(labelled, ink_map):
+    """How far right of the mask the ink of a page sits, in pixels.
+
+    A resampled page moves the lead masks a fraction of a pixel off the ink, and on
+    the time axis that costs slope times the offset. It is read row wise, which is
+    the only direction that sees it: every row of a steep stroke gives the distance
+    between the centre of the mask segment and the ink weighted centre of the same
+    stroke, measured over a window of TRACE_SHIFT_PAD pixels more on each side. A
+    window is dropped when it leaves the page, when any other mask pixel reaches
+    into it, or when its ink never gets near the stroke's own darkness.
+    The samples of all leads are pooled, because one scalar per page is all that
+    holds up: per lead, linear across the page and per layout column were all tried
+    and are noise.
+    Returns (dx, info), dx the median of the pooled samples and 0.0 below
+    TRACE_SHIFT_MIN_ROWS of them, info the raw median and how many there were.
+    """
+    height, width = labelled.shape
+    # One mask pixel of any lead, summed along every row: a window holds its own
+    # segment and nothing else exactly when it counts no more pixels than that.
+    mask_before = np.zeros((height, width + 1), dtype=np.int32)
+    np.cumsum(labelled > 0, axis=1, out=mask_before[:, 1:])
+
+    # The labels of the page once, so that every lead is only read over its own box.
+    rows, columns = np.nonzero(labelled)
+    labels = labelled[rows, columns]
+    pooled = []
+    for value in LEAD_LABEL_MAPPING.values():
+        here = labels == value
+        if not here.any():
+            continue
+        r0, r1 = int(rows[here].min()), int(rows[here].max()) + 1
+        c0, c1 = int(columns[here].min()), int(columns[here].max()) + 1
+        sub = labelled[r0:r1, c0:c1] == value
+        p95 = float(np.percentile(ink_map[r0:r1, c0:c1][sub], 95))
+        if not np.isfinite(p95) or p95 <= 0:
+            continue
+
+        count = sub.sum(axis=0)
+        first = np.argmax(sub, axis=0)
+        last = sub.shape[0] - 1 - np.argmax(sub[::-1], axis=0)
+        row_index = np.arange(sub.shape[0])[:, None]
+        steep = (
+            sub
+            & (count >= TRACE_SHIFT_MIN_RUN)[None, :]
+            & (row_index >= (first + TRACE_SHIFT_CORNER_ROWS)[None, :])
+            & (row_index <= (last - TRACE_SHIFT_CORNER_ROWS)[None, :])
+        )
+        if not steep.any():
+            continue
+
+        row, start, end = _lead_runs(sub, steep)
+        row, start, end = row + r0, start + c0, end + c0
+        left, right = start - TRACE_SHIFT_PAD, end + TRACE_SHIFT_PAD
+        # A window that reaches over an edge of the page is dropped before anything
+        # is looked up in it: there is no paper there to read the stroke against.
+        inside = (left >= 0) & (right < width)
+        row, start, end = row[inside], start[inside], end[inside]
+        left, right = left[inside], right[inside]
+        keep = mask_before[row, right + 1] - mask_before[row, left] == end - start + 1
+        row, start, end = row[keep], start[keep], end[keep]
+        left, right = left[keep], right[keep]
+        if row.size == 0:
+            continue
+
+        # The windows, laid end to end, so that every one of them is one segment.
+        lengths = right - left + 1
+        offsets = np.concatenate(([0], np.cumsum(lengths)))
+        window = np.repeat(left - offsets[:-1], lengths) + np.arange(offsets[-1])
+        ink = ink_map[np.repeat(row, lengths), window]
+        weight = (ink / p95) ** TRACE_SHIFT_WEIGHT_POWER
+        total = np.add.reduceat(weight, offsets[:-1])
+        centre = np.add.reduceat(weight * window, offsets[:-1])
+        peak = np.maximum.reduceat(ink, offsets[:-1])
+        keep = (peak >= TRACE_SHIFT_MIN_PEAK * p95) & (total > 0)
+        pooled.append(centre[keep] / total[keep] - 0.5 * (start + end)[keep])
+
+    samples = np.concatenate(pooled) if pooled else np.zeros(0)
+    info = {"rows": int(samples.size), "median": float("nan")}
+    if samples.size == 0:
+        return 0.0, info
+    info["median"] = float(np.median(samples))
+    if samples.size < TRACE_SHIFT_MIN_ROWS:
+        return 0.0, info
+    return info["median"], info
+
+
+def trace_shift_px(measured, estimator):
+    """The measured page shift as it is applied: shared with the estimator, dead banded.
+
+    The ink estimator has taken part of the offset out already, so only the rest of
+    it is left to move, and a shift small enough to be measurement noise is dropped.
+    """
+    dx = measured * (TRACE_SHIFT_INK_SHARE if estimator == "ink" else 1.0)
+    return 0.0 if abs(dx) < TRACE_SHIFT_DEAD_BAND else dx
+
+
 def vectorise_grid(
     image_rotated,
     mask,
@@ -1792,13 +1945,15 @@ def vectorise_grid(
     scale=1.0,
     ink_map=None,
     info=None,
+    x_shift=0.0,
 ):
     """Vectorise one lead by sampling it on the shared column grid.
 
     ink_map is the ink of the whole page from _ink(), which weighs the mask rows by
-    the ink under them; None is the mask on its own. The return value stays the
-    signal, because that is what every caller reads, so info, if given, is the dict
-    the ink measurement of this lead is reported in.
+    the ink under them; None is the mask on its own. x_shift is the page shift of
+    measure_trace_shift(), the pixels the columns of the profile are moved right by.
+    The return value stays the signal, because that is what every caller reads, so
+    info, if given, is the dict the ink measurement of this lead is reported in.
     """
     total_seconds = LONG_SIGNAL_LENGTH_SEC if is_long else SHORT_SIGNAL_LENGTH_SEC
     y_shift_ratio_ = y_shift_ratio["full"] if is_long else y_shift_ratio[lead]
@@ -1819,7 +1974,10 @@ def vectorise_grid(
     x = g0 + column * P + np.arange(values_needed) * P / samples_per_column - 0.5
     # The lead is read where its ink is, so the shift moves the columns of the
     # profile and not the sampling grid, which belongs to the printed grid.
-    sampled = np.interp(x, position["x1"] + filled, profile)
+    columns = position["x1"] + filled
+    if x_shift:
+        columns = columns + x_shift
+    sampled = np.interp(x, columns, profile)
     baseline = baseline_row(y_shift_ratio_, image_rotated.shape[1], scale)
 
     # Pixel row r covers [r, r+1) as well, so the sampled trace sits at row + 0.5.
@@ -2114,6 +2272,8 @@ def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
         "trace_estimator",
         "ink_leads",
         "ink_p95",
+        "trace_shift_px",
+        "trace_shift_rows",
     ]
     write_header = not os.path.exists(qc_path)
     with open(qc_path, "a", newline="") as f:
@@ -2374,6 +2534,27 @@ def run(args):
         if args.trace_estimator == "ink" and g0 is not None:
             ink_map = _ink(image_rotated)
         ink_measured = []
+        # One shift for the whole page, measured on the same ink.
+        trace_shift, trace_shift_rows, x_shift = float("nan"), 0, 0.0
+        if args.trace_shift == "page" and g0 is not None:
+            page_ink = _ink(image_rotated) if ink_map is None else ink_map
+            measured, shift_info = measure_trace_shift(
+                mask_to_use[0].numpy(), page_ink
+            )
+            trace_shift = trace_shift_px(measured, args.trace_estimator)
+            trace_shift_rows = shift_info["rows"]
+            x_shift = trace_shift
+            if args.verbose:
+                dead = ""
+                if trace_shift == 0.0 and trace_shift_rows >= TRACE_SHIFT_MIN_ROWS:
+                    dead = (
+                        f" (median {shift_info['median']:+.2f} px, "
+                        f"inside the dead band)"
+                    )
+                print(
+                    f"Trace shift for record {record}: {trace_shift:+.2f} px from "
+                    f"{trace_shift_rows} rows{dead}"
+                )
         signals_predicted = {}
         for lead, mask in signal_masks_cropped.items():
             if mask is None:
@@ -2418,6 +2599,7 @@ def run(args):
                     baseline_scale,
                     ink_map=ink_map,
                     info=ink,
+                    x_shift=x_shift,
                 )
                 if ink:
                     ink_measured.append(ink)
@@ -2526,6 +2708,8 @@ def run(args):
         qc["trace_estimator"] = args.trace_estimator
         qc["ink_leads"] = ink_leads
         qc["ink_p95"] = ink_p95
+        qc["trace_shift_px"] = trace_shift
+        qc["trace_shift_rows"] = trace_shift_rows
         append_qc_row(
             args.output_folder, record, args.lead_placement, qc, max_offset_deviation
         )

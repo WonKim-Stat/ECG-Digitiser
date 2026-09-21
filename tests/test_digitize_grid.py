@@ -626,6 +626,144 @@ def test_ink_falls_back_to_the_mask_mean_in_a_column_without_ink():
     assert profile[white_column] == FLAT_ROW + 1
 
 
+# ------------------------------------------------------------------ trace shift
+# Rows a clean bar of the page below contributes: 8 tall, minus the two corner rows
+# at each end.
+BAR_ROWS = 8 - 2 * digitize.TRACE_SHIFT_CORNER_ROWS
+
+
+def _bar_page(
+    bars=10, spacing=12, first=6, offset=1, ink_width=3, faint=None, neighbour=None,
+    snug=False, far_right=False,
+):
+    """A page of steep three pixel strokes whose label mask sits offset px left.
+
+    Every bar is 8 rows tall, so its columns are steep and BAR_ROWS of its rows lie
+    between the corners; the bars are far enough apart for their ink windows not to
+    meet. faint draws one bar in pale grey, neighbour labels another lead one pixel
+    beyond one bar's window edge (True = beside every bar), snug ends the page on the
+    last bar's ink so that its window reaches past the right border, and far_right
+    labels another lead in the last column of the page.
+    Returns (labelled, ink_map), as run() hands them to measure_trace_shift.
+    """
+    last = first + (bars - 1) * spacing
+    height = 30
+    width = last + 3 if snug else first + bars * spacing
+    labelled = np.zeros((height, width), dtype=np.uint8)
+    page = np.full((3, height, width), 255, dtype=np.uint8)
+    for bar in range(bars):
+        column, top = first + bar * spacing, 8 + bar % 3
+        page[:, top : top + 8, column : column + ink_width] = (
+            200 if bar == faint else 0
+        )
+        labelled[top : top + 8, column - offset : column - offset + 3] = 1
+        if neighbour is True or neighbour == bar:
+            labelled[top : top + 8, column - offset + 4] = 2
+        if far_right:
+            labelled[top : top + 8, width - 1] = 2
+    return labelled, digitize._ink(torch.from_numpy(page))
+
+
+def test_measure_trace_shift_finds_a_mask_that_sits_left_of_the_ink():
+    for offset in (0, 1):
+        dx, info = digitize.measure_trace_shift(*_bar_page(offset=offset))
+        assert info["rows"] == 10 * BAR_ROWS
+        assert dx == pytest.approx(offset)
+    # An ink two pixels wide under a three pixel mask is half a pixel off.
+    dx, info = digitize.measure_trace_shift(*_bar_page(ink_width=2))
+    assert dx == pytest.approx(0.5)
+
+
+def test_measure_trace_shift_ignores_a_lead_without_a_steep_stroke():
+    labelled, ink_map = _bar_page()
+    # Three rows per column is flatter than TRACE_SHIFT_MIN_RUN asks for.
+    labelled = labelled * (np.cumsum(labelled > 0, axis=0) <= 3)
+    dx, info = digitize.measure_trace_shift(labelled, ink_map)
+    assert (dx, info["rows"]) == (0.0, 0)
+
+
+def test_measure_trace_shift_needs_enough_rows():
+    dx, info = digitize.measure_trace_shift(*_bar_page(bars=5))
+    assert info["rows"] == 5 * BAR_ROWS < digitize.TRACE_SHIFT_MIN_ROWS
+    # The median is still reported, it is only not trusted.
+    assert info["median"] == pytest.approx(1.0)
+    assert dx == 0.0
+
+
+def test_measure_trace_shift_drops_a_window_another_lead_reaches_into():
+    _, info = digitize.measure_trace_shift(*_bar_page(neighbour=3))
+    assert info["rows"] == 9 * BAR_ROWS
+    _, info = digitize.measure_trace_shift(*_bar_page(neighbour=True))
+    assert info["rows"] == 0
+
+
+def test_measure_trace_shift_drops_a_window_over_the_page_border():
+    # The first bar's window reaches one pixel past the left edge of the page, and
+    # the last column of every row holds mask pixels, which is what a window looked
+    # up with a negative column would read instead of the paper left of the page.
+    for far_right in (False, True):
+        dx, info = digitize.measure_trace_shift(*_bar_page(first=2, far_right=far_right))
+        assert info["rows"] == 9 * BAR_ROWS
+        assert dx == pytest.approx(1.0)
+
+    # The same one pixel over the right edge, where there is no column to read at all.
+    dx, info = digitize.measure_trace_shift(*_bar_page(snug=True))
+    assert info["rows"] == 9 * BAR_ROWS
+    assert dx == pytest.approx(1.0)
+
+
+def test_measure_trace_shift_drops_a_window_without_ink_of_its_own():
+    dx, info = digitize.measure_trace_shift(*_bar_page(faint=4))
+    assert info["rows"] == 9 * BAR_ROWS
+    assert dx == pytest.approx(1.0)
+
+
+def test_trace_shift_px_shares_the_measurement_with_the_estimator():
+    assert digitize.trace_shift_px(0.3, "mask") == pytest.approx(0.3)
+    assert digitize.trace_shift_px(0.3, "ink") == pytest.approx(
+        0.3 * digitize.TRACE_SHIFT_INK_SHARE
+    )
+    # Inside the dead band nothing is applied, on either side of zero.
+    for measured in (0.04, -0.04):
+        assert digitize.trace_shift_px(measured, "mask") == 0.0
+    assert digitize.trace_shift_px(0.06, "mask") == pytest.approx(0.06)
+    # The share is taken first, so it decides what falls into the band.
+    assert digitize.trace_shift_px(0.07, "ink") == 0.0
+
+
+def test_vectorise_grid_without_a_shift_samples_where_it_always_did():
+    masks, positions, image = cut(make_label_mask())
+    arguments = (
+        positions["V5"], G0_TRUE, P_TRUE,
+        SHORT_COLUMNS["V5"], False, Y_SHIFT_RATIO, "V5",
+    )
+    default = digitize.vectorise_grid(image, masks["V5"], *arguments).numpy()
+    explicit = digitize.vectorise_grid(
+        image, masks["V5"], *arguments, 1.0, x_shift=0.0
+    ).numpy()
+    assert np.array_equal(default, explicit)
+
+
+@pytest.mark.parametrize("x_shift", [-1.0, 1.0])
+def test_vectorise_grid_x_shift_moves_the_trace_in_time(x_shift):
+    """A shift to the right reads the trace later, by its own pixels."""
+    masks, positions, image = cut(make_label_mask())
+    out = digitize.vectorise_grid(
+        image, masks["V5"], positions["V5"], G0_TRUE, P_TRUE,
+        SHORT_COLUMNS["V5"], False, Y_SHIFT_RATIO, "V5", 1.0, x_shift=x_shift,
+    ).numpy()
+
+    samples = np.arange(SHORT_SAMPLES)
+    lags = np.arange(-4.0, 4.0001, 0.05)
+    errors = [
+        np.mean((out - analytic_signal((samples + lag) / FREQUENCY, "V5")) ** 2)
+        for lag in lags
+    ]
+    best = lags[int(np.argmin(errors))]
+    samples_per_pixel = SHORT_SAMPLES / P_TRUE
+    assert best == pytest.approx(-x_shift * samples_per_pixel, abs=0.15)
+
+
 # --------------------------------------------------------------- page baseline
 def test_y_shift_ratios_match_the_generator_row_geometry():
     # The generator puts 4 rows on a page of rows + 2 = 6 row heights, the short
@@ -926,7 +1064,7 @@ def _output_folder(tmp_path, name, time_mapping, baseline=None, grid_origin=None
 
 def _run(
     tmp_path, name, label, time_mapping, baseline=None, image=None, grid_origin=None,
-    verbose=False, trace_estimator=None,
+    verbose=False, trace_estimator=None, trace_shift=None,
 ):
     data_folder, mask_folder = _write_case(tmp_path, name, label, image)
     output_folder = _output_folder(tmp_path, name, time_mapping, baseline, grid_origin)
@@ -949,6 +1087,8 @@ def _run(
         argv += ["--grid_origin", grid_origin]
     if trace_estimator is not None:
         argv += ["--trace_estimator", trace_estimator]
+    if trace_shift is not None:
+        argv += ["--trace_shift", trace_shift]
     args = digitize.get_parser().parse_args(argv)
     digitize.run(args)
     with warnings.catch_warnings():
@@ -1092,7 +1232,7 @@ def test_append_qc_row_writes_the_trace_estimator_columns(tmp_path):
         row = next(reader)
         # The new columns are appended, the old ones keep their order.
         assert reader.fieldnames[:2] == ["record", "placement"]
-        assert reader.fieldnames[-3:] == ["trace_estimator", "ink_leads", "ink_p95"]
+        assert reader.fieldnames[-5:-2] == ["trace_estimator", "ink_leads", "ink_p95"]
     assert row["trace_estimator"] == "ink"
     assert int(row["ink_leads"]) == 13
     assert float(row["ink_p95"]) == pytest.approx(232.0)
@@ -1121,3 +1261,67 @@ def test_run_with_trace_estimator_ink_reads_every_lead(tmp_path, capsys):
     assert row["trace_estimator"] == "ink"
     assert int(row["ink_leads"]) == leads
     assert float(row["ink_p95"]) == pytest.approx(255.0)
+
+
+def test_parser_trace_shift_defaults_to_off():
+    parser = digitize.get_parser()
+    args = parser.parse_args(["-d", "data", "-o", "out"])
+    assert args.trace_shift == "off"
+    args = parser.parse_args(["-d", "data", "-o", "out", "--trace_shift", "page"])
+    assert args.trace_shift == "page"
+
+
+def test_append_qc_row_writes_the_trace_shift_columns(tmp_path):
+    qc = {"trace_shift_px": 0.18, "trace_shift_rows": 4752}
+    digitize.append_qc_row(str(tmp_path), "rec", "column", qc, 0.0)
+    with open(tmp_path / "qc.csv", newline="") as f:
+        reader = csv.DictReader(f)
+        row = next(reader)
+        # The new columns are appended, the old ones keep their order.
+        assert reader.fieldnames[:2] == ["record", "placement"]
+        assert reader.fieldnames[-2:] == ["trace_shift_px", "trace_shift_rows"]
+    assert float(row["trace_shift_px"]) == pytest.approx(0.18)
+    assert int(row["trace_shift_rows"]) == 4752
+
+
+def _connected_label(label):
+    """Close the vertical gaps between neighbouring columns, as a drawn trace does.
+
+    The one pixel per column of _draw_lead is no stroke a shift can be measured on:
+    a column needs TRACE_SHIFT_MIN_RUN pixels before it counts as steep.
+    """
+    out = label.copy()
+    for value in LEAD_LABEL_MAPPING.values():
+        is_lead = label == value
+        columns = np.flatnonzero(is_lead.any(axis=0))
+        rows = np.argmax(is_lead, axis=0)
+        for column in columns[1:]:
+            low, high = sorted((rows[column - 1], rows[column]))
+            out[low : high + 1, column] = value
+    return out
+
+
+def test_run_with_trace_shift_page_leaves_a_page_on_its_own_ink_alone(tmp_path, capsys):
+    label = _connected_label(make_label_mask())
+    page = _inked_page(label)
+    shifted = _run(
+        tmp_path, "shift", label, "grid", image=page, verbose=True,
+        trace_estimator="ink", trace_shift="page",
+    )
+    out = capsys.readouterr().out
+    assert "Trace shift for record shift: +0.00 px from" in out
+
+    # The mask is the ink, so there is nothing to move and nothing moves.
+    off = _run(
+        tmp_path, "noshift", label, "grid", image=page, verbose=True,
+        trace_estimator="ink",
+    )
+    assert "Trace shift for record" not in capsys.readouterr().out
+    assert shifted.sig_name == off.sig_name
+    assert np.array_equal(shifted.p_signal, off.p_signal, equal_nan=True)
+
+    with open(_output_folder(tmp_path, "shift", "grid") / "qc.csv", newline="") as f:
+        row = next(csv.DictReader(f))
+    assert float(row["trace_shift_px"]) == 0.0
+    # Enough steep rows on the QRS flanks for the median to be used at all.
+    assert int(row["trace_shift_rows"]) >= digitize.TRACE_SHIFT_MIN_ROWS

@@ -369,7 +369,7 @@ def test_append_qc_row_writes_the_resolution_columns(tmp_path):
         row = next(reader)
         # The new columns are appended, the old ones keep their order.
         assert reader.fieldnames[:2] == ["record", "placement"]
-        assert reader.fieldnames[-5:-3] == ["grid_period_px", "resolution_scale"]
+        assert reader.fieldnames[-7:-5] == ["grid_period_px", "resolution_scale"]
     assert float(row["grid_period_px"]) == pytest.approx(3.937)
     assert float(row["resolution_scale"]) == pytest.approx(2.0)
 
