@@ -1064,13 +1064,15 @@ def _output_folder(tmp_path, name, time_mapping, baseline=None, grid_origin=None
 
 def _run(
     tmp_path, name, label, time_mapping, baseline=None, image=None, grid_origin=None,
-    verbose=False, trace_estimator=None, trace_shift=None,
+    verbose=False, trace_estimator="mask", trace_shift="off",
 ):
     data_folder, mask_folder = _write_case(tmp_path, name, label, image)
     output_folder = _output_folder(tmp_path, name, time_mapping, baseline, grid_origin)
     # The stages under test are the column grid and the baseline: the pages here show
     # the vertical lines of that grid and nothing else, which leaves the rotation, the
     # perspective and the resolution nothing to correct, only seconds and warnings.
+    # The trace estimator and the page shift are the plain mask ones here for the same
+    # reason; None passes no flag at all, which is how the defaults are tested.
     argv = [
         "-d", str(data_folder),
         "-o", str(output_folder),
@@ -1216,12 +1218,12 @@ def test_run_with_grid_origin_lines_keeps_the_masks_without_grid_lines(tmp_path,
     assert np.allclose(lines.p_signal, masks.p_signal, equal_nan=True)
 
 
-def test_parser_trace_estimator_defaults_to_mask():
+def test_parser_trace_estimator_defaults_to_ink():
     parser = digitize.get_parser()
     args = parser.parse_args(["-d", "data", "-o", "out"])
-    assert args.trace_estimator == "mask"
-    args = parser.parse_args(["-d", "data", "-o", "out", "--trace_estimator", "ink"])
     assert args.trace_estimator == "ink"
+    args = parser.parse_args(["-d", "data", "-o", "out", "--trace_estimator", "mask"])
+    assert args.trace_estimator == "mask"
 
 
 def test_append_qc_row_writes_the_trace_estimator_columns(tmp_path):
@@ -1263,12 +1265,12 @@ def test_run_with_trace_estimator_ink_reads_every_lead(tmp_path, capsys):
     assert float(row["ink_p95"]) == pytest.approx(255.0)
 
 
-def test_parser_trace_shift_defaults_to_off():
+def test_parser_trace_shift_defaults_to_page():
     parser = digitize.get_parser()
     args = parser.parse_args(["-d", "data", "-o", "out"])
-    assert args.trace_shift == "off"
-    args = parser.parse_args(["-d", "data", "-o", "out", "--trace_shift", "page"])
     assert args.trace_shift == "page"
+    args = parser.parse_args(["-d", "data", "-o", "out", "--trace_shift", "off"])
+    assert args.trace_shift == "off"
 
 
 def test_append_qc_row_writes_the_trace_shift_columns(tmp_path):
@@ -1325,3 +1327,34 @@ def test_run_with_trace_shift_page_leaves_a_page_on_its_own_ink_alone(tmp_path, 
     assert float(row["trace_shift_px"]) == 0.0
     # Enough steep rows on the QRS flanks for the median to be used at all.
     assert int(row["trace_shift_rows"]) >= digitize.TRACE_SHIFT_MIN_ROWS
+
+
+# --------------------------------------------------- the trace stages by default
+def test_run_uses_the_ink_estimator_and_the_page_shift_by_default(tmp_path, capsys):
+    """What the two defaults are for, with no trace flag given at all.
+
+    The page here is drawn from its own masks, so neither stage has anything to move;
+    what shows that they ran is the QC row and the lines they print.
+    """
+    label = _connected_label(make_label_mask())
+    page = _inked_page(label)
+    record = _run(
+        tmp_path, "default", label, "grid", image=page, verbose=True,
+        trace_estimator=None, trace_shift=None,
+    )
+    out = capsys.readouterr().out
+    assert "Trace estimator for record default: ink on" in out
+    assert "Trace shift for record default: +0.00 px from" in out
+
+    with open(_output_folder(tmp_path, "default", "grid") / "qc.csv", newline="") as f:
+        row = next(csv.DictReader(f))
+    assert row["trace_estimator"] == "ink"
+    assert int(row["ink_leads"]) == len(LEAD_ORDER)
+    assert float(row["trace_shift_px"]) == 0.0
+    # Enough steep rows on the QRS flanks for the median to be used at all.
+    assert int(row["trace_shift_rows"]) >= digitize.TRACE_SHIFT_MIN_ROWS
+
+    # Nothing to move, so the defaults read this page where the plain masks do.
+    masks = _run(tmp_path, "defaultmask", label, "grid", image=page)
+    assert record.sig_name == masks.sig_name
+    assert np.array_equal(record.p_signal, masks.p_signal, equal_nan=True)

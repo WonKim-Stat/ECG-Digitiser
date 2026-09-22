@@ -167,25 +167,26 @@ def get_parser():
         "--trace_estimator",
         type=str,
         choices=["mask", "ink"],
-        default="mask",
+        default="ink",
         help=(
-            "Only for --time_mapping grid. mask = the row of a column is the mean row "
-            "of the binary mask; ink = the mean row is weighted by the ink of the page "
-            "under the mask, which puts the row on the core of the stroke instead of "
-            "in the middle of the mask, and keeps the mask mean for a lead whose "
-            "stroke is too faint to weigh with."
+            "Only for --time_mapping grid. ink = the mean row is weighted by the ink "
+            "of the page under the mask, which puts the row on the core of the stroke "
+            "instead of in the middle of the mask, and keeps the mask mean for a lead "
+            "whose stroke is too faint to weigh with; mask = the row of a column is "
+            "the mean row of the binary mask."
         ),
     )
     parser.add_argument(
         "--trace_shift",
         type=str,
         choices=["off", "page"],
-        default="off",
+        default="page",
         help=(
             "Only for --time_mapping grid. page = measure, once per page, how far the "
             "ink of the steep strokes sits right of the lead masks and read every "
             "lead on a column axis moved by that, which takes the timing error out of "
-            "a resampled page; off = read every lead where its mask is."
+            "a resampled page and leaves a page whose masks already sit on their own "
+            "ink where it is; off = read every lead where its mask is."
         ),
     )
     parser.add_argument(
