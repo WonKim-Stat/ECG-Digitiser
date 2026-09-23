@@ -251,6 +251,122 @@ where
 - `output_path` is the folder where the outputs will be saved.
 
 
+#### Pipeline stages
+
+Under the defaults, every page goes through the stages below before its signals are
+written (`run()` in `src/run/digitize.py`). Every stage that reads the printed 1 mm
+grid lines falls back to the behaviour without them if the page shows none.
+
+1. **Resolution:** the period of the printed grid lines is measured and the page is
+   resampled to the period of a 200 dpi page, the scale the model was trained on.
+2. **Rotation:** a 0.1° Hough transform, refined with the phase drift of the grid lines
+   from the top to the bottom of the page.
+3. **Perspective:** the shear and the perspective that the phase field of the grid lines
+   shows are taken out, in the same warp as the rotation.
+4. **Segmentation:** nnU-Net predicts the lead masks of the corrected page.
+5. **Column grid:** all leads are put on one shared column grid, with the column pitch
+   from the page height, the origin refined to sub-pixel accuracy on the grid lines and
+   moved by the grid line offset.
+6. **Trace reading:** every column of a lead gives one row, the mean row of its mask
+   weighted by the ink of the page under it, read on a column axis moved by the trace
+   shift measured on the page.
+7. **Baseline:** the zero line comes from the page geometry scaled with the column pitch
+   and is then shifted so that the Einthoven and Goldberger sums have no DC offset.
+
+
+#### Options
+
+| Flag | Choices | Default | What it does |
+| --- | --- | --- | --- |
+| `--resolution` | `keep`, `lines` | `lines` | `lines` resamples the page so that the printed 1 mm grid lines have the period of a 200 dpi page, the scale the model was trained on. A page within about a tenth of that scale keeps its pixels, because resampling it costs more than the scale does. |
+| `--rotation` | `hough`, `lines` | `lines` | `lines` refines a 0.1° Hough angle with the phase drift of the grid lines, which resolves fractions of a degree. `hough` is the Hough transform of the page in whole degrees only. |
+| `--perspective` | `off`, `lines` | `lines` | `lines` takes the shear and the perspective that the grid lines show out of the rotated page, and leaves a page alone that is straight enough already. `off` keeps the rotated page. |
+| `--time_mapping` | `bbox`, `grid` | `grid` | `grid` samples all leads on one shared column grid, for the standard 3x4 layout with rhythm strip. `bbox` stretches the bounding box of every lead to its length. |
+| `--grid_pitch` | `page`, `fit` | `page` | Where the column pitch of that grid comes from: `page` from the page height, checked against the least squares fit of the column edges, `fit` from that fit. |
+| `--grid_origin` | `masks`, `lines` | `lines` | `lines` refines origin and pitch of the column grid on the printed grid lines, assuming the first column starts on a grid line. `masks` uses the mask edges only. |
+| `--grid_line_offset` | any number of pixels | `0.5` | How far right of the traces the printed grid lines sit. `0.5` is the matplotlib Agg snap of the generator images, `0` is for scans and photographs. It is a page unit, so it survives `--resolution`. |
+| `--trace_estimator` | `mask`, `ink` | `ink` | `ink` weights the mean row of a column by the ink under the mask, which puts the row on the core of the stroke; a lead whose stroke is too faint keeps the mask mean. `mask` is the mean row of the binary mask. |
+| `--trace_shift` | `off`, `page` | `page` | `page` measures once per page how far right of the lead masks the ink of the steep strokes sits and reads every lead on a column axis moved by that. `off` reads every lead where its mask is. |
+| `--baseline` | `page`, `leads` | `leads` | `page` takes the baseline from the page geometry, scaled with the column pitch. `leads` additionally shifts it so that the Einthoven and Goldberger sums have no DC offset. |
+
+`python -m src.run.digitize --help` lists the remaining options (`--interpolation`, `--enable_tta`, `--lead_placement`, `--save_mask`, `--mask_folder`, `--fold`, `--device`).
+
+
+#### Quality control output
+
+The digitization writes one row per record to `qc.csv` in the output folder, with these
+columns:
+
+- **Record:** `record` and `placement`, the `--lead_placement` the row was written with.
+- **Lead consistency:** `einthoven_rms`, `einthoven_rms_demedian`, `einthoven_ratio`,
+  `einthoven_n` for I + III − II, and `goldberger_rms`, `goldberger_rms_demedian`,
+  `goldberger_ratio`, `goldberger_n` for aVR + aVL + aVF: the RMS of the sum in mV, the
+  same after its median is taken out, the RMS relative to the mean RMS of the three
+  leads in the sum, and the number of samples it was computed over.
+- **Lead placement:** `max_offset_deviation`, the largest distance in seconds between a
+  measured lead offset and the standard one it was snapped to.
+- **Resolution:** `grid_period_px`, the measured grid line period, and
+  `resolution_scale`, the factor the page was resampled by (1 if it was left alone).
+- **Rotation:** `rotation_angle`, the angle the page was turned by, `rotation_coarse`,
+  the Hough angle before the grid lines, and `rotation_residual_px`, the residual of the
+  grid line phase fit.
+- **Perspective:** `perspective_shift_px`, the largest displacement the rectification
+  causes on the page, and `perspective_residual_px`, the residual of its fit.
+- **Column grid:** `grid_line_contrast`, the amplitude of the grid line comb over the
+  neighbouring periods, and `grid_line_shift_px`, how far the grid lines moved the
+  origin of the mask grid.
+- **Trace:** `trace_estimator`, `ink_leads`, the number of leads whose ink was dark
+  enough to weight with, `ink_p95`, the median 95th percentile of that ink, and
+  `trace_shift_px` and `trace_shift_rows`, the page shift that was applied and the
+  number of rows it was measured on.
+- **Baseline:** `baseline_scale`, the column pitch over the pitch the page height
+  implies, `baseline_shift_px`, the shift that was applied, and
+  `baseline_disagreement_px`, the difference between the Goldberger and the Einthoven
+  estimate.
+
+A `WARNING` line is printed whenever a stage cannot do what it is asked and falls back:
+the grid lines are unusable for the resolution (the page is kept as it is), for the
+rotation (the whole degree Hough angle is kept), for the perspective (the rotated page
+is kept) or for the grid origin (the grid of the masks is kept); no column grid fits the
+page, so `--time_mapping bbox` is used for it; the Einthoven and the Goldberger baseline
+estimate disagree by more than the tolerance, so the page baseline is kept; or a lead
+mask has a gap inside its column, which is interpolated linearly. A page whose fitted
+column pitch does not match the pitch of the page height prints a line as well and uses
+the fitted one.
+
+
+#### Results on synthetic pages
+
+All pages below are synthetic: pages from the image generator, and synthetic scan and
+photo defects applied to generator pages. There are no real scans among them. The masks
+were predicted once per condition with test time augmentation off, the signals were then
+read from those saved masks with the defaults (no flags) and scored with
+`python -m src.run.evaluate --placement window`. The metric is the median raw SNR over
+the leads of a condition.
+
+| Condition | Pages | Description | Median SNR (dB) |
+| --- | --- | --- | --- |
+| clean | 32 | generator pages, no defect | 22.99 |
+| aug | 32 | generator augmentation on a random subset of pages: wrinkles, noise, rotation up to 5°, black and white | 22.36 |
+| rot | 32 | generator augmentation with a forced rotation of ±1–5° and a crop of up to 1 % | 21.06 |
+| blur | 8 | Gaussian blur, σ 1.5 | 21.66 |
+| jpeg | 8 | JPEG quality 30 | 23.26 |
+| gridfaint | 8 | grid ink at 30 % of its darkness | 23.66 |
+| gridblue | 8 | colour channels swapped, so the red grid is printed blue | 23.48 |
+| margin | 8 | page shrunk to 92 % and moved off centre | 20.97 |
+| persp05 | 8 | perspective, corners moved up to 0.5 % | 22.54 |
+| persp15 | 8 | perspective, corners moved up to 1.5 % | 22.63 |
+| photo | 8 | rotation of 1.5°, perspective up to 1 %, uneven light, defocus, JPEG quality 60 | 21.56 |
+| scale080 | 8 | page resampled ×0.80 and moved a fraction of a pixel | 20.94 |
+| scale088 | 8 | page resampled ×0.88 and moved a fraction of a pixel | 21.32 |
+| scale115 | 8 | page resampled ×1.15 and moved a fraction of a pixel | 23.50 |
+| scale125 | 8 | page resampled ×1.25 and moved a fraction of a pixel | 23.47 |
+
+The three generator sets are pages of 32 PTB-XL records, 384 leads each; the other twelve
+conditions are defects applied to the generator pages of 8 of those records, 96 leads
+each. The evaluation scripts and data are not part of this repository.
+
+
 ## 📄 Citation and Acknowledgements
 
 If you use this code in your research, please cite our [paper](https://arxiv.org/abs/2410.14185):
