@@ -2717,6 +2717,15 @@ def assemble_signals(signals, offsets, num_samples, placement):
     return np.array(signal_list).T, sig_names
 
 
+# Einthoven ratio (the RMS of I + III - II over the mean RMS of the three leads) at or
+# above which a page is reported for a check. Leads I and III are read in the first
+# column only, so the ratio covers at most its 2.5 s, nothing of the other columns and
+# nothing of the rhythm strip II after them. Fitted on the development pages of the
+# ECG-Image-Database (see the README): the highest threshold that flags at least 90 %
+# of the clean scans with a page SNR below 12 dB, 0.17976, rounded down.
+EINTHOVEN_RATIO_WARNING = 0.1797
+
+
 def _residual_qc(signals, sig_names, leads, coefficients):
     """Residual statistics of one lead consistency rule."""
     nan_result = {"rms": np.nan, "rms_demedian": np.nan, "ratio": np.nan, "n": 0}
@@ -2755,6 +2764,31 @@ def compute_consistency_qc(signals, sig_names):
         "goldberger_ratio": goldberger["ratio"],
         "goldberger_n": goldberger["n"],
     }
+
+
+def einthoven_warning(qc, record, threshold=EINTHOVEN_RATIO_WARNING):
+    """WARNING line of a page whose leads I, II and III disagree, None if they agree.
+
+    qc is the dict of compute_consistency_qc(). A page without a ratio cannot be
+    checked and is reported as well.
+    """
+    ratio = qc["einthoven_ratio"]
+    if np.isnan(ratio):
+        if qc["einthoven_n"] == 0:
+            reason = "no sample with leads I, II and III all read"
+        else:
+            reason = "leads I, II and III are zero on their common samples"
+        return (
+            f"WARNING: Einthoven check failed for record {record} "
+            f"(no ratio: {reason}), check this page."
+        )
+    if ratio >= threshold:
+        return (
+            f"WARNING: Einthoven check failed for record {record} "
+            f"(ratio {ratio:.3f} >= {threshold:.4g}): leads I, II and III disagree, "
+            f"check this page."
+        )
+    return None
 
 
 def write_record(record, signals, sig_names, output_folder, placement):
@@ -3308,6 +3342,9 @@ def run(args):
             f"(demedian {qc['goldberger_rms_demedian']:.4f}, "
             f"ratio {qc['goldberger_ratio']:.2f}, n={qc['goldberger_n']})"
         )
+        warning_line = einthoven_warning(qc, record)
+        if warning_line is not None:
+            print(warning_line)
         deviations = [
             abs(offset["raw"] - offset["snapped"])
             for offset in offsets.values()
