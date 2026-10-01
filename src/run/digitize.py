@@ -12,6 +12,8 @@ import subprocess
 import sys
 import tempfile
 import warnings
+from scipy.interpolate import CubicSpline
+from scipy.signal import butter, sosfiltfilt
 from tqdm import tqdm
 import torch
 import torch.nn.functional as F
@@ -187,6 +189,20 @@ def get_parser():
             "lead on a column axis moved by that, which takes the timing error out of "
             "a resampled page and leaves a page whose masks already sit on their own "
             "ink where it is; off = read every lead where its mask is."
+        ),
+    )
+    parser.add_argument(
+        "--sharpen",
+        type=str,
+        choices=["none", "bandlimited"],
+        default="bandlimited",
+        help=(
+            "Only for --time_mapping grid. bandlimited = restore the 20-40 Hz band "
+            "that the column aperture and the linear interpolation attenuate: "
+            "cur + LP35(R2a8 - cur), where R2a8 is the aperture-corrected (a = 1/8) "
+            "cubic-spline reconstruction; only the band below 35 Hz is changed, so "
+            "steep QRS spikes cannot ring; none = the column profile is linearly "
+            "interpolated, the behaviour before the sharpening."
         ),
     )
     parser.add_argument(
@@ -1933,6 +1949,136 @@ def trace_shift_px(measured, estimator):
     return 0.0 if abs(dx) < TRACE_SHIFT_DEAD_BAND else dx
 
 
+# Weight of the two neighbours in the aperture correction [-a, 1 + 2a, -a] of the
+# column profile under --sharpen bandlimited. A column value is the middle of the
+# rows the trace crosses in that column, the mean of its values at the two column
+# edges, which damps a wave of f cycles per column width d as cos(pi f d); the
+# correction lifts it by 1 + 4a sin^2(pi f d), and 1/8 is the value whose second
+# order term cancels that of the cosine (1/24 would invert a box average).
+SHARPEN_APERTURE_A = 0.125
+# Cutoff of the low-pass that confines the correction to the band it is meant for.
+# The diagnosis model reads the signal at 100 Hz, flat to 42 Hz, so little above that
+# counts, while the full correction overshoots on the steep QRS spikes. 35 Hz is the
+# highest cutoff screened at which no generator lead and no lead of the 12 quasi-real
+# conditions of the pass line loses more than 1 dB (40 Hz: 3 such leads, 45 Hz: 5) and
+# 3 of 23,994 leads of 2,000 pages do (40 Hz: 8, 45 Hz: 20), for a median gain of
+# +1.41 dB on the generator pages (45 Hz: +1.69).
+SHARPEN_CUTOFF_HZ = 35.0
+# Order of the Butterworth low-pass. It is run forwards and backwards, so it has no
+# phase and the square of the gain: 0.99 at 20 Hz, 0.78 at 30 Hz, 0.5 at the cutoff
+# and 0.05 at 50 Hz.
+SHARPEN_FILTER_ORDER = 4
+# Shortest run of consecutive filled columns that gets the cubic spline. Through fewer
+# than four columns the not-a-knot spline is a parabola or a line, so a shorter run,
+# like a gap, keeps the linear values.
+SHARPEN_MIN_RUN = 4
+# Second order sections of the low-pass, built once per sampling rate.
+_SHARPEN_SOS = {}
+
+
+def _sharpen_sos(fs):
+    """The --sharpen low-pass as second order sections for the sampling rate fs."""
+    fs = float(fs)
+    if fs not in _SHARPEN_SOS:
+        _SHARPEN_SOS[fs] = butter(
+            SHARPEN_FILTER_ORDER, SHARPEN_CUTOFF_HZ, fs=fs, output="sos"
+        )
+    return _SHARPEN_SOS[fs]
+
+
+def _sharpen_padlen(sos):
+    """The samples sosfiltfilt() pads a trace with at each end, its default padlen.
+
+    Three times the taps of the sections, 15 for the fourth order filter: a trace
+    needs more samples than that to be filtered at all.
+    """
+    taps = 2 * len(sos) + 1 - min((sos[:, 2] == 0).sum(), (sos[:, 5] == 0).sum())
+    return 3 * int(taps)
+
+
+def _column_runs(filled):
+    """Runs of consecutive integers in the sorted filled columns of one lead.
+
+    Returns a list of (i0, i1), half open index ranges into filled.
+    """
+    filled = np.asarray(filled)
+    if filled.size == 0:
+        return []
+    cut = np.flatnonzero(np.diff(filled) != 1) + 1
+    starts = np.r_[0, cut]
+    ends = np.r_[cut, filled.size]
+    return [(int(a), int(b)) for a, b in zip(starts, ends)]
+
+
+def _aperture_fir(profile, runs, a):
+    """The aperture correction [-a, 1 + 2a, -a] of a column profile, run by run.
+
+    Computed as p - a (left - 2p + right), so that a constant stays bitwise what it
+    was. The ends of a run repeat their own value instead of reaching over a gap,
+    which leaves a run of one column and the inside of a straight run unchanged.
+    Returns a new float64 array.
+    """
+    p = np.asarray(profile, dtype=float)
+    y = p.copy()
+    if a == 0:
+        return y
+    for i0, i1 in runs:
+        seg = p[i0:i1]
+        if seg.size < 2:
+            continue
+        left = np.r_[seg[0], seg[:-1]]
+        right = np.r_[seg[1:], seg[-1]]
+        y[i0:i1] = seg - a * (left - 2.0 * seg + right)
+    return y
+
+
+def _cubic_samples(columns, profile, x, runs, min_run):
+    """A column profile sampled at x by a not-a-knot cubic spline through each run.
+
+    The spline of a run of at least min_run columns replaces np.interp for the x
+    between its first and its last column; the gaps, the runs that are too short
+    and the ends past the outer columns keep the linear, edge held values.
+    """
+    out = np.interp(x, columns, profile)
+    columns = np.asarray(columns, dtype=float)
+    profile = np.asarray(profile, dtype=float)
+    x = np.asarray(x, dtype=float)
+    out = np.array(out, dtype=float, copy=True)
+    for i0, i1 in runs:
+        if i1 - i0 < max(min_run, 2):
+            continue
+        cx = columns[i0:i1]
+        inside = (x >= cx[0]) & (x <= cx[-1])
+        if not inside.any():
+            continue
+        spline = CubicSpline(cx, profile[i0:i1], bc_type="not-a-knot")
+        out[inside] = spline(x[inside])
+    return out
+
+
+def _bandlimited_sharpen(columns, profile, filled, x, sampled, fs):
+    """The linear trace of one lead with its band below the cutoff sharpened.
+
+    The column average and the linear interpolation between the column centres both
+    damp the trace, a thin one together by about 8 % at 20 Hz and 18 % at 30 Hz on a
+    200 dpi page, which rounds off the QRS. The aperture correction with a spline
+    through it gives that back but overshoots on the steep spikes, so only the low
+    passed difference to the linear trace is added: below SHARPEN_CUTOFF_HZ the trace
+    is the spline's, above it stays the linear one, with no phase shift. columns
+    carries the page shift, while the runs come from the integer filled columns.
+    sampled is np.interp(x, columns, profile); a trace no longer than the samples the
+    filter pads its ends with (15) keeps it.
+    """
+    runs = _column_runs(filled)
+    a_prof = _aperture_fir(profile, runs, SHARPEN_APERTURE_A)
+    a_samp = _cubic_samples(columns, a_prof, x, runs, SHARPEN_MIN_RUN)
+    d = a_samp - sampled
+    sos = _sharpen_sos(fs)
+    if len(d) > _sharpen_padlen(sos):
+        return sampled + sosfiltfilt(sos, d)
+    return sampled
+
+
 def vectorise_grid(
     image_rotated,
     mask,
@@ -1947,15 +2093,20 @@ def vectorise_grid(
     ink_map=None,
     info=None,
     x_shift=0.0,
+    sharpen="none",
 ):
     """Vectorise one lead by sampling it on the shared column grid.
 
     ink_map is the ink of the whole page from _ink(), which weighs the mask rows by
     the ink under them; None is the mask on its own. x_shift is the page shift of
     measure_trace_shift(), the pixels the columns of the profile are moved right by.
+    sharpen is the --sharpen mode: "none" interpolates the column profile linearly,
+    "bandlimited" adds the band of _bandlimited_sharpen() to that.
     The return value stays the signal, because that is what every caller reads, so
     info, if given, is the dict the ink measurement of this lead is reported in.
     """
+    if sharpen not in ("none", "bandlimited"):
+        raise ValueError(f"unknown sharpen mode {sharpen!r}")
     total_seconds = LONG_SIGNAL_LENGTH_SEC if is_long else SHORT_SIGNAL_LENGTH_SEC
     y_shift_ratio_ = y_shift_ratio["full"] if is_long else y_shift_ratio[lead]
     values_needed = int(total_seconds * FREQUENCY)
@@ -1979,6 +2130,8 @@ def vectorise_grid(
     if x_shift:
         columns = columns + x_shift
     sampled = np.interp(x, columns, profile)
+    if sharpen == "bandlimited":
+        sampled = _bandlimited_sharpen(columns, profile, filled, x, sampled, FREQUENCY)
     baseline = baseline_row(y_shift_ratio_, image_rotated.shape[1], scale)
 
     # Pixel row r covers [r, r+1) as well, so the sampled trace sits at row + 0.5.
@@ -2249,6 +2402,7 @@ def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
     fieldnames = [
         "record",
         "placement",
+        "sharpen",
         "einthoven_rms",
         "einthoven_rms_demedian",
         "einthoven_ratio",
@@ -2601,6 +2755,7 @@ def run(args):
                     ink_map=ink_map,
                     info=ink,
                     x_shift=x_shift,
+                    sharpen=args.sharpen,
                 )
                 if ink:
                     ink_measured.append(ink)
@@ -2707,6 +2862,7 @@ def run(args):
         qc["grid_period_px"] = resolution_info["period"]
         qc["resolution_scale"] = resolution_info["scale"]
         qc["trace_estimator"] = args.trace_estimator
+        qc["sharpen"] = args.sharpen
         qc["ink_leads"] = ink_leads
         qc["ink_p95"] = ink_p95
         qc["trace_shift_px"] = trace_shift

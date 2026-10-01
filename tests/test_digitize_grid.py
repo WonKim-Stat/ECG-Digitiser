@@ -1072,7 +1072,8 @@ def _run(
     # the vertical lines of that grid and nothing else, which leaves the rotation, the
     # perspective and the resolution nothing to correct, only seconds and warnings.
     # The trace estimator and the page shift are the plain mask ones here for the same
-    # reason; None passes no flag at all, which is how the defaults are tested.
+    # reason; None passes no flag at all, which is how the defaults are tested. The
+    # sharpening is left at its default throughout.
     argv = [
         "-d", str(data_folder),
         "-o", str(output_folder),
@@ -1349,6 +1350,7 @@ def test_run_uses_the_ink_estimator_and_the_page_shift_by_default(tmp_path, caps
     with open(_output_folder(tmp_path, "default", "grid") / "qc.csv", newline="") as f:
         row = next(csv.DictReader(f))
     assert row["trace_estimator"] == "ink"
+    assert row["sharpen"] == "bandlimited"
     assert int(row["ink_leads"]) == len(LEAD_ORDER)
     assert float(row["trace_shift_px"]) == 0.0
     # Enough steep rows on the QRS flanks for the median to be used at all.
