@@ -166,6 +166,37 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--column_mapping",
+        type=str,
+        choices=["uniform", "lines"],
+        default="lines",
+        help=(
+            "Only for --time_mapping grid with --grid_origin lines. lines (default) = "
+            "read the time axis off the printed grid lines themselves: the 1 mm lines, "
+            "each put on the right line by the bold 5 mm ones, give every sample the x "
+            "of its own millimetre, so a page whose grid and traces are stretched or "
+            "compressed in places (printing, paper feed, scanning) is read where its "
+            "traces are; keeps the uniform grid, with a warning, on a page whose map "
+            "cannot be trusted, for example one without bold grid lines, and without "
+            "one on a page that the map moves by less than a pixel; uniform = every "
+            "column is P pixels wide from g0 on, the time axis before lines became "
+            "the default."
+        ),
+    )
+    # COLUMN_MAPPING_MEDIAN_MM is defined below as well.
+    parser.add_argument(
+        "--column_mapping_median",
+        type=float,
+        default=COLUMN_MAPPING_MEDIAN_MM,
+        help=(
+            "Only for --column_mapping lines. Width in grid millimetres of the running "
+            "median of the map's displacement from the uniform columns, which takes out "
+            "the ripple of grid lines snapped to the pixels of a page drawn at 200 dpi "
+            "(13.5 = one period of it) and keeps a step or a stretch of the lines; "
+            "0 = the map as measured."
+        ),
+    )
+    parser.add_argument(
         "--trace_estimator",
         type=str,
         choices=["mask", "ink"],
@@ -2079,6 +2110,376 @@ def _bandlimited_sharpen(columns, profile, filled, x, sampled, fs):
     return sampled
 
 
+# Window of the column mapping in printed 1 mm lines: it averages the noise of single
+# lines and still follows a step of the lines within some 60 px. It does not average out
+# the pixel snap of a drawn page, whose lines sit at round(x) + 0.5: at 200 dpi that
+# error repeats about every eight thin lines, one cycle per window, where a Hann window
+# passes half of it (its first null is at two cycles), and every 13.5 mm on the bold
+# lines. COLUMN_MAPPING_MEDIAN_MM takes that ripple out of the map, and the dead band
+# COLUMN_MAPPING_MIN_SHIFT_PX keeps a drawn page on the uniform columns.
+COLUMN_MAPPING_FINE_LINES = 8
+# Every fifth printed line is bold, and their comb over twenty lines, four of their
+# periods, says which 1 mm line a window is on. The 1 mm phase alone cannot tell a step
+# of the lines by half a line one way from one the other way, and on a scanned page such
+# steps are common: the wrong choice leaves everything after it a whole line, 1 mm or 20
+# samples, off.
+COLUMN_MAPPING_BOLD_EVERY = 5
+COLUMN_MAPPING_COARSE_LINES = 20
+# The map is measured this share of a column beyond the first and the last column edge,
+# so that its knots bracket every sample the page reads.
+COLUMN_MAPPING_REACH = 0.25
+# Windows whose 1 mm or 5 mm comb is weaker than this share of the median are dropped:
+# they sit on text, on the QR code or on paper without grid lines.
+COLUMN_MAPPING_MIN_WINDOW_AMPLITUDE = 0.3
+# Largest disagreement, in 1 mm lines, between the offset of the bold lines of a window
+# and that of its 1 mm lines. A window further off is dropped, and so is a window this
+# far off the median of its four neighbours, where a stray 5 mm phase named another line.
+COLUMN_MAPPING_BRANCH_TOLERANCE = 0.3
+# Share of the windows whose two offsets have to agree. With bold lines on the page
+# nearly all do (0.88 or more on every generator page with them, the 15 synthetic
+# conditions and the real renders and clean scans), without them the 5 mm phase is
+# noise and agrees by chance only (0.29 to 0.85 on augmented generator pages).
+COLUMN_MAPPING_MIN_AGREEMENT = 0.85
+# Neighbouring windows further apart than this many lines split the map into runs, and a
+# run shorter than a 1 mm window is dropped: a stretch whose bold offset strayed together
+# sits a whole line off both of its sides (0.96 and 1.04 lines on an augmented generator
+# page). A step of the printed lines themselves is a single jump between two long runs,
+# up to 0.70 lines on the real scans; a jump of more than COLUMN_MAPPING_MAX_JUMP lines
+# left after that is a line off, not a step.
+COLUMN_MAPPING_RUN_BREAK = 0.5
+COLUMN_MAPPING_MAX_JUMP = 0.8
+# Share of the windows over the columns that the map has to keep, and the longest stretch
+# of a column it may bridge without a window. A clean page keeps 0.87 or more with gaps up
+# to 0.17 columns; a mouldy scan loses whole stretches, over which a step goes unseen.
+COLUMN_MAPPING_MIN_COVERAGE = 0.8
+COLUMN_MAPPING_MAX_GAP = 0.25
+# A map that moves no sample the page reads by this many pixels against the uniform
+# columns is not used, which keeps such a page byte identical. After the running median
+# a drawn page is off by up to 0.26 px (dev renders; 0.39 px on the generator pages and
+# the synthetic conditions), the rest of the pixel snap of its lines, which the traces
+# do not share, while a clean scan moves by 1.4 px at least and by 9 px in the median.
+COLUMN_MAPPING_MIN_SHIFT_PX = 1.0
+# Width in grid millimetres of the running median of the map's displacement from the
+# uniform columns (--column_mapping_median). A page drawn at 200 dpi has its grid lines
+# snapped to the pixels and its traces not: the bold lines are 39.37 px apart, so their
+# snap advances by 0.37 px from one to the next and repeats every 2.7 of them, 13.5 mm.
+# The real scans carry that ripple as if printed from such pages: on dev pages the map's
+# displacement, less its 20 mm moving average, has its strongest period at 13.5 mm and
+# follows the render of the same record (r 0.44 per record in the median). The map would
+# move samples by it where the traces do not move. A running median over one period
+# takes it out (r 0.06 after it) and keeps a step or a stretch of the lines as it is,
+# since a run that only rises or only falls is its own median.
+COLUMN_MAPPING_MEDIAN_MM = 13.5
+
+
+def _running_median(knots_m, values, width):
+    """Running median of values at the increasing knots_m over width grid millimetres.
+
+    The window is centred on every knot. Beyond the outer knots the outer value is
+    carried on, as _column_map_x() carries the map on, so that a run that rises or
+    falls up to the end of the knots keeps its end.
+    """
+    half = width / 2
+    spacing = float(np.median(np.diff(knots_m)))
+    count = int(np.ceil(half / spacing)) + 1
+    padded_m = np.r_[
+        knots_m[0] - spacing * np.arange(count, 0, -1),
+        knots_m,
+        knots_m[-1] + spacing * np.arange(1, count + 1),
+    ]
+    padded = np.r_[np.full(count, values[0]), values, np.full(count, values[-1])]
+    low = np.searchsorted(padded_m, knots_m - half, side="left")
+    high = np.searchsorted(padded_m, knots_m + half, side="right")
+    return np.array([np.median(padded[a:b]) for a, b in zip(low, high)])
+
+
+def _column_mapping_windows(profile, period, low, high):
+    """Complex 1 mm and 5 mm comb amplitudes of windows along one grid line profile.
+
+    The window centres are about half a line apart and cover [low, high] as far as the
+    page reaches. The 1 mm window is COLUMN_MAPPING_FINE_LINES periods long, the 5 mm
+    window COLUMN_MAPPING_COARSE_LINES periods, centred on it and moved inside the page at
+    its ends. Both are Hann windowed and measured against the absolute x, as in
+    _grid_phase_field, so that their phases say where on the page the lines are.
+    Returns (centres, fine, coarse).
+    """
+    width = profile.size
+    fine_length = int(round(COLUMN_MAPPING_FINE_LINES * period))
+    coarse_length = int(round(COLUMN_MAPPING_COARSE_LINES * period))
+    step = max(int(round(period / 2)), 1)
+    first = max(int(np.floor(low - fine_length / 2)), 0)
+    last = min(int(np.ceil(high - fine_length / 2)), width - fine_length)
+    if fine_length < 2 or coarse_length > width or last < first:
+        empty = np.zeros(0)
+        return empty, empty.astype(complex), empty.astype(complex)
+    starts = np.arange(first, last + 1, step)
+    centres = starts + fine_length / 2
+    coarse_starts = np.clip(
+        np.round(centres - coarse_length / 2).astype(int), 0, width - coarse_length
+    )
+
+    def comb(window_starts, length, comb_period):
+        windows = profile[window_starts[:, None] + np.arange(length)]
+        # The mean of the single window, not of the page: uneven light is a slow ramp.
+        centred = windows - windows.mean(axis=1, keepdims=True)
+        # Pixel c covers [c, c+1), so its centre is at c + 0.5.
+        coordinates = window_starts[:, None] + np.arange(length) + 0.5
+        kernel = np.hanning(length) * np.exp(-2j * np.pi * coordinates / comb_period)
+        return (centred * kernel).sum(axis=1)
+
+    fine = comb(starts, fine_length, period)
+    coarse = comb(coarse_starts, coarse_length, COLUMN_MAPPING_BOLD_EVERY * period)
+    return centres, fine, coarse
+
+
+def _column_map_x(knots_m, knots_x, period, millimetres):
+    """The x of grid millimetres on a column map.
+
+    Linear between the knots (m, x), and one line per period beyond them, where nothing
+    was measured, which is the uniform grid carried on from the outer knots.
+    """
+    m = np.asarray(millimetres, dtype=float)
+    x = np.interp(m, knots_m, knots_x)
+    x = np.where(m < knots_m[0], knots_x[0] + (m - knots_m[0]) * period, x)
+    return np.where(m > knots_m[-1], knots_x[-1] + (m - knots_m[-1]) * period, x)
+
+
+def column_mapping_edges(signal_masks, signal_positions, long_leads):
+    """The mask edges of every lead with the grid millimetre each belongs to.
+
+    A short lead starts at the start of its column and ends at the start of the next,
+    the rhythm strip spans all columns; a column is 62.5 mm. The edges are x1 and
+    x1 + width, as fit_column_grid() reads them: pixel c covers [c, c+1). A lead that is
+    in no column of the layout gives no edge. Returns a list of (x, mm).
+    """
+    edges = []
+    for lead, mask in signal_masks.items():
+        if mask is None:
+            continue
+        if lead in long_leads:
+            first, last = 0, NUM_COLUMNS
+        elif lead in STANDARD_LEAD_OFFSETS_SEC:
+            first = int(STANDARD_LEAD_OFFSETS_SEC[lead] / SHORT_SIGNAL_LENGTH_SEC)
+            last = first + 1
+        else:
+            continue
+        x1 = float(signal_positions[lead]["x1"])
+        edges.append((x1, first * GRID_LINES_PER_COLUMN))
+        edges.append((x1 + mask.shape[2], last * GRID_LINES_PER_COLUMN))
+    return edges
+
+
+def measure_column_mapping(
+    image_rotated,
+    g0,
+    P,
+    edges,
+    snap_offset=GRID_LINE_SNAP_OFFSET,
+    median_mm=COLUMN_MAPPING_MEDIAN_MM,
+):
+    """Where every millimetre of the printed grid is along x, from its vertical lines.
+
+    The uniform grid puts every column P pixels wide from g0 on. A printed and scanned
+    sheet is not that even: its grid lines, and the traces printed with them, are pushed
+    about by up to a few pixels within a column, and a stretch of it can be a few per cent
+    narrower. The printed 1 mm lines say where each millimetre is, so the time axis is
+    read off them: the median profile of the bands of rows with grid lines, summed as the
+    frame is straight, gives in windows about half a line apart the offset of the 1 mm
+    lines, which is only known modulo a line, and that of the bold 5 mm lines, which,
+    followed along x, names the 1 mm line each window is on. Windows the two offsets do
+    not agree on are dropped, and so is a short stretch of windows a whole line off its
+    sides; a page whose windows still jump by a line is left alone. The grid coordinate u(x) = (x - offset(x)) / period counts
+    the lines, and its origin is the line the mask edges of all leads agree on, each read
+    at its own millimetre of that same local grid, so that neither a distorted column
+    nor a single late mask start picks it.
+    snap_offset is how far right of the traces the lines sit, as in
+    refine_grid_from_lines(). g0 and P are the column grid that function refined, P / 62.5
+    is the period of the lines. edges is column_mapping_edges().
+    median_mm is the width of the running median of the map's displacement from the
+    uniform columns (COLUMN_MAPPING_MEDIAN_MM), 0 or less for none; info["smoothing"] is
+    how far it moved a knot.
+    Returns (x_map, info). x_map(m) is the x of the traces m grid millimetres after the
+    start of the first column, in the coordinate of g0 (pixel c covers [c, c+1)). It is
+    None when info["reason"] says why the map cannot be trusted, or when
+    info["dead_band"] says that it moves no sample the page reads by
+    COLUMN_MAPPING_MIN_SHIFT_PX; info["shift"] is that largest move in pixels and
+    info["column_shift"] the same per column.
+    """
+    nan = float("nan")
+    info = {
+        "shift": nan,
+        "windows": 0,
+        "coverage": nan,
+        "gap": nan,
+        "agreement": nan,
+        "spikes": 0,
+        "islands": 0,
+        "jump": nan,
+        "origin_offset": nan,
+        "origin_move": nan,
+        "smoothing": nan,
+        "column_shift": [nan] * NUM_COLUMNS,
+        "dead_band": False,
+        "reason": "",
+        "knots_m": None,
+        "knots_x": None,
+    }
+    period = P / GRID_LINES_PER_COLUMN
+    profiles, _ = _band_profiles(_darkness(image_rotated))
+    if profiles.shape[0] == 0:
+        info["reason"] = "image too small for the grid line profile"
+        return None, info
+    # The frame is straight, so the bands add up coherently; the borders and anything
+    # else without grid lines are left out, as in grid_line_slope().
+    weights = np.abs(_grid_line_comb(profiles, period))
+    kept_bands = weights >= GRID_LINE_MIN_BAND_AMPLITUDE * np.median(weights)
+    profile = profiles[kept_bands].sum(axis=0)
+    low = g0 - COLUMN_MAPPING_REACH * P
+    high = g0 + (NUM_COLUMNS + COLUMN_MAPPING_REACH) * P
+    centres, fine, coarse = _column_mapping_windows(profile, period, low, high)
+    if centres.size < 2:
+        info["reason"] = "image too small for the column map"
+        return None, info
+
+    bold = COLUMN_MAPPING_BOLD_EVERY * period
+    # A blank window has no phase at all, however weak the others are.
+    strong = (
+        (np.abs(fine) > 0)
+        & (np.abs(coarse) > 0)
+        & (np.abs(fine) >= COLUMN_MAPPING_MIN_WINDOW_AMPLITUDE * np.median(np.abs(fine)))
+        & (
+            np.abs(coarse)
+            >= COLUMN_MAPPING_MIN_WINDOW_AMPLITUDE * np.median(np.abs(coarse))
+        )
+    )
+    index = np.flatnonzero(strong)
+    if index.size < 2:
+        info["reason"] = "no grid lines along the columns"
+        return None, info
+    # Where the lines are, modulo one line and modulo one bold line.
+    fine_offset = (-np.angle(fine[index]) / (2 * np.pi) * period) % period
+    coarse_offset = (-np.angle(coarse[index]) / (2 * np.pi) * bold) % bold
+    # Neighbouring windows are half a line apart, and the lines move by far less than
+    # half a bold period over that, so the bold offset unwraps by continuity along x.
+    steps = (np.diff(coarse_offset) + bold / 2) % bold - bold / 2
+    coarse_offset = coarse_offset[0] + np.r_[0.0, np.cumsum(steps)]
+    # The 1 mm offset on the line the bold lines name: exact to the 1 mm phase, and on
+    # the right line wherever the two agree.
+    offset = fine_offset + period * np.round((coarse_offset - fine_offset) / period)
+    agree = np.abs(offset - coarse_offset) <= COLUMN_MAPPING_BRANCH_TOLERANCE * period
+    info["agreement"] = float(np.mean(agree))
+    if info["agreement"] < COLUMN_MAPPING_MIN_AGREEMENT:
+        info["reason"] = (
+            f"5 mm and 1 mm lines agree on {100 * info['agreement']:.0f} % of the windows"
+        )
+        return None, info
+    x, offset = centres[index][agree], offset[agree]
+    # A window whose bold offset strayed by a bold period names another line and stands
+    # out of its neighbours by that line; a step of the lines themselves does not, as
+    # each side of it has two neighbours on its own level.
+    if x.size >= 5:
+        padded = np.pad(offset, 2, mode="edge")
+        neighbours = np.stack(
+            [padded[0:-4], padded[1:-3], padded[3:-1], padded[4:]], axis=1
+        )
+        spikes = np.abs(offset - np.median(neighbours, axis=1)) > (
+            COLUMN_MAPPING_BRANCH_TOLERANCE * period
+        )
+        info["spikes"] = int(np.count_nonzero(spikes))
+        x, offset = x[~spikes], offset[~spikes]
+    runs = np.split(
+        np.arange(x.size),
+        np.flatnonzero(np.abs(np.diff(offset)) > COLUMN_MAPPING_RUN_BREAK * period) + 1,
+    )
+    # The windows are about half a line apart, so a 1 mm window holds twice its lines.
+    long_runs = [run for run in runs if run.size >= 2 * COLUMN_MAPPING_FINE_LINES]
+    info["islands"] = len(runs) - len(long_runs)
+    if not long_runs:
+        info["reason"] = "no stretch of grid lines along the columns"
+        return None, info
+    x, offset = x[np.concatenate(long_runs)], offset[np.concatenate(long_runs)]
+    info["windows"] = int(x.size)
+    info["jump"] = float(np.max(np.abs(np.diff(offset)), initial=0.0) / period)
+
+    end = g0 + NUM_COLUMNS * P
+    inside = (centres >= g0) & (centres <= end)
+    kept_inside = np.count_nonzero((x >= g0) & (x <= end))
+    info["coverage"] = float(kept_inside / max(np.count_nonzero(inside), 1))
+    info["gap"] = float(np.max(np.diff(np.r_[g0, x[(x > g0) & (x < end)], end])) / P)
+    if info["coverage"] < COLUMN_MAPPING_MIN_COVERAGE:
+        info["reason"] = f"map keeps {100 * info['coverage']:.0f} % of its windows"
+        return None, info
+    if info["gap"] > COLUMN_MAPPING_MAX_GAP:
+        info["reason"] = f"map has a gap of {info['gap']:.2f} columns"
+        return None, info
+    if info["jump"] > COLUMN_MAPPING_MAX_JUMP:
+        info["reason"] = f"grid lines jump by {info['jump']:.2f} lines"
+        return None, info
+    lines = (x - offset) / period
+    if np.any(np.diff(lines) <= 0):
+        info["reason"] = "grid coordinate does not grow along x"
+        return None, info
+
+    # The origin: the line the mask edges agree on. Each edge is read on the local grid
+    # at the millimetre it belongs to, the traces sit snap_offset left of the lines, and
+    # the offset is held beyond the outer windows, as _column_map_x() carries it on.
+    if not edges:
+        info["reason"] = "no mask edges"
+        return None, info
+    edge_x = np.array([edge[0] for edge in edges], float) + snap_offset
+    edge_mm = np.array([edge[1] for edge in edges], float)
+    edge_lines = (edge_x - np.interp(edge_x, x, offset)) / period - edge_mm
+    consensus = float(np.median(edge_lines))
+    origin = np.round(consensus)
+    info["origin_offset"] = float((consensus - origin) * period)
+    if abs(info["origin_offset"]) > GRID_LINE_SHIFT_TOLERANCE * P:
+        info["reason"] = (
+            f"mask edges are {info['origin_offset']:+.1f} px off the next grid line"
+        )
+        return None, info
+    knots_m = lines - origin
+    knots_x = x - snap_offset
+    if median_mm > 0:
+        # The displacement from the uniform columns without the ripple of the pixel
+        # snap of the lines, which the traces do not share.
+        uniform_knots = g0 + knots_m * period
+        smoothed = uniform_knots + _running_median(
+            knots_m, knots_x - uniform_knots, median_mm
+        )
+        info["smoothing"] = float(np.max(np.abs(smoothed - knots_x)))
+        knots_x = smoothed
+        if np.any(np.diff(knots_x) <= 0):
+            info["reason"] = "smoothed map does not grow along x"
+            return None, info
+    info["knots_m"], info["knots_x"] = knots_m, knots_x
+
+    # Every sample the page reads: the rhythm strip covers all columns.
+    samples_per_column = SHORT_SIGNAL_LENGTH_SEC * FREQUENCY
+    millimetres = (
+        np.arange(int(NUM_COLUMNS * samples_per_column))
+        / samples_per_column
+        * GRID_LINES_PER_COLUMN
+    )
+    mapped = _column_map_x(knots_m, knots_x, period, millimetres)
+    uniform = g0 + millimetres * P / GRID_LINES_PER_COLUMN
+    moved = np.abs(mapped - uniform)
+    info["shift"] = float(np.max(moved))
+    info["column_shift"] = [float(np.max(part)) for part in np.split(moved, NUM_COLUMNS)]
+    info["origin_move"] = float(mapped[0] - g0)
+    # The dead band is one for the page: a column the map moves by less than a pixel is
+    # still read on it, since the uniform columns are fitted to the whole page, the
+    # distorted columns included (on dev scans, holding such columns uniform cost
+    # column 2 some 1.3 to 1.6 dB in the median against the map).
+    if info["shift"] < COLUMN_MAPPING_MIN_SHIFT_PX:
+        info["dead_band"] = True
+        return None, info
+
+    def x_map(m):
+        return _column_map_x(knots_m, knots_x, period, m)
+
+    return x_map, info
+
+
 def vectorise_grid(
     image_rotated,
     mask,
@@ -2094,6 +2495,7 @@ def vectorise_grid(
     info=None,
     x_shift=0.0,
     sharpen="none",
+    x_map=None,
 ):
     """Vectorise one lead by sampling it on the shared column grid.
 
@@ -2102,6 +2504,9 @@ def vectorise_grid(
     measure_trace_shift(), the pixels the columns of the profile are moved right by.
     sharpen is the --sharpen mode: "none" interpolates the column profile linearly,
     "bandlimited" adds the band of _bandlimited_sharpen() to that.
+    x_map is the column map of measure_column_mapping(), the x of the traces at a
+    number of grid millimetres after the start of the first column, which then places
+    the samples instead of the uniform columns of g0 and P; None keeps those.
     The return value stays the signal, because that is what every caller reads, so
     info, if given, is the dict the ink measurement of this lead is reported in.
     """
@@ -2123,7 +2528,14 @@ def vectorise_grid(
         profile = _ink_profile(ink_map, binary, position, profile, filled, info)
 
     # Pixel c covers [c, c+1), so its centre is at c + 0.5. np.interp holds the edges.
-    x = g0 + column * P + np.arange(values_needed) * P / samples_per_column - 0.5
+    if x_map is None:
+        x = g0 + column * P + np.arange(values_needed) * P / samples_per_column - 0.5
+    else:
+        # A sample is 1/20 mm at 25 mm/s and 500 Hz, a column 62.5 mm.
+        millimetres = (
+            column + np.arange(values_needed) / samples_per_column
+        ) * GRID_LINES_PER_COLUMN
+        x = x_map(millimetres) - 0.5
     # The lead is read where its ink is, so the shift moves the columns of the
     # profile and not the sampling grid, which belongs to the printed grid.
     columns = position["x1"] + filled
@@ -2429,6 +2841,8 @@ def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
         "ink_p95",
         "trace_shift_px",
         "trace_shift_rows",
+        "column_mapping",
+        "column_mapping_shift_px",
     ]
     write_header = not os.path.exists(qc_path)
     with open(qc_path, "a", newline="") as f:
@@ -2710,6 +3124,56 @@ def run(args):
                     f"Trace shift for record {record}: {trace_shift:+.2f} px from "
                     f"{trace_shift_rows} rows{dead}"
                 )
+        # The time axis off the printed grid lines, on a page whose columns they refined.
+        # A page without a column grid or without grid lines has been warned about above.
+        x_map, column_mapping, column_mapping_shift = None, "uniform", float("nan")
+        if args.column_mapping == "lines":
+            if g0 is None:
+                column_mapping = "uniform: no column grid"
+            elif args.grid_origin != "lines":
+                column_mapping = "uniform: grid origin from the masks"
+            elif grid_lines["reason"]:
+                column_mapping = "uniform: grid lines not used"
+            if column_mapping != "uniform":
+                if args.verbose:
+                    print(f"Column mapping for record {record}: {column_mapping}")
+            else:
+                x_map, map_info = measure_column_mapping(
+                    image_rotated,
+                    g0,
+                    P,
+                    column_mapping_edges(
+                        signal_masks_cropped, signal_positions_cropped, long_leads
+                    ),
+                    snap_offset=args.grid_line_offset,
+                    median_mm=args.column_mapping_median,
+                )
+                column_mapping_shift = map_info["shift"]
+                if map_info["reason"]:
+                    column_mapping = f"uniform: {map_info['reason']}"
+                    print(
+                        f"WARNING: column mapping not used for record {record} "
+                        f"({map_info['reason']}), keeping the uniform grid."
+                    )
+                elif x_map is None:
+                    column_mapping = "uniform: dead band"
+                else:
+                    column_mapping = "lines"
+                if args.verbose:
+                    print(
+                        f"Column mapping for record {record}: {column_mapping}, shift "
+                        f"{map_info['shift']:.2f} px, windows {map_info['windows']}, "
+                        f"coverage {map_info['coverage']:.3f}, gap "
+                        f"{map_info['gap']:.3f} columns, agreement "
+                        f"{map_info['agreement']:.3f}, spikes {map_info['spikes']}, "
+                        f"islands {map_info['islands']}, jump "
+                        f"{map_info['jump']:.2f} lines, "
+                        f"origin offset {map_info['origin_offset']:+.2f} px, origin "
+                        f"move {map_info['origin_move']:+.2f} px, smoothing "
+                        f"{map_info['smoothing']:.2f} px, column shifts "
+                        + "/".join(f"{s:.2f}" for s in map_info["column_shift"])
+                        + " px"
+                    )
         signals_predicted = {}
         for lead, mask in signal_masks_cropped.items():
             if mask is None:
@@ -2756,6 +3220,7 @@ def run(args):
                     info=ink,
                     x_shift=x_shift,
                     sharpen=args.sharpen,
+                    x_map=x_map,
                 )
                 if ink:
                     ink_measured.append(ink)
@@ -2867,6 +3332,8 @@ def run(args):
         qc["ink_p95"] = ink_p95
         qc["trace_shift_px"] = trace_shift
         qc["trace_shift_rows"] = trace_shift_rows
+        qc["column_mapping"] = column_mapping
+        qc["column_mapping_shift_px"] = column_mapping_shift
         append_qc_row(
             args.output_folder, record, args.lead_placement, qc, max_offset_deviation
         )

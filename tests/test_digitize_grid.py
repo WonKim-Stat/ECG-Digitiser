@@ -1064,7 +1064,7 @@ def _output_folder(tmp_path, name, time_mapping, baseline=None, grid_origin=None
 
 def _run(
     tmp_path, name, label, time_mapping, baseline=None, image=None, grid_origin=None,
-    verbose=False, trace_estimator="mask", trace_shift="off",
+    verbose=False, trace_estimator="mask", trace_shift="off", column_mapping=None,
 ):
     data_folder, mask_folder = _write_case(tmp_path, name, label, image)
     output_folder = _output_folder(tmp_path, name, time_mapping, baseline, grid_origin)
@@ -1073,7 +1073,9 @@ def _run(
     # perspective and the resolution nothing to correct, only seconds and warnings.
     # The trace estimator and the page shift are the plain mask ones here for the same
     # reason; None passes no flag at all, which is how the defaults are tested. The
-    # sharpening is left at its default throughout.
+    # sharpening is left at its default throughout, and so is the column mapping: no
+    # page here has the bold 5 mm lines it needs, most have no grid lines at all, so
+    # it never moves a sample and every lead is read on the uniform columns.
     argv = [
         "-d", str(data_folder),
         "-o", str(output_folder),
@@ -1092,6 +1094,8 @@ def _run(
         argv += ["--trace_estimator", trace_estimator]
     if trace_shift is not None:
         argv += ["--trace_shift", trace_shift]
+    if column_mapping is not None:
+        argv += ["--column_mapping", column_mapping]
     args = digitize.get_parser().parse_args(argv)
     digitize.run(args)
     with warnings.catch_warnings():
@@ -1235,7 +1239,7 @@ def test_append_qc_row_writes_the_trace_estimator_columns(tmp_path):
         row = next(reader)
         # The new columns are appended, the old ones keep their order.
         assert reader.fieldnames[:2] == ["record", "placement"]
-        assert reader.fieldnames[-5:-2] == ["trace_estimator", "ink_leads", "ink_p95"]
+        assert reader.fieldnames[-7:-4] == ["trace_estimator", "ink_leads", "ink_p95"]
     assert row["trace_estimator"] == "ink"
     assert int(row["ink_leads"]) == 13
     assert float(row["ink_p95"]) == pytest.approx(232.0)
@@ -1282,7 +1286,7 @@ def test_append_qc_row_writes_the_trace_shift_columns(tmp_path):
         row = next(reader)
         # The new columns are appended, the old ones keep their order.
         assert reader.fieldnames[:2] == ["record", "placement"]
-        assert reader.fieldnames[-2:] == ["trace_shift_px", "trace_shift_rows"]
+        assert reader.fieldnames[-4:-2] == ["trace_shift_px", "trace_shift_rows"]
     assert float(row["trace_shift_px"]) == pytest.approx(0.18)
     assert int(row["trace_shift_rows"]) == 4752
 
@@ -1335,7 +1339,8 @@ def test_run_uses_the_ink_estimator_and_the_page_shift_by_default(tmp_path, caps
     """What the two defaults are for, with no trace flag given at all.
 
     The page here is drawn from its own masks, so neither stage has anything to move;
-    what shows that they ran is the QC row and the lines they print.
+    what shows that they ran is the QC row and the lines they print. The page has no
+    grid lines either, so the default column mapping keeps the uniform columns.
     """
     label = _connected_label(make_label_mask())
     page = _inked_page(label)
@@ -1346,6 +1351,7 @@ def test_run_uses_the_ink_estimator_and_the_page_shift_by_default(tmp_path, caps
     out = capsys.readouterr().out
     assert "Trace estimator for record default: ink on" in out
     assert "Trace shift for record default: +0.00 px from" in out
+    assert "Column mapping for record default: uniform: grid lines not used" in out
 
     with open(_output_folder(tmp_path, "default", "grid") / "qc.csv", newline="") as f:
         row = next(csv.DictReader(f))
@@ -1355,8 +1361,22 @@ def test_run_uses_the_ink_estimator_and_the_page_shift_by_default(tmp_path, caps
     assert float(row["trace_shift_px"]) == 0.0
     # Enough steep rows on the QRS flanks for the median to be used at all.
     assert int(row["trace_shift_rows"]) >= digitize.TRACE_SHIFT_MIN_ROWS
+    # --column_mapping lines is the default, and without grid lines it measures no map.
+    assert row["column_mapping"] == "uniform: grid lines not used"
+    assert row["column_mapping_shift_px"] == "nan"
 
     # Nothing to move, so the defaults read this page where the plain masks do.
     masks = _run(tmp_path, "defaultmask", label, "grid", image=page)
     assert record.sig_name == masks.sig_name
     assert np.array_equal(record.p_signal, masks.p_signal, equal_nan=True)
+
+    # And where the uniform columns, the time axis before the default, read it.
+    uniform = _run(
+        tmp_path, "defaultuniform", label, "grid", image=page,
+        trace_estimator=None, trace_shift=None, column_mapping="uniform",
+    )
+    qc_path = _output_folder(tmp_path, "defaultuniform", "grid") / "qc.csv"
+    with open(qc_path, newline="") as f:
+        assert next(csv.DictReader(f))["column_mapping"] == "uniform"
+    assert record.sig_name == uniform.sig_name
+    assert np.array_equal(record.p_signal, uniform.p_signal, equal_nan=True)
