@@ -253,41 +253,49 @@ where
 
 #### Pipeline stages
 
-Under the defaults, every page goes through the stages below before its signals are
-written (`run()` in `src/run/digitize.py`). Every stage that reads the printed 1 mm
-grid lines falls back to the behaviour without them if the page shows none.
+Under the defaults, every page goes through stages 2 to 10 below before its signals are
+written (`run()` in `src/run/digitize.py`); stage 1 is opt-in. Every stage that reads
+the printed 1 mm grid lines falls back to the behaviour without them if the page shows
+none.
 
-1. **Resolution:** the period of the printed grid lines is measured and the page is
+1. **Paper normalisation (only with `--paper_normalisation auto`, off by default):** a
+   photographed page is put into the frame the model was trained on. A page whose grid
+   lines stages 2 to 4 read as it is, or whose printed grid fills the image, is left
+   alone; otherwise the four edges of the sheet are looked for and the sheet is warped
+   onto a US Letter landscape page at 200 dpi (`src/run/paper_normalisation.py`). A page
+   whose paper is not found is kept, with a `WARNING`.
+2. **Resolution:** the period of the printed grid lines is measured and the page is
    resampled to the period of a 200 dpi page, the scale the model was trained on.
-2. **Rotation:** a 0.1° Hough transform, refined with the phase drift of the grid lines
+3. **Rotation:** a 0.1° Hough transform, refined with the phase drift of the grid lines
    from the top to the bottom of the page.
-3. **Perspective:** the shear and the perspective that the phase field of the grid lines
+4. **Perspective:** the shear and the perspective that the phase field of the grid lines
    shows are taken out, in the same warp as the rotation.
-4. **Segmentation:** nnU-Net predicts the lead masks of the corrected page.
-5. **Column grid:** all leads are put on one shared column grid, with the column pitch
+5. **Segmentation:** nnU-Net predicts the lead masks of the corrected page.
+6. **Column grid:** all leads are put on one shared column grid, with the column pitch
    from the page height, the origin refined to sub-pixel accuracy on the grid lines and
    moved by the grid line offset.
-6. **Column mapping:** the time axis is read off the grid lines themselves: the 1 mm
+7. **Column mapping:** the time axis is read off the grid lines themselves: the 1 mm
    lines, each named by the bold 5 mm lines, say where every millimetre of the page is,
    so a page whose grid and traces are stretched, compressed or stepped in places by
    printing, paper feed or scanning is read at the x of each sample's own millimetre.
    A page that the map moves by less than a pixel, or whose map cannot be trusted, keeps
    the uniform columns of the column grid.
-7. **Trace reading:** every column of a lead gives one row, the mean row of its mask
+8. **Trace reading:** every column of a lead gives one row, the mean row of its mask
    weighted by the ink of the page under it, read on a column axis moved by the trace
    shift measured on the page.
-8. **Sharpening:** the 20–40 Hz band that the width of a column and the linear
+9. **Sharpening:** the 20–40 Hz band that the width of a column and the linear
    interpolation between columns attenuate is put back: the part below 35 Hz of the
    difference between an aperture-corrected cubic spline through the columns and the
    linear trace is added to the trace, so steep QRS spikes cannot ring.
-9. **Baseline:** the zero line comes from the page geometry scaled with the column pitch
-   and is then shifted so that the Einthoven and Goldberger sums have no DC offset.
+10. **Baseline:** the zero line comes from the page geometry scaled with the column pitch
+    and is then shifted so that the Einthoven and Goldberger sums have no DC offset.
 
 
 #### Options
 
 | Flag | Choices | Default | What it does |
 | --- | --- | --- | --- |
+| `--paper_normalisation` | `off`, `auto` | `off` | `auto` puts a photographed page into the frame the model was trained on, before every other stage and on the signals of the image alone. A page whose printed grid lines the resolution, the rotation and the perspective stage all read as it is is left as it is (`pass_chain`), and so is one without a background to find a paper edge in: the image reaches at most 8 mm beyond a Letter sheet, or no paper edge is found and the grid is within 12 mm of the border on all four sides, or the paper found covers 95 % of the image (`pass_fullframe`). Otherwise the four edges of the sheet are looked for (the region of the red grid, then in 24 bands per side the step from the print or its white margin to the background, then each side again at full resolution) and the sheet is warped in one bicubic pass onto a US Letter landscape page at 200 dpi (2200 × 1700 px), long side horizontal, in the orientation that puts the trace ink in the lower part, and scaled so that the 1 mm grid has the period it has on a scanned printout, 0.954 × 200 dpi (`normalised`). A page whose paper is not found, runs off the image or gives an implausible sheet or grid is kept, with a `WARNING` (`failed`); such a page, or a `pass_fullframe` one, whose grid the resolution stage could not read while the extent of its grid says it is more than 12 % above 200 dpi of paper is shrunk to that and not rectified, with a `WARNING` as well (`scaled`). The curl of a sheet is not taken out, and the print gets the scale of the frame, not its position. A page without a readable grid is not told from a photograph by its content, as in the view builder: a blank page is `pass_fullframe`, and a large image without a grid, blank or with content that looks like a sheet at the scale of a photograph (4000 × 3000 px, say), is taken to show a whole Letter sheet and shrunk to 200 dpi of it (`scaled`). The stage is the image code of the view builder that made the photograph results of the quality control section, function for function, with the thresholds chosen there on the 345 development photographs of the ECG-Image-Database (115 records, three photo conditions; references below the table). With that builder, outside this repository, 301 of those pages were normalised, 22 scaled, 12 passed and 10 failed; scored per lead against PTB-XL, the median lead SNR of the three conditions rose from −6.20, −3.63 and −4.53 dB to −1.87, −1.10 and −0.52 dB (paired median, pooled over the three, +3.71 dB, 95 % CI 2.87 to 4.41; +3.55 dB with the time axis left uniform, so from the normalisation alone), a PTB-XL diagnostic classifier changed 26.3, 32.7 and 30.6 % instead of 47.5, 51.3 and 40.2 % of its record and class decisions against the digital signal, and the 903 rendered pages, scans and synthetic pages it was checked on were all left as they are. So photographs are read better, not well: most of what is left is the time axis of a sheet that does not lie flat. These numbers were not measured again with the flag itself. On a page that is left as it is, with `--resolution`, `--rotation` and `--perspective` at `lines`, the three stages are measured once and used twice, and the stage costs about 0.1 s (the digests of the page); with one of them set otherwise the stages are measured a second time, 1 to 4 s per page on generator pages, and a synthetic 12-megapixel photograph takes 5 to 8 s. What was done to a page is recorded next to its mask, see below the table. `off` takes the page as it is. |
 | `--resolution` | `keep`, `lines` | `lines` | `lines` resamples the page so that the printed 1 mm grid lines have the period of a 200 dpi page, the scale the model was trained on. A page within about a tenth of that scale keeps its pixels, because resampling it costs more than the scale does. |
 | `--rotation` | `hough`, `lines` | `lines` | `lines` refines a 0.1° Hough angle with the phase drift of the grid lines, which resolves fractions of a degree. `hough` is the Hough transform of the page in whole degrees only. |
 | `--perspective` | `off`, `lines` | `lines` | `lines` takes the shear and the perspective that the grid lines show out of the rotated page, and leaves a page alone that is straight enough already. `off` keeps the rotated page. |
@@ -303,6 +311,49 @@ grid lines falls back to the behaviour without them if the page shows none.
 | `--baseline` | `page`, `leads` | `leads` | `page` takes the baseline from the page geometry, scaled with the column pitch. `leads` additionally shifts it so that the Einthoven and Goldberger sums have no DC offset. |
 
 `python -m src.run.digitize --help` lists the remaining options (`--interpolation`, `--enable_tta`, `--lead_placement`, `--save_mask`, `--mask_folder`, `--fold`, `--device`).
+
+`--save_mask` writes the mask of a page as `<record>_mask.png` with a `<record>_mask.json`
+that says which frame the mask lives in, and `--mask_folder` reads both back instead of
+running the model. A page that `--paper_normalisation auto` decided gets one more key in
+that JSON, `paper_normalisation`: the version of the decision rules, the numpy and cv2
+versions, the decision and its reason, the size (width, height) and the SHA-1 of the
+pixels of the page as it came (`input_size`, `input_sha1`) and of the page the model saw
+(`output_size`, `view_sha1`), and the numbers that build the second from the first, the
+size the page is shrunk to first and the 3 × 3 warp matrix of a `normalised` page
+(`pre_size`, `warp`, with `homography` and `orientation` for the record) or the size of
+a `scaled` one (`resize`, with `scaled_from` and `scale_factor`). A mask only fits the
+page it was predicted on, and a normalised page has the size of every other page, so
+with `--mask_folder` a page whose mask has this record is never decided again, whatever
+the flag says, but checked against it before any stage runs:
+
+- a page that already is the recorded view (size and SHA-1) is used as given;
+- with `--paper_normalisation auto`, a page that is the recorded input (size and SHA-1)
+  of a `normalised` or `scaled` view is warped or shrunk again with the recorded numbers,
+  and the result must have the recorded size and SHA-1;
+- everything else stops the run with a `ValueError` that names the record and says
+  `the mask does not fit`: another page, another view, a record of an unknown version or
+  decision, or the input page given without `--paper_normalisation auto`. `-f` does not
+  cover it, as it only skips a page without signals.
+
+The JSON of a mask is read for this record before any stage runs, with either flag, so a
+`<record>_mask.json` that cannot be parsed now stops the run there, with the error of the
+JSON parser.
+
+A mask without the record, which is every mask saved without the flag, has no such pixel
+check: its page is used as given, with `as given` in `qc.csv` under
+`--paper_normalisation auto`, and only the size of the mask and the frame warnings of
+the rotation and the perspective stand between it and another page. A mask that is
+refused can still be used: give the run the page it was predicted on, which is the
+recorded view itself or, with `--paper_normalisation auto`, the input page the view is
+rebuilt from; or, to take a page as given without the check, remove the
+`paper_normalisation` key from the JSON of the mask. The message of every refusal ends
+on these two ways out: `Give the page the mask was predicted on, or remove the
+paper_normalisation key from the mask's JSON to take the page as given.` A mask without
+the record that has another size than its page stops the run as it always did
+(`the mask was predicted for another --resolution`), and under
+`--paper_normalisation auto` the message adds that the mask has no record, so the page
+was used as given: the page to give then is the view the mask was predicted on. With
+`--mask_folder` and `--save_mask` together the record is written out again unchanged.
 
 The real-page numbers in the table and in the quality control section below are on the
 ECG-Image-Database, version 2
@@ -335,6 +386,14 @@ columns:
   leads in the sum, and the number of samples it was computed over.
 - **Lead placement:** `max_offset_deviation`, the largest distance in seconds between a
   measured lead offset and the standard one it was snapped to.
+- **Paper normalisation:** `paper_normalisation`, `off` without
+  `--paper_normalisation auto`; with it the decision for the page, `pass_chain`,
+  `pass_fullframe`, `normalised`, `scaled` or `failed`, or `as given` for a page read
+  with a mask from `--mask_folder` that has no record of one. A mask with such a record
+  gives its decision with either flag. The column is the 13th, right after
+  `max_offset_deviation`, and rows are appended to a `qc.csv` that is already there
+  under the header it has: do not append to a `qc.csv` written by an older version,
+  which lacks the column, but use a fresh output folder.
 - **Resolution:** `grid_period_px`, the measured grid line period, and
   `resolution_scale`, the factor the page was resampled by (1 if it was left alone).
 - **Rotation:** `rotation_angle`, the angle the page was turned by, `rotation_coarse`,
@@ -363,7 +422,9 @@ columns:
   estimate.
 
 A `WARNING` line is printed whenever a stage cannot do what it is asked and falls back:
-the grid lines are unusable for the resolution (the page is kept as it is), for the
+`--paper_normalisation auto` does not find the paper of a page that needs it (the page
+is kept as it is, or only rescaled); the grid lines are unusable for the resolution (the
+page is kept as it is), for the
 rotation (the whole degree Hough angle is kept), for the perspective (the rotated page
 is kept) or for the grid origin (the grid of the masks is kept); no column grid fits the
 page, so `--time_mapping bbox` is used for it; the Einthoven and the Goldberger baseline
@@ -401,7 +462,8 @@ rendered pages, none below 12 dB, each with a real error in lead I, II or III. O
 photographs it flags nearly every page, so there it does not tell good pages from bad
 ones: all 203 mould-damaged scans below 12 dB and 23 of the other 27, and 340 of the 343
 photographs below 12 dB and both others (photographs read after a paper normalisation
-that is not part of this repository). It flags 1 of the 115 rendered pages, which is not
+done outside this repository, by the view builder whose image code
+`--paper_normalisation auto` now holds). It flags 1 of the 115 rendered pages, which is not
 below 12 dB. On synthetic pages it flags 3 of the 192 pages of the results below, none
 of them below 12 dB, and 98 of 2,000 synthetic pages of 500 PTB-XL records (read before
 the column mapping), 5 of the 6 below 12 dB among them. The Goldberger ratio

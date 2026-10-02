@@ -2,6 +2,7 @@
 import argparse
 import csv
 import cv2
+import hashlib
 import json
 import numpy as np
 import matplotlib.pyplot as plt
@@ -34,6 +35,7 @@ from config import (
     ADC_GAIN,
     BASELINE,
 )
+from src.run import paper_normalisation
 
 
 # Parse arguments.
@@ -301,6 +303,25 @@ def get_parser():
             "the rotation and the perspective included, sees the resampled "
             "page, and --grid_line_offset is a page unit, so its default stays right "
             "for generator pages of any resolution. keep = take the page as it is."
+        ),
+    )
+    parser.add_argument(
+        "--paper_normalisation",
+        type=str,
+        choices=["off", "auto"],
+        default="off",
+        help=(
+            "auto = before everything else, put a photographed page into the frame "
+            "the model was trained on: a page whose printed grid lines the "
+            "resolution, the rotation and the perspective stage all read is left as "
+            "it is, and so is one whose grid fills the image; otherwise the four "
+            "edges of the paper are looked for and the sheet is warped onto a US "
+            "Letter landscape page at 200 dpi, long side horizontal, traces in the "
+            "lower part; a page whose paper cannot be found is kept, with a warning, "
+            "or only shrunk to 200 dpi of paper when its grid says it is much larger. "
+            "What was done to a page is written next to its mask by --save_mask, and "
+            "--mask_folder replays it from there instead of deciding again. "
+            "off = take the page as it is."
         ),
     )
     parser.add_argument(
@@ -1786,6 +1807,303 @@ def normalise_resolution(image):
     return torch.from_numpy(resized.transpose(2, 0, 1).copy()), info
 
 
+# The decisions of the paper normalisation, each with what its record has to hold, on
+# top of the sizes and the digests every record holds, for the view to be built again
+# from the record alone: nothing for a page that was left as it is.
+PAPER_BLOCK_KEYS = {
+    "pass_chain": (),
+    "pass_fullframe": (),
+    "failed": (),
+    "normalised": ("pre_size", "warp"),
+    "scaled": ("resize",),
+}
+
+
+def page_sha1(image):
+    """SHA-1 of the pixels of a page tensor [C, H, W], read row by row, channels last.
+
+    That is the digest of the H x W x C array of the page, so two pages agree in it
+    only if they agree in every pixel, whatever file either of them was read from.
+    """
+    array = np.ascontiguousarray(image.permute(1, 2, 0).numpy())
+    return hashlib.sha1(array.tobytes()).hexdigest()
+
+
+def paper_chain(image):
+    """What the stages before the segmentation make of a page as it is.
+
+    The resolution, the rotation and the perspective stage in the order of run(), each
+    with the grid lines whatever the flags of the run say: a page all three of them
+    read is one the paper normalisation has to leave alone.
+    Returns (info, stages). info holds the numbers and the reasons of the three stages,
+    and info["ok"] says that none of them fell back, which is the page run() prints no
+    "grid lines not used" warning for. stages holds what the stages returned, so that
+    run() need not measure the same page a second time: the resampled page and its
+    info, the angle as estimate_rotation() gave it, None or NaN included, and its info,
+    the page the perspective was measured on, and its homography and info.
+    """
+    rescaled, resolution_info = normalise_resolution(image)
+    info = {
+        "res_reason": resolution_info.get("reason", ""),
+        "res_scale": resolution_info["scale"],
+        "res_period": resolution_info["period"],
+        "res_contrast": resolution_info.get("contrast", float("nan")),
+        "res_harmonic": resolution_info.get("harmonic", 0),
+    }
+    rot_angle, rotation_info = estimate_rotation(rescaled, "lines")
+    info["rot_reason"] = rotation_info["reason"]
+    info["rot_contrast"] = rotation_info["contrast"]
+    info["rot_coarse"] = rotation_info["coarse"]
+    angle = rot_angle
+    if angle is None or np.isnan(angle):
+        angle = 0.0
+    info["rot_angle"] = float(angle)
+    rotation = rotation_homography(angle, rescaled.shape[2], rescaled.shape[1])
+    # In the frame of the final warp, as run() measures it.
+    measured = rescaled if angle == 0.0 else warp_page(rescaled, rotation)
+    H_rect, perspective_info = estimate_perspective(measured)
+    info["persp_reason"] = perspective_info["reason"]
+    info["persp_shift"] = perspective_info["shift"]
+    info["persp_residual"] = perspective_info["residual"]
+    info["persp_windows"] = perspective_info["windows"]
+    info["persp_applied"] = int(H_rect is not None)
+    info["ok"] = not (
+        info["res_reason"] or info["rot_reason"] or info["persp_reason"]
+    )
+    info["size"] = f"{rescaled.shape[2]}x{rescaled.shape[1]}"
+    stages = {
+        "image": rescaled,
+        "resolution_info": resolution_info,
+        "rot_angle": rot_angle,
+        "rotation_info": rotation_info,
+        "measured": measured,
+        "H_rect": H_rect,
+        "perspective_info": perspective_info,
+    }
+    return info, stages
+
+
+def paper_frame_periods(page):
+    """Period of the printed 1 mm grid lines of a page along x and along y.
+
+    page is an H x W x 3 array, the sheet as the paper normalisation warped it.
+    measure_grid_period() on the page and on the page transposed, each NaN when it
+    rejects the comb, with the period before that rejection (raw) and the contrast of
+    the comb.
+    """
+    t = torch.from_numpy(np.ascontiguousarray(page.transpose(2, 0, 1)))
+    px, ix = measure_grid_period(t)
+    py, iy = measure_grid_period(t.permute(0, 2, 1).contiguous())
+    return {
+        "px": float(px),
+        "py": float(py),
+        "px_raw": float(ix.get("period", np.nan)),
+        "py_raw": float(iy.get("period", np.nan)),
+        "cx": float(ix.get("contrast", np.nan)),
+        "cy": float(iy.get("contrast", np.nan)),
+    }
+
+
+def normalise_paper(image):
+    """Put a photographed page into the frame the model reads, or leave the page alone.
+
+    image is the page as read_image gives it. What is done with it is decided by
+    paper_normalisation.normalise_page() on the pixels alone, with paper_chain() as
+    the test of a page that needs nothing and paper_frame_periods() as the check of a
+    warped one: pass_chain and pass_fullframe leave the page as it is, normalised is
+    the sheet warped onto the 2200 x 1700 page, scaled the page shrunk to 200 dpi of
+    paper, and failed a page whose paper was not found, left as it is as well.
+    Returns (view, block, meta, stages). view is the page to go on with, the very
+    tensor that came in when the page was left as it is. block is the record of what
+    was done, in plain values for the JSON next to a mask: the view is built again
+    from it alone, see check_paper_block(). meta is everything the decision was made
+    on. stages is what paper_chain() measured on a page that was left as it is, for
+    run() to use, and None for a page that was changed.
+    """
+    width, height = int(image.shape[2]), int(image.shape[1])
+    kept = {}
+    if image.shape[0] != 3:
+        # The paper search reads colour. A page of another number of channels only
+        # goes through the chain, which raises on what the stages cannot read.
+        info, kept["stages"] = paper_chain(image)
+        meta = {
+            "decision": "pass_chain" if info["ok"] else "failed",
+            "reason": "" if info["ok"] else f"page has {image.shape[0]} channels",
+            "size": f"{width}x{height}",
+            "chain": info,
+        }
+        pixels = None
+    else:
+        rgb = np.ascontiguousarray(image.permute(1, 2, 0).numpy())
+
+        def chain(_):
+            # On the tensor run() goes on with, not on the copy of its pixels, so that
+            # what the stages return here is what they would return there.
+            info, kept["stages"] = paper_chain(image)
+            return info
+
+        pixels, meta = paper_normalisation.normalise_page(
+            rgb, chain, paper_frame_periods
+        )
+    view = image if pixels is None else torch.from_numpy(pixels).permute(2, 0, 1)
+
+    block = {
+        "version": paper_normalisation.VERSION,
+        # A warp is only the same pixels under the same libraries.
+        "libraries": f"numpy {np.__version__} cv2 {cv2.__version__}",
+        "decision": meta["decision"],
+        "reason": meta["reason"],
+        "input_size": [width, height],
+        "input_sha1": page_sha1(image),
+        "output_size": [int(view.shape[2]), int(view.shape[1])],
+    }
+    block["view_sha1"] = block["input_sha1"] if pixels is None else page_sha1(view)
+    if meta["decision"] == "normalised":
+        block["pre_size"] = [int(side) for side in meta["pre_size"]]
+        block["warp"] = np.asarray(meta["warp"], float).tolist()
+        block["homography"] = np.asarray(meta["homography"], float).tolist()
+        block["orientation"] = int(meta["orientation"])
+    elif meta["decision"] == "scaled":
+        block["resize"] = [int(side) for side in meta["resize"]]
+        block["scaled_from"] = meta["scaled_from"]
+        block["scale_factor"] = float(meta["scale_factor"])
+    return view, block, meta, kept["stages"] if pixels is None else None
+
+
+def check_paper_block(block, image, record, flag):
+    """The page a saved mask was predicted on, from the record next to the mask.
+
+    block is the paper normalisation record of the mask, image the page of this run
+    and flag its --paper_normalisation. A normalised page has the size of every other
+    one, so the size check of the mask cannot tell a mask of that view from a mask of
+    another: the digests of the record can. The page is never decided again. Either
+    it already is the view the mask was predicted on, with either flag, or, with
+    "auto", it is the page that view was made from and the view is built again from
+    the numbers of the record, pixel for pixel. Everything else is a ValueError that
+    names the record and says how to go on, before any stage has run: a mask laid
+    over another page gives signals that look like signals.
+    Returns (view, how), how is "view" for a page that already was the view, which
+    then is the very tensor that came in, and "replayed" for one built again.
+    """
+
+    def refusal(what):
+        # Every refusal names the record and ends on the two ways out of it.
+        return ValueError(
+            f"Mask of record {record} {what} Give the page the mask was predicted "
+            f"on, or remove the paper_normalisation key from the mask's JSON to "
+            f"take the page as given."
+        )
+
+    known = ", ".join(repr(v) for v in paper_normalisation.REPLAYABLE)
+    if not isinstance(block, dict):
+        raise refusal(
+            "has a paper normalisation record that is not an object; "
+            "the mask does not fit."
+        )
+    if "version" not in block:
+        raise refusal(
+            f"has a paper normalisation record without a version, this code reads "
+            f"{known}; the mask does not fit."
+        )
+    version = block["version"]
+    if version not in paper_normalisation.REPLAYABLE:
+        raise refusal(
+            f"has a paper normalisation record of version {version!r}, this code "
+            f"reads {known}; the mask does not fit."
+        )
+    decision = block.get("decision")
+    if not isinstance(decision, str) or decision not in PAPER_BLOCK_KEYS:
+        raise refusal(
+            f"has a paper normalisation record with the decision {decision!r}, "
+            f"known are {', '.join(PAPER_BLOCK_KEYS)}; the mask does not fit."
+        )
+    needed = ("input_size", "output_size", "input_sha1", "view_sha1")
+    missing = [key for key in needed + PAPER_BLOCK_KEYS[decision] if key not in block]
+    if missing:
+        raise refusal(
+            f"has a paper normalisation record of a {decision} page without "
+            f"{', '.join(missing)}; the mask does not fit."
+        )
+
+    size = [int(image.shape[2]), int(image.shape[1])]
+    digest = page_sha1(image)
+    if size == block["output_size"] and digest == block["view_sha1"]:
+        return image, "view"
+
+    # A page of the size of the one a normalised or a scaled view was made from.
+    input_sized = decision in ("normalised", "scaled") and size == block["input_size"]
+    if flag == "auto" and input_sized:
+        if digest != block["input_sha1"]:
+            raise refusal(
+                f"was predicted on the {decision} view of a page with SHA-1 "
+                f"{block['input_sha1']}, the page of this size given now has SHA-1 "
+                f"{digest}: another input page; the mask does not fit."
+            )
+        try:
+            rgb = np.ascontiguousarray(image.permute(1, 2, 0).numpy())
+            pixels = paper_normalisation.replay_page(rgb, block)
+            view = torch.from_numpy(pixels).permute(2, 0, 1)
+            replayed = [int(view.shape[2]), int(view.shape[1])]
+            replayed_digest = page_sha1(view)
+        except Exception as error:
+            # Numbers no view is built from, as in a record that was written or
+            # changed by hand: whatever numpy, cv2 or torch say to them.
+            raise refusal(
+                f"has the paper normalisation record of a {decision} page: the "
+                f"record cannot be replayed ({type(error).__name__}: "
+                f"{' '.join(str(error).split())}); the mask does not fit."
+            ) from error
+        # What differs comes first. The libraries are told as well, because a warp
+        # is only the same pixels under the same ones.
+        libraries = (
+            f"(libraries then: {block.get('libraries', 'not recorded')}, now: "
+            f"numpy {np.__version__} cv2 {cv2.__version__})"
+        )
+        if replayed != block["output_size"]:
+            raise refusal(
+                f"was predicted on a {decision} view of {block['output_size']} px "
+                f"(width, height), the view built again from its record is "
+                f"{replayed} px: another size {libraries}; the mask does not fit."
+            )
+        if replayed_digest != block["view_sha1"]:
+            raise refusal(
+                f"was predicted on a {decision} view of {replayed} px (width, "
+                f"height) with SHA-1 {block['view_sha1']}, the view built again "
+                f"from its record has that size and SHA-1 {replayed_digest}: other "
+                f"pixels {libraries}; the mask does not fit."
+            )
+        return view, "replayed"
+
+    if (
+        block["input_size"] == block["output_size"]
+        and block["input_sha1"] == block["view_sha1"]
+    ):
+        # The view is the page it was made from, as for every page that was left
+        # as it is: one size and one digest, said once.
+        predicted = (
+            f"a {decision} page of {block['output_size']} px (width, height) with "
+            f"SHA-1 {block['view_sha1']}"
+        )
+        remedy = "the mask was predicted on another page"
+    else:
+        predicted = (
+            f"a {decision} view of {block['output_size']} px (width, height) with "
+            f"SHA-1 {block['view_sha1']}, made from a page of "
+            f"{block['input_size']} px with SHA-1 {block['input_sha1']}"
+        )
+        if input_sized and digest == block["input_sha1"]:
+            # Only without the flag: with it this page has been replayed above.
+            remedy = "pass --paper_normalisation auto to replay the mask's record"
+        elif input_sized and size != block["output_size"]:
+            remedy = "the mask was predicted on the view of another input page"
+        else:
+            remedy = "the mask was predicted on another view"
+    raise refusal(
+        f"was predicted on {predicted}; the page given now is {size} px with SHA-1 "
+        f"{digest}; the mask does not fit: {remedy}."
+    )
+
+
 def baseline_row(ratio, image_height, scale=1.0):
     """Row of the zero line of one lead, for a page rescaled about its centre."""
     centre = image_height / 2
@@ -2817,7 +3135,7 @@ def write_record(record, signals, sig_names, output_folder, placement):
 
 
 def save_mask_files(
-    mask, record, output_folder, rot_angle, homography=None, scale=1.0
+    mask, record, output_folder, rot_angle, homography=None, scale=1.0, paper=None
 ):
     """Save the predicted mask as PNG plus a small JSON with the frame info.
 
@@ -2825,6 +3143,9 @@ def save_mask_files(
     only when the page was warped: a file without one means the rotation alone.
     scale is what --resolution resampled the page by before all of that, written out
     only when it did: a file without one means the page at the size it came in.
+    paper is the record of the paper normalisation, which comes before both and says
+    which page all of that was done to, written out only when there is one: a file
+    without one means the page as it was given.
     """
     mask_to_save = mask.to(torch.uint8)
     write_png(mask_to_save, os.path.join(output_folder, f"{record}_mask.png"))
@@ -2838,6 +3159,8 @@ def save_mask_files(
     # NaN is the stage being off, 1.0 the page having been left at its own scale.
     if np.isfinite(scale) and scale != 1.0:
         meta["scale"] = float(scale)
+    if paper is not None:
+        meta["paper_normalisation"] = paper
     with open(os.path.join(output_folder, f"{record}_mask.json"), "w") as f:
         json.dump(meta, f)
 
@@ -2858,6 +3181,7 @@ def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
         "goldberger_ratio",
         "goldberger_n",
         "max_offset_deviation",
+        "paper_normalisation",
         "baseline_scale",
         "baseline_shift_px",
         "baseline_disagreement_px",
@@ -2964,10 +3288,73 @@ def run(args):
         image = read_image(image_file_path)
         image = image[:3]
 
+        # Normalise the paper
+        paper_block, paper_qc, stages = None, "off", None
+        if args.mask_folder is not None:
+            # A mask only fits the page it was predicted on, and which page that was
+            # stands in the record next to it: with a record the page is checked
+            # against it, or built again from it, and never decided anew. A mask
+            # without one, as every mask saved without the normalisation, is taken
+            # to fit the page as it is given.
+            meta_path = os.path.join(args.mask_folder, f"{record}_mask.json")
+            mask_meta = {}
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    mask_meta = json.load(f)
+            # A JSON that holds no object has no record. It is left to the check of
+            # the frame of the mask below, which is where it always failed.
+            if isinstance(mask_meta, dict) and "paper_normalisation" in mask_meta:
+                paper_block = mask_meta["paper_normalisation"]
+                image, how = check_paper_block(
+                    paper_block, image, record, args.paper_normalisation
+                )
+                paper_qc = paper_block["decision"]
+                if args.verbose:
+                    how = "replayed" if how == "replayed" else "page is the view"
+                    print(
+                        f"Paper normalisation for record {record}: {paper_qc} from "
+                        f"the mask's record ({how})"
+                    )
+            elif args.paper_normalisation == "auto":
+                paper_qc = "as given"
+                if args.verbose:
+                    print(
+                        f"Paper normalisation for record {record}: mask without a "
+                        f"record, page used as given"
+                    )
+        elif args.paper_normalisation == "auto":
+            image, paper_block, _, stages = normalise_paper(image)
+            paper_qc = paper_block["decision"]
+            if paper_qc == "failed":
+                print(
+                    f"WARNING: paper normalisation not applied to record {record} "
+                    f"({paper_block['reason']}), page kept."
+                )
+            elif paper_qc == "scaled":
+                print(
+                    f"WARNING: paper normalisation not applied to record {record} "
+                    f"({paper_block['reason']}), page rescaled only."
+                )
+            if args.verbose:
+                reason = f" ({paper_block['reason']})" if paper_block["reason"] else ""
+                print(f"Paper normalisation for record {record}: {paper_qc}{reason}")
+        # A page the paper stage decided now and left as it is has been through the
+        # three stages below already, each with the grid lines. What they returned
+        # there is taken here instead of measuring the same page a second time, up to
+        # the first stage whose flag asks for something else: that one and all after
+        # it run as they always do, and so does every stage of a page that was
+        # changed or that comes with a mask.
+        reuse_resolution = stages is not None and args.resolution == "lines"
+        reuse_rotation = reuse_resolution and args.rotation == "lines"
+        reuse_perspective = reuse_rotation and args.perspective == "lines"
+
         # Rescale
         resolution_info = {"period": float("nan"), "scale": float("nan")}
         if args.resolution == "lines":
-            image, resolution_info = normalise_resolution(image)
+            if reuse_resolution:
+                image, resolution_info = stages["image"], stages["resolution_info"]
+            else:
+                image, resolution_info = normalise_resolution(image)
             if resolution_info["reason"]:
                 print(
                     f"WARNING: grid lines not used for the resolution of "
@@ -2984,7 +3371,10 @@ def run(args):
                 )
 
         # Rotate
-        rot_angle, rotation_info = estimate_rotation(image, args.rotation)
+        if reuse_rotation:
+            rot_angle, rotation_info = stages["rot_angle"], stages["rotation_info"]
+        else:
+            rot_angle, rotation_info = estimate_rotation(image, args.rotation)
         if args.rotation == "lines":
             if rotation_info["reason"]:
                 print(
@@ -3009,7 +3399,12 @@ def run(args):
         # Both interpolations put the page in the same frame, only the resampling
         # differs; a straight page keeps its pixels and is never warped.
         if args.interpolation == "bicubic" and rot_angle != 0.0:
-            image_rotated = warp_page(image, rotation)
+            if reuse_rotation:
+                # The page the paper stage measured the perspective on is this warp,
+                # of the same page by the same angle, whatever --perspective says.
+                image_rotated = stages["measured"]
+            else:
+                image_rotated = warp_page(image, rotation)
         else:
             image_rotated = rotate(image, rot_angle)
 
@@ -3025,9 +3420,13 @@ def run(args):
                 measured = image
             elif args.interpolation == "bicubic":
                 measured = image_rotated
-            else:
+            elif not reuse_perspective:
                 measured = warp_page(image, rotation)
-            H_rect, perspective_info = estimate_perspective(measured)
+            if reuse_perspective:
+                # Measured by the paper stage already, on the page in that frame.
+                H_rect, perspective_info = stages["H_rect"], stages["perspective_info"]
+            else:
+                H_rect, perspective_info = estimate_perspective(measured)
             if perspective_info["reason"]:
                 print(
                     f"WARNING: grid lines not used for the perspective of record "
@@ -3056,14 +3455,25 @@ def run(args):
                     f"No mask found for record {record} at {mask_path}."
                 )
             mask_to_use = read_image(mask_path)
-            # A mask of another size cannot be laid over this page at all, and the
-            # only thing that changes the size of a page is the resolution stage.
+            # A mask of another size cannot be laid over this page at all. The size
+            # of a page is changed by the resolution stage and by the paper
+            # normalisation, and a mask with a record of the second has been checked
+            # against its page above. One without a record may still be the mask of
+            # a view that was built outside of this run, which then is the page to
+            # give: with the flag that asks for the normalisation, the message says
+            # that the page was not normalised.
             if mask_to_use.shape[1:] != image_rotated.shape[1:]:
+                as_given = ""
+                if paper_qc == "as given":
+                    as_given = (
+                        " The mask has no paper normalisation record, so the page "
+                        "was used as given."
+                    )
                 raise ValueError(
                     f"Mask of record {record} is {mask_to_use.shape[2]} x "
                     f"{mask_to_use.shape[1]} px, the page is "
                     f"{image_rotated.shape[2]} x {image_rotated.shape[1]} px; "
-                    f"the mask was predicted for another --resolution."
+                    f"the mask was predicted for another --resolution.{as_given}"
                 )
         else:
             mask_to_use = predict_mask_nnunet(
@@ -3075,6 +3485,9 @@ def run(args):
                 fold=args.fold,
             )
         if args.save_mask:
+            # The record goes along only when there is one: without it this is the
+            # call it always was.
+            paper_record = {} if paper_block is None else {"paper": paper_block}
             save_mask_files(
                 mask_to_use,
                 record,
@@ -3082,6 +3495,7 @@ def run(args):
                 rot_angle,
                 homography,
                 resolution_info["scale"],
+                **paper_record,
             )
 
         # Use mask to cut into single, binary masks
@@ -3351,6 +3765,7 @@ def run(args):
             if np.isfinite(offset["raw"])
         ]
         max_offset_deviation = max(deviations) if deviations else np.nan
+        qc["paper_normalisation"] = paper_qc
         qc["baseline_scale"] = baseline_scale
         qc["baseline_shift_px"] = baseline_shift
         qc["baseline_disagreement_px"] = baseline_disagreement
