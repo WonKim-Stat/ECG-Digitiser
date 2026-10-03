@@ -3111,6 +3111,20 @@ def einthoven_warning(qc, record, threshold=EINTHOVEN_RATIO_WARNING):
     return None
 
 
+def rescale_warning(record, lowest, highest):
+    """WARNING line of a page whose output is rescaled before it is written.
+
+    lowest and highest are the smallest and the largest sample of the assembled signals
+    in mV. run() rescales an output with a sample beyond 10 mV on either side to -1..1
+    over all its leads, so what it writes for such a page is not in millivolts.
+    """
+    return (
+        f"WARNING: output rescaled for record {record} "
+        f"(range {lowest:.3f} to {highest:.3f} mV, outside +-10 mV): the written "
+        f"signals are rescaled to -1..1 and are not in millivolts, check this page."
+    )
+
+
 def write_record(record, signals, sig_names, output_folder, placement):
     """Write the signals to a WFDB record."""
     kwargs = dict(
@@ -3812,6 +3826,7 @@ def run(args):
             print(f"Signal out of range for record {record}, normalizing to range between 1 and -1")
             max_val = np.nanmax(signals)
             min_val = np.nanmin(signals)
+            print(rescale_warning(record, min_val, max_val))
             signals = (signals - min_val) / (max_val - min_val) * 2 - 1
         write_record(
             record, signals, sig_names, args.output_folder, args.lead_placement

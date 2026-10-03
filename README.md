@@ -439,8 +439,9 @@ a lead mask has a gap inside its column, which is interpolated linearly. A page 
 column pitch does not match the pitch of the page height prints a line as well and uses
 the fitted one.
 
-One more `WARNING` line comes without a fallback, the Einthoven check. Every page with
-signals prints a `QC <record>: Einthoven RMS …` line with its lead consistency values.
+Two more `WARNING` lines come without a fallback. The first is the Einthoven check.
+Every page with signals prints a `QC <record>: Einthoven RMS …` line with its lead
+consistency values.
 Right after it, a page whose `einthoven_ratio` (the RMS of I + III − II over the mean RMS
 of the three leads, on the samples where all three are read) is 0.1797 or more prints
 `WARNING: Einthoven check failed for record <record> (ratio <ratio> >= 0.1797): leads I, II and III disagree, check this page.`
@@ -474,6 +475,22 @@ of them below 12 dB, and 98 of 2,000 synthetic pages of 500 PTB-XL records (read
 the column mapping), 5 of the 6 below 12 dB among them. The Goldberger ratio
 (aVR + aVL + aVF) is not used: at the same sensitivity it flags 106 instead of 57 of the
 clean scans at or above 12 dB.
+
+The second is the rescale of an output out of range. An output with a sample beyond
+±10 mV is, as it always was, rescaled to −1..1 over all its leads before it is written,
+and right after the line that says so,
+`Signal out of range for record <record>, normalizing to range between 1 and -1`, the
+page prints
+`WARNING: output rescaled for record <record> (range <lowest> to <highest> mV, outside +-10 mV): the written signals are rescaled to -1..1 and are not in millivolts, check this page.`
+with the smallest and the largest sample of its signals, to three decimals (a sample
+less than 0.0005 mV beyond the limit reads as the limit). The line changes neither the
+signals nor `qc.csv`, which has no column for it. Such a page is always one to check,
+whatever the Einthoven check, which reads the signals before the rescale, says of it. On
+the development set, read as for the numbers above (the photographs after the same paper
+normalisation), the output of 60 pages was rescaled: 13 of the 230 mould-damaged scans
+and 47 of the 345 photographs, none of the 345 rendered pages and clean scans. The
+Einthoven check flags 57 of the 60, and the other three are the only photographs it does
+not flag.
 
 
 #### Results on synthetic pages
