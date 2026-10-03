@@ -309,10 +309,10 @@ def get_parser():
         "--paper_normalisation",
         type=str,
         choices=["off", "auto"],
-        default="off",
+        default="auto",
         help=(
-            "auto = before everything else, put a photographed page into the frame "
-            "the model was trained on: a page whose printed grid lines the "
+            "auto (default) = before everything else, put a photographed page into "
+            "the frame the model was trained on: a page whose printed grid lines the "
             "resolution, the rotation and the perspective stage all read is left as "
             "it is, and so is one whose grid fills the image; otherwise the four "
             "edges of the paper are looked for and the sheet is warped onto a US "
@@ -320,8 +320,10 @@ def get_parser():
             "lower part; a page whose paper cannot be found is kept, with a warning, "
             "or only shrunk to 200 dpi of paper when its grid says it is much larger. "
             "What was done to a page is written next to its mask by --save_mask, and "
-            "--mask_folder replays it from there instead of deciding again. "
-            "off = take the page as it is."
+            "--mask_folder replays it from there instead of deciding again; a mask "
+            "without that record is laid over the page as it is given. "
+            "off = take the page as it is, the behaviour before auto became the "
+            "default; the record of a saved mask is still checked."
         ),
     )
     parser.add_argument(
@@ -2092,7 +2094,7 @@ def check_paper_block(block, image, record, flag):
             f"{block['input_size']} px with SHA-1 {block['input_sha1']}"
         )
         if input_sized and digest == block["input_sha1"]:
-            # Only without the flag: with it this page has been replayed above.
+            # Only with the flag off: under auto this page has been replayed above.
             remedy = "pass --paper_normalisation auto to replay the mask's record"
         elif input_sized and size != block["output_size"]:
             remedy = "the mask was predicted on the view of another input page"

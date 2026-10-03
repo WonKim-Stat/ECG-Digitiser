@@ -253,17 +253,18 @@ where
 
 #### Pipeline stages
 
-Under the defaults, every page goes through stages 2 to 10 below before its signals are
-written (`run()` in `src/run/digitize.py`); stage 1 is opt-in. Every stage that reads
-the printed 1 mm grid lines falls back to the behaviour without them if the page shows
-none.
+Under the defaults, every page goes through stages 1 to 10 below before its signals are
+written (`run()` in `src/run/digitize.py`). Every stage that reads the printed 1 mm grid
+lines falls back to the behaviour without them if the page shows none.
 
-1. **Paper normalisation (only with `--paper_normalisation auto`, off by default):** a
-   photographed page is put into the frame the model was trained on. A page whose grid
-   lines stages 2 to 4 read as it is, or whose printed grid fills the image, is left
-   alone; otherwise the four edges of the sheet are looked for and the sheet is warped
-   onto a US Letter landscape page at 200 dpi (`src/run/paper_normalisation.py`). A page
-   whose paper is not found is kept, with a `WARNING`.
+1. **Paper normalisation:** a photographed page is put into the frame the model was
+   trained on. A page whose grid lines stages 2 to 4 read as it is, or whose printed
+   grid fills the image, is left alone; otherwise the four edges of the sheet are looked
+   for and the sheet is warped onto a US Letter landscape page at 200 dpi
+   (`src/run/paper_normalisation.py`). A page whose paper is not found is kept, with a
+   `WARNING`. A page read with a saved mask is not decided again: the record next to
+   the mask says what was done to it, and a mask without one is laid over the page as it
+   is given. `--paper_normalisation off` leaves out the stage.
 2. **Resolution:** the period of the printed grid lines is measured and the page is
    resampled to the period of a 200 dpi page, the scale the model was trained on.
 3. **Rotation:** a 0.1° Hough transform, refined with the phase drift of the grid lines
@@ -295,7 +296,7 @@ none.
 
 | Flag | Choices | Default | What it does |
 | --- | --- | --- | --- |
-| `--paper_normalisation` | `off`, `auto` | `off` | `auto` puts a photographed page into the frame the model was trained on, before every other stage and on the signals of the image alone. A page whose printed grid lines the resolution, the rotation and the perspective stage all read as it is is left as it is (`pass_chain`), and so is one without a background to find a paper edge in: the image reaches at most 8 mm beyond a Letter sheet, or no paper edge is found and the grid is within 12 mm of the border on all four sides, or the paper found covers 95 % of the image (`pass_fullframe`). Otherwise the four edges of the sheet are looked for (the region of the red grid, then in 24 bands per side the step from the print or its white margin to the background, then each side again at full resolution) and the sheet is warped in one bicubic pass onto a US Letter landscape page at 200 dpi (2200 × 1700 px), long side horizontal, in the orientation that puts the trace ink in the lower part, and scaled so that the 1 mm grid has the period it has on a scanned printout, 0.954 × 200 dpi (`normalised`). A page whose paper is not found, runs off the image or gives an implausible sheet or grid is kept, with a `WARNING` (`failed`); such a page, or a `pass_fullframe` one, whose grid the resolution stage could not read while the extent of its grid says it is more than 12 % above 200 dpi of paper is shrunk to that and not rectified, with a `WARNING` as well (`scaled`). The curl of a sheet is not taken out, and the print gets the scale of the frame, not its position. A page without a readable grid is not told from a photograph by its content, as in the view builder: a blank page is `pass_fullframe`, and a large image without a grid, blank or with content that looks like a sheet at the scale of a photograph (4000 × 3000 px, say), is taken to show a whole Letter sheet and shrunk to 200 dpi of it (`scaled`). The stage is the image code of the view builder that made the photograph results of the quality control section, function for function, with the thresholds chosen there on the 345 development photographs of the ECG-Image-Database (115 records, three photo conditions; references below the table). With that builder, outside this repository, 301 of those pages were normalised, 22 scaled, 12 passed and 10 failed; scored per lead against PTB-XL, the median lead SNR of the three conditions rose from −6.20, −3.63 and −4.53 dB to −1.87, −1.10 and −0.52 dB (paired median, pooled over the three, +3.71 dB, 95 % CI 2.87 to 4.41; +3.55 dB with the time axis left uniform, so from the normalisation alone), a PTB-XL diagnostic classifier changed 26.3, 32.7 and 30.6 % instead of 47.5, 51.3 and 40.2 % of its record and class decisions against the digital signal, and the 903 rendered pages, scans and synthetic pages it was checked on were all left as they are. So photographs are read better, not well: most of what is left is the time axis of a sheet that does not lie flat. These numbers were not measured again with the flag itself. On a page that is left as it is, with `--resolution`, `--rotation` and `--perspective` at `lines`, the three stages are measured once and used twice, and the stage costs about 0.1 s (the digests of the page); with one of them set otherwise the stages are measured a second time, 1 to 4 s per page on generator pages, and a synthetic 12-megapixel photograph takes 5 to 8 s. What was done to a page is recorded next to its mask, see below the table. `off` takes the page as it is. |
+| `--paper_normalisation` | `off`, `auto` | `auto` | `auto` puts a photographed page into the frame the model was trained on, before every other stage and on the signals of the image alone. A page whose printed grid lines the resolution, the rotation and the perspective stage all read as it is is left as it is (`pass_chain`), and so is one without a background to find a paper edge in: the image reaches at most 8 mm beyond a Letter sheet, or no paper edge is found and the grid is within 12 mm of the border on all four sides, or the paper found covers 95 % of the image (`pass_fullframe`). Otherwise the four edges of the sheet are looked for (the region of the red grid, then in 24 bands per side the step from the print or its white margin to the background, then each side again at full resolution) and the sheet is warped in one bicubic pass onto a US Letter landscape page at 200 dpi (2200 × 1700 px), long side horizontal, in the orientation that puts the trace ink in the lower part, and scaled so that the 1 mm grid has the period it has on a scanned printout, 0.954 × 200 dpi (`normalised`). A page whose paper is not found, runs off the image or gives an implausible sheet or grid is kept, with a `WARNING` (`failed`); such a page, or a `pass_fullframe` one, whose grid the resolution stage could not read while the extent of its grid says it is more than 12 % above 200 dpi of paper is shrunk to that and not rectified, with a `WARNING` as well (`scaled`). The curl of a sheet is not taken out, and the print gets the scale of the frame, not its position. A page without a readable grid is not told from a photograph by its content, as in the view builder: a blank page is `pass_fullframe`, and a large image without a grid, blank or with content that looks like a sheet at the scale of a photograph (4000 × 3000 px, say), is taken to show a whole Letter sheet and shrunk to 200 dpi of it (`scaled`). The stage is the image code of the view builder that made the photograph results of the quality control section, function for function, with the thresholds chosen there on the 345 development photographs of the ECG-Image-Database (115 records, three photo conditions; references below the table). With that builder, outside this repository, 301 of those pages were normalised, 22 scaled, 12 passed and 10 failed; scored per lead against PTB-XL, the median lead SNR of the three conditions rose from −6.20, −3.63 and −4.53 dB to −1.87, −1.10 and −0.52 dB (paired median, pooled over the three, +3.71 dB, 95 % CI 2.87 to 4.41; +3.55 dB with the time axis left uniform, so from the normalisation alone), a PTB-XL diagnostic classifier changed 26.3, 32.7 and 30.6 % instead of 47.5, 51.3 and 40.2 % of its record and class decisions against the digital signal, and the 903 rendered pages, scans and synthetic pages it was checked on were all left as they are. So photographs are read better, not well: most of what is left is the time axis of a sheet that does not lie flat. The stage itself, run on those 345 pages with their saved masks, gives the same view, pixel for pixel, and the same signals, byte for byte, so these numbers are its numbers. With the flag itself, the 575 rendered and scanned development pages of that database and all 208 synthetic pages (every page of the results below included) were left as they are and keep byte identical signals. On a page that is left as it is, with `--resolution`, `--rotation` and `--perspective` at `lines`, the three stages are measured once and used twice, and the stage costs about 0.1 s (the digests of the page); with one of them set otherwise the stages are measured a second time, 1 to 4 s per page on generator pages, and a synthetic 12-megapixel photograph takes 5 to 8 s. What was done to a page is recorded next to its mask, see below the table. `off` takes the page as it is, the behaviour before `auto` became the default. |
 | `--resolution` | `keep`, `lines` | `lines` | `lines` resamples the page so that the printed 1 mm grid lines have the period of a 200 dpi page, the scale the model was trained on. A page within about a tenth of that scale keeps its pixels, because resampling it costs more than the scale does. |
 | `--rotation` | `hough`, `lines` | `lines` | `lines` refines a 0.1° Hough angle with the phase drift of the grid lines, which resolves fractions of a degree. `hough` is the Hough transform of the page in whole degrees only. |
 | `--perspective` | `off`, `lines` | `lines` | `lines` takes the shear and the perspective that the grid lines show out of the rotated page, and leaves a page alone that is straight enough already. `off` keeps the rotated page. |
@@ -314,14 +315,15 @@ none.
 
 `--save_mask` writes the mask of a page as `<record>_mask.png` with a `<record>_mask.json`
 that says which frame the mask lives in, and `--mask_folder` reads both back instead of
-running the model. A page that `--paper_normalisation auto` decided gets one more key in
-that JSON, `paper_normalisation`: the version of the decision rules, the numpy and cv2
-versions, the decision and its reason, the size (width, height) and the SHA-1 of the
-pixels of the page as it came (`input_size`, `input_sha1`) and of the page the model saw
-(`output_size`, `view_sha1`), and the numbers that build the second from the first, the
-size the page is shrunk to first and the 3 × 3 warp matrix of a `normalised` page
-(`pre_size`, `warp`, with `homography` and `orientation` for the record) or the size of
-a `scaled` one (`resize`, with `scaled_from` and `scale_factor`). A mask only fits the
+running the model. A page that `--paper_normalisation auto`, the default, decided gets
+one more key in that JSON, `paper_normalisation`: the version of the decision rules, the
+numpy and cv2 versions, the decision and its reason, the size (width, height) and the
+SHA-1 of the pixels of the page as it came (`input_size`, `input_sha1`) and of the page
+the model saw (`output_size`, `view_sha1`), and the numbers that build the second from
+the first, the size the page is shrunk to first and the 3 × 3 warp matrix of a
+`normalised` page (`pre_size`, `warp`, with `homography` and `orientation` for the
+record) or the size of a `scaled` one (`resize`, with `scaled_from` and
+`scale_factor`). A mask only fits the
 page it was predicted on, and a normalised page has the size of every other page, so
 with `--mask_folder` a page whose mask has this record is never decided again, whatever
 the flag says, but checked against it before any stage runs:
@@ -332,21 +334,23 @@ the flag says, but checked against it before any stage runs:
   and the result must have the recorded size and SHA-1;
 - everything else stops the run with a `ValueError` that names the record and says
   `the mask does not fit`: another page, another view, a record of an unknown version or
-  decision, or the input page given without `--paper_normalisation auto`. `-f` does not
+  decision, or the input page given with `--paper_normalisation off`. `-f` does not
   cover it, as it only skips a page without signals.
 
 The JSON of a mask is read for this record before any stage runs, with either flag, so a
 `<record>_mask.json` that cannot be parsed now stops the run there, with the error of the
 JSON parser.
 
-A mask without the record, which is every mask saved without the flag, has no such pixel
-check: its page is used as given, with `as given` in `qc.csv` under
-`--paper_normalisation auto`, and only the size of the mask and the frame warnings of
-the rotation and the perspective stand between it and another page. A mask that is
-refused can still be used: give the run the page it was predicted on, which is the
-recorded view itself or, with `--paper_normalisation auto`, the input page the view is
-rebuilt from; or, to take a page as given without the check, remove the
-`paper_normalisation` key from the JSON of the mask. The message of every refusal ends
+A mask without the record, which is every mask saved with `--paper_normalisation off`,
+by a version without the stage, or again from such a mask, has no such pixel check: its page is used as given,
+with `as given` in `qc.csv` under the default `--paper_normalisation auto` and `off`
+under `--paper_normalisation off`, and only the size of the mask and the frame warnings
+of the rotation and the perspective stand between it and another page. So a folder of
+such masks is read to the same signals with either flag. A mask that is refused can
+still be used: give the run the page it was predicted on, which is the recorded view
+itself or, with `--paper_normalisation auto`, the input page the view is rebuilt from;
+or, to take a page as given without the check, remove the `paper_normalisation` key
+from the JSON of the mask. The message of every refusal ends
 on these two ways out: `Give the page the mask was predicted on, or remove the
 paper_normalisation key from the mask's JSON to take the page as given.` A mask without
 the record that has another size than its page stops the run as it always did
@@ -386,14 +390,15 @@ columns:
   leads in the sum, and the number of samples it was computed over.
 - **Lead placement:** `max_offset_deviation`, the largest distance in seconds between a
   measured lead offset and the standard one it was snapped to.
-- **Paper normalisation:** `paper_normalisation`, `off` without
-  `--paper_normalisation auto`; with it the decision for the page, `pass_chain`,
+- **Paper normalisation:** `paper_normalisation`, under the default
+  `--paper_normalisation auto` the decision for the page, `pass_chain`,
   `pass_fullframe`, `normalised`, `scaled` or `failed`, or `as given` for a page read
-  with a mask from `--mask_folder` that has no record of one. A mask with such a record
-  gives its decision with either flag. The column is the 13th, right after
-  `max_offset_deviation`, and rows are appended to a `qc.csv` that is already there
-  under the header it has: do not append to a `qc.csv` written by an older version,
-  which lacks the column, but use a fresh output folder.
+  with a mask from `--mask_folder` that has no record of one; `off` with
+  `--paper_normalisation off`. A mask with such a record gives its decision with either
+  flag. The column is the 13th, right after `max_offset_deviation`, and rows are
+  appended to a `qc.csv` that is already there under the header it has: do not append
+  to a `qc.csv` written by an older version, which lacks the column, but use a fresh
+  output folder.
 - **Resolution:** `grid_period_px`, the measured grid line period, and
   `resolution_scale`, the factor the page was resampled by (1 if it was left alone).
 - **Rotation:** `rotation_angle`, the angle the page was turned by, `rotation_coarse`,
@@ -482,7 +487,9 @@ the leads of a condition. `--sharpen none` gives the signals of the pipeline bef
 sharpening byte for byte, with medians 0.9 (scale080) to 2.5 dB (gridblue) lower.
 `--column_mapping uniform` gives the same signals as the defaults byte for byte: the
 map moves no sample of these pages by a pixel or, on augmented pages and pages with a
-faint grid whose lines it cannot read, is not trusted.
+faint grid whose lines it cannot read, is not trusted. So does `--paper_normalisation
+off`: the saved masks have no record of the paper normalisation, so their pages are
+used as given.
 
 | Condition | Pages | Description | Median SNR (dB) |
 | --- | --- | --- | --- |

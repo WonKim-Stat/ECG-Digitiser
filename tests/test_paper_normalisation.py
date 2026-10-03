@@ -385,7 +385,7 @@ def _same_columns(folder):
 
     A text column has to be the same text, a number the same to nine digits: the
     perspective stage does not repeat its last ones from one call on a page to the
-    next (seen once, at 5e-12 of the shift and without the flag), so two runs are
+    next (seen once, at 5e-12 of the shift and with the flag off), so two runs are
     compared as numbers and not as the text of the file.
     """
     return pytest.approx(_other_columns(folder), rel=1e-9, abs=1e-12, nan_ok=True)
@@ -552,16 +552,66 @@ def shrunk(tmp_path_factory):
 
 
 # ------------------------------------------------------- the flag and the constants
-def test_the_flag_is_off_unless_auto_is_asked_for(capsys):
+def test_the_flag_is_auto_unless_off_is_asked_for(capsys):
     parse = digitize.get_parser().parse_args
     folders = ["-d", "in", "-o", "out"]
-    assert parse(folders).paper_normalisation == "off"
+    assert parse(folders).paper_normalisation == "auto"
     for value in ("off", "auto"):
         args = parse(folders + ["--paper_normalisation", value])
         assert args.paper_normalisation == value
     with pytest.raises(SystemExit):
         parse(folders + ["--paper_normalisation", "on"])
     assert "--paper_normalisation: invalid choice: 'on'" in capsys.readouterr().err
+
+
+def test_a_run_that_does_not_name_the_flag_decides_the_page_as_auto(tmp_path):
+    # auto is the default: the page is decided, and the run is the run with auto.
+    data = _folder(tmp_path / "data", rec=_tensor(_page(SMALL, traces=False)))
+    flags = ("--time_mapping", "bbox", "--save_mask")
+    default = _run(data, tmp_path / "default", *flags, label=_flat_label())
+    auto = _run(
+        data, tmp_path / "auto", "--paper_normalisation", "auto", *flags,
+        label=_flat_label(),
+    )
+    assert len(default.decided) == len(auto.decided) == 1
+    _, (_, block, _, _) = default.decided[0]
+    assert (block["decision"], block["reason"]) == ("pass_chain", "")
+    assert _qc(default.out)["paper_normalisation"] == "pass_chain"
+    assert default.log.count("Paper normalisation for record rec: pass_chain\n") == 1
+    assert _mask_meta(default.out)["paper_normalisation"] == block
+    assert _mask_json(default.out) == _mask_json(auto.out)
+    assert default.calls == auto.calls == ONCE
+    assert default.asked == auto.asked
+    for name in ("rec.dat", "rec.hea"):
+        assert _file(default.out, name) == _file(auto.out, name)
+    assert _other_columns(default.out) == _same_columns(auto.out)
+
+
+def test_a_mask_without_a_record_gives_under_the_default_the_signals_of_off(
+    tmp_path, monkeypatch
+):
+    # Every mask saved before the stage, so without a record: under the default its
+    # page is used as given, so a folder of such masks is read to the old signals.
+    for name in ("normalise_paper", "paper_chain", "check_paper_block"):
+        monkeypatch.setattr(digitize, name, _never(name))
+    data = _folder(tmp_path / "data", rec=_tensor(_page(SMALL, traces=False)))
+    _small_masks(tmp_path / "masks")
+    flags = ("--time_mapping", "bbox", "--mask_folder", str(tmp_path / "masks"))
+    off = _run(data, tmp_path / "off", "--paper_normalisation", "off", *flags)
+    default = _run(data, tmp_path / "default", *flags)
+    assert off.decided == default.decided == []
+    assert _qc(off.out)["paper_normalisation"] == "off"
+    assert _qc(default.out)["paper_normalisation"] == "as given"
+    line = (
+        "Paper normalisation for record rec: mask without a record, page used as "
+        "given\n"
+    )
+    assert default.log.count(line) == 1
+    assert _stage_lines(default.log) == off.log.splitlines()
+    assert default.calls == off.calls == ONCE
+    for name in ("rec.dat", "rec.hea"):
+        assert _file(default.out, name) == _file(off.out, name)
+    assert _other_columns(default.out) == _same_columns(off.out)
 
 
 def test_the_port_keeps_the_scales_of_the_digitiser():
@@ -584,13 +634,16 @@ def test_the_port_is_image_code_on_numpy_and_cv2_alone():
 
 
 # -------------------------------------------------------------------- the flag off
-def test_run_without_the_flag_never_looks_for_paper(tmp_path, monkeypatch):
+def test_run_with_the_flag_off_never_looks_for_paper(tmp_path, monkeypatch):
     for name in ("normalise_paper", "paper_chain", "check_paper_block"):
         monkeypatch.setattr(digitize, name, _never(name))
     data = _folder(tmp_path / "data", rec=_tensor(_page(SMALL, traces=False)))
     flags = ("--time_mapping", "bbox", *CHEAP)
-    # No flag at all is off, on a page the model is asked about ...
-    first = _run(data, tmp_path / "first", *flags, "--save_mask", label=_flat_label())
+    # off, on a page the model is asked about ...
+    first = _run(
+        data, tmp_path / "first", *flags, "--paper_normalisation", "off",
+        "--save_mask", label=_flat_label(),
+    )
     # ... and on one that brings its mask, which then has no record next to it.
     second = _run(
         data, tmp_path / "second", *flags, "--paper_normalisation", "off",
@@ -1038,7 +1091,10 @@ def test_a_blank_page_fills_the_frame_and_is_warned_about_once(tmp_path):
     blank = torch.full((3, SMALL[1], SMALL[0]), 255, dtype=torch.uint8)
     data = _folder(tmp_path / "data", rec=blank)
     flags = ("--time_mapping", "bbox", "--save_mask")
-    off = _run(data, tmp_path / "off", *flags, label=_flat_label())
+    off = _run(
+        data, tmp_path / "off", "--paper_normalisation", "off", *flags,
+        label=_flat_label(),
+    )
     auto = _run(
         data, tmp_path / "auto", "--paper_normalisation", "auto", *flags,
         label=_flat_label(),
@@ -1056,13 +1112,13 @@ def test_a_blank_page_fills_the_frame_and_is_warned_about_once(tmp_path):
     assert auto.log.count(line) == 1
     assert auto.log.count("aper normalisation") == 1
     # The record of a page that was left as it is stands next to its mask, after
-    # the frame of the mask, which is the JSON of the run without the flag.
+    # the frame of the mask, which is the JSON of the run with the flag off.
     saved = _mask_meta(auto.out)
     assert list(saved) == ["rot_angle", "height", "width", "paper_normalisation"]
     assert saved.pop("paper_normalisation") == block
     assert saved == _mask_meta(off.out)
 
-    # Every stage measured once and said so once, as without the flag.
+    # Every stage measured once and said so once, as with the flag off.
     for run in (off, auto):
         assert run.calls == ONCE
         for stage in ("resolution", "rotation", "perspective"):
@@ -1140,7 +1196,7 @@ def test_replay_page_builds_nothing_for_a_page_that_was_left_alone():
 
 
 # ------------------------------------------------------ a page that needs nothing
-def test_a_page_the_chain_reads_is_digitised_as_without_the_flag(tmp_path):
+def test_a_page_the_chain_reads_is_digitised_as_with_the_flag_off(tmp_path):
     page = _tensor(_page())
     data = _folder(tmp_path / "data", rec=page)
     flag = "--paper_normalisation"
@@ -1167,7 +1223,7 @@ def test_a_page_the_chain_reads_is_digitised_as_without_the_flag(tmp_path):
     assert _other_columns(auto.out) == _same_columns(off.out)
     assert auto.log.count("Paper normalisation for record rec: pass_chain\n") == 1
     assert _stage_lines(auto.log) == off.log.splitlines()
-    # The mask and its frame are the ones of the run without the flag, which writes
+    # The mask and its frame are the ones of the run with the flag off, which writes
     # no record, and the record of the page comes after them.
     assert _file(auto.out, "rec_mask.png") == _file(off.out, "rec_mask.png")
     saved = _mask_meta(auto.out)
@@ -1192,7 +1248,9 @@ def test_a_page_the_resolution_stage_resamples_goes_on_resampled(tmp_path):
         return _flat_label((image.shape[2], image.shape[1]))
 
     flags = ("--time_mapping", "bbox", "--save_mask")
-    off = _run(data, tmp_path / "off", *flags, label=label)
+    off = _run(
+        data, tmp_path / "off", "--paper_normalisation", "off", *flags, label=label
+    )
     auto = _run(
         data, tmp_path / "auto", "--paper_normalisation", "auto", *flags, label=label
     )
@@ -1223,11 +1281,14 @@ def test_a_page_the_resolution_stage_resamples_goes_on_resampled(tmp_path):
 
 
 def _tilted_runs(tmp_path, *flags):
-    """A small page tilted by 0.37 degrees, without the flag and with it."""
+    """A small page tilted by 0.37 degrees, with the flag off and with it auto."""
     page = _tensor(_tilted(_page(SMALL, traces=False), 0.37))
     data = _folder(tmp_path / "data", rec=page)
     flags = ("--time_mapping", "bbox", *flags)
-    off = _run(data, tmp_path / "off", *flags, label=_flat_label())
+    off = _run(
+        data, tmp_path / "off", "--paper_normalisation", "off", *flags,
+        label=_flat_label(),
+    )
     auto = _run(
         data, tmp_path / "auto", "--paper_normalisation", "auto", *flags,
         label=_flat_label(),
@@ -1501,7 +1562,7 @@ def test_a_photo_with_one_pixel_changed_is_refused_as_another_input_page(
     )
 
 
-def test_without_the_flag_the_photo_is_refused_with_the_way_out(
+def test_with_the_flag_off_the_photo_is_refused_with_the_way_out(
     tmp_path, monkeypatch, digitised
 ):
     # -f does not let it through either: the signals would look like signals.
@@ -1513,7 +1574,7 @@ def test_without_the_flag_the_photo_is_refused_with_the_way_out(
     )
 
 
-def test_without_the_flag_a_changed_photo_is_not_told_to_pass_the_flag(
+def test_with_the_flag_off_a_changed_photo_is_not_told_to_pass_the_flag(
     tmp_path, monkeypatch, photo, digitised
 ):
     # A page of the size of the photograph with other pixels: the flag would not
@@ -2035,7 +2096,10 @@ def test_a_grey_page_the_chain_reads_passes_and_is_never_searched(
     grey = torch.from_numpy(_page(SMALL, traces=False).min(axis=2))[None]
     data = _folder(tmp_path / "data", rec=grey)
     flags = ("--time_mapping", "bbox")
-    off = _run(data, tmp_path / "off", *flags, label=_flat_label())
+    off = _run(
+        data, tmp_path / "off", "--paper_normalisation", "off", *flags,
+        label=_flat_label(),
+    )
     auto = _run(
         data, tmp_path / "auto", "--paper_normalisation", "auto", *flags,
         label=_flat_label(),
