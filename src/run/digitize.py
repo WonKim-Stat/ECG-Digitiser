@@ -202,32 +202,33 @@ def get_parser():
         "--grid_rescue",
         type=str,
         choices=["off", "map"],
-        default="off",
+        default="map",
         help=(
             "Only for --time_mapping grid with --grid_origin lines and "
-            "--column_mapping lines. map = a page whose mask edges are off one uniform "
-            "column grid, or whose grid lines are off the origin of the masks, is "
-            "tried once more, with twice the edge tolerance or on the pitch of the "
-            "lines about the centre of the mask grid, and read on that grid only if "
-            "the column map then stands on it; a page whose map does not stand is "
-            "what it is without the flag, with the same warnings; off (default) = "
-            "such a page falls back to --time_mapping bbox or to the grid of the "
-            "masks."
+            "--column_mapping lines. map (default) = a page whose mask edges are off "
+            "one uniform column grid, or whose grid lines are off the origin of the "
+            "masks, is tried once more, with twice the edge tolerance or on the pitch "
+            "of the lines about the centre of the mask grid, and read on that grid "
+            "only if the column map then stands on it; a page whose map does not "
+            "stand is what it is with off, with the same warnings; off = such a page "
+            "falls back to --time_mapping bbox or to the grid of the masks, the "
+            "behaviour before map became the default."
         ),
     )
     parser.add_argument(
         "--row_mapping",
         type=str,
         choices=["off", "lines"],
-        default="off",
+        default="lines",
         help=(
             "Only on a page whose column map is in use (--column_mapping lines). "
-            "lines = one map per row of leads instead of one for the page: the grid "
-            "lines in the band of each of the four layout rows are measured against "
-            "the page map, and the leads of a row are read on the map of their own "
-            "row, since a printed and scanned sheet moves its rows against each "
-            "other by fractions of a pixel; a row whose lines do not carry a map of "
-            "its own keeps the page map; off (default) = every lead on the page map."
+            "lines (default) = one map per row of leads instead of one for the page: "
+            "the grid lines in the band of each of the four layout rows are measured "
+            "against the page map, and the leads of a row are read on the map of "
+            "their own row, since a printed and scanned sheet moves its rows against "
+            "each other by fractions of a pixel; a row whose lines do not carry a map "
+            "of its own keeps the page map; off = every lead on the page map, the "
+            "reading before lines became the default."
         ),
     )
     # ROW_MAPPING_MEDIAN_MM is defined below as well.
@@ -3093,11 +3094,11 @@ ROW_MAPPING_MIN_BAND_ROWS = 30
 # the pixels, where the page map takes one (COLUMN_MAPPING_MEDIAN_MM); the profile of a
 # row has about a sixth of the rows of the page under it. Chosen on the development
 # clean scans of the ECG-Image-Database (230 pages, --grid_rescue map and --row_mapping
-# lines against neither), where only these two widths were read: with 13.5 mm the
+# lines against both off), where only these two widths were read: with 13.5 mm the
 # paired median gain of a lead is +1.33 dB (patient bootstrap 95 % CI 1.20 to 1.53) and
 # 295 leads are more than 1 dB worse; with 27 mm it is +1.39 dB (1.21 to 1.58) and 250
 # leads, and a PTB-XL diagnostic classifier changes 32 instead of 34 of its 1,150
-# record and class decisions (44 with neither flag).
+# record and class decisions (44 with both off).
 ROW_MAPPING_MEDIAN_MM = 27.0
 
 
@@ -3876,13 +3877,15 @@ def run(args):
         print("Running digitization model...")
 
     # --grid_rescue map decides on the column map, so it needs the flags the map needs.
+    # map is the default, so a run without them has not asked for it: only --verbose
+    # says that there is no second try, and the QC column says off either way.
     grid_rescue_on = (
         args.grid_rescue == "map"
         and args.time_mapping == "grid"
         and args.grid_origin == "lines"
         and args.column_mapping == "lines"
     )
-    if args.grid_rescue == "map" and not grid_rescue_on:
+    if args.verbose and args.grid_rescue == "map" and not grid_rescue_on:
         print(
             "Grid rescue is off for this run: --grid_rescue map needs --time_mapping "
             "grid, --grid_origin lines and --column_mapping lines."
@@ -4130,7 +4133,7 @@ def run(args):
         # --grid_rescue map: the second try of a page that failed a check of the grid,
         # None for a page that failed none, and the column map of a rescued page. Such
         # a page takes its grid, its grid lines and that map from the second try; a
-        # refused one goes on as without the flag.
+        # refused one goes on as with --grid_rescue off.
         rescue, rescued_map = None, None
         if args.time_mapping == "grid":
             g0, P, long_leads, reason = fit_column_grid(

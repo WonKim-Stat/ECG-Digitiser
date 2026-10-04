@@ -1,14 +1,14 @@
-"""Unit tests for --grid_rescue map in src/run/digitize.py.
+"""Unit tests for --grid_rescue map, the default, in src/run/digitize.py.
 
 A page whose mask edges are off one uniform column grid (fit_column_grid() gives no
 grid) or whose grid lines are off the origin of the mask grid (refine_grid_from_lines()
 refuses them) is tried a second time, rescue_grid_fit() and rescue_grid_phase(), and
 kept on that second grid only if measure_column_mapping() returns a map on it; a page
-whose map does not stand is what it is without the flag. No model and no data files:
-the pages are drawn here, a 1 mm / 5 mm grid at 200 dpi with thin dark traces and
-their label mask, undistorted and with the distortions of a printed and scanned sheet
-(a narrower fourth column, masks that start early, grid lines off the traces, a stretch
-without grid lines).
+whose map does not stand is what it is with --grid_rescue off. No model and no data
+files: the pages are drawn here, a 1 mm / 5 mm grid at 200 dpi with thin dark traces
+and their label mask, undistorted and with the distortions of a printed and scanned
+sheet (a narrower fourth column, masks that start early, grid lines off the traces, a
+stretch without grid lines).
 """
 import contextlib
 import csv
@@ -132,7 +132,7 @@ def drawn_page(compress=0.0, line_phase=0.0, early=0, snap=0.0, blank=None):
 
 
 # name -> the arguments of drawn_page(). What the checks of the uniform grid make of
-# each without the flag is pinned in test_the_pages_fail_the_checks_they_are_drawn_for.
+# each on the first try is pinned in test_the_pages_fail_the_checks_they_are_drawn_for.
 PAGES = {
     # Nothing to rescue: an even page, and one the column map reads without help.
     "even": {},
@@ -189,11 +189,12 @@ def same_map(a, b):
 
 
 # ------------------------------------------------------------- flag and constants
-def test_the_flag_is_off_unless_map_is_asked_for(capsys):
+def test_the_flag_is_map_unless_off_is_asked_for(capsys):
     parse = digitize.get_parser().parse_args
     folders = ["-d", "in", "-o", "out"]
-    assert parse(folders).grid_rescue == "off"
+    assert parse(folders).grid_rescue == "map"
     assert parse(folders + ["--grid_rescue", "map"]).grid_rescue == "map"
+    assert parse(folders + ["--grid_rescue", "off"]).grid_rescue == "off"
     with pytest.raises(SystemExit):
         parse(folders + ["--grid_rescue", "lines"])
     capsys.readouterr()
@@ -496,7 +497,7 @@ def test_rescue_grid_phase_reads_the_page_on_the_pitch_of_the_lines(snap, median
     assert same_map((rescue["x_map"], rescue["map_info"]), again)
     mm = np.arange(0.0, SPAN, 0.05)
     assert np.max(np.abs(rescue["x_map"](mm) - trace_x(mm))) < 0.2
-    # The mask grid, which the page keeps without the flag, starts 3 px early.
+    # The mask grid, which the page keeps with --grid_rescue off, starts 3 px early.
     assert np.max(np.abs(g0 + mm * P / LINES - trace_x(mm))) > 3.0
 
 
@@ -555,10 +556,17 @@ def test_grid_rescue_line_names_the_record_the_check_and_the_map():
 
 
 # ------------------------------------------------------------------- end to end
-FLAGS = (
+STAGES = (
     "--rotation", "hough", "--perspective", "off", "--resolution", "keep",
     "--grid_line_offset", "0", "--paper_normalisation", "off", "-f",
 )
+# The runs below are about the rescue alone, and their numbers were fixed with every
+# lead on the page map: --row_mapping off, which was the default then. The run of the
+# two defaults together takes STAGES.
+FLAGS = (*STAGES, "--row_mapping", "off")
+# map is the default, so the run without a second try asks for off.
+OFF = ("--grid_rescue", "off")
+MAP = ("--grid_rescue", "map")
 
 
 # The pages of the runs that only compare a flag set with another one: a page for each
@@ -571,13 +579,13 @@ ONE = ("fit",)
 def runs(tmp_path_factory):
     """run() on drawn pages with the flags given, each set of pages and flags once.
 
-    Returns a function: (*flags, pages=every page) -> (output folder, what run()
-    printed).
+    Returns a function: (*flags, pages=every page, base=FLAGS) -> (output folder,
+    what run() printed); base are the flags every run of this file has.
     """
     root = tmp_path_factory.mktemp("grid_rescue")
     folders, done = {}, {}
 
-    def run(*flags, pages=tuple(PAGES)):
+    def run(*flags, pages=tuple(PAGES), base=FLAGS):
         if pages not in folders:
             data, masks = root / f"data{len(folders)}", root / f"masks{len(folders)}"
             data.mkdir()
@@ -587,15 +595,15 @@ def runs(tmp_path_factory):
                 write_png(image, str(data / f"{name}.png"))
                 write_png(mask, str(masks / f"{name}_mask.png"))
             folders[pages] = (data, masks)
-        if (pages, flags) not in done:
+        if (pages, base, flags) not in done:
             data, masks = folders[pages]
             out = root / f"out{len(done)}"
             argv = ["-d", str(data), "-o", str(out), "--mask_folder", str(masks)]
             printed = io.StringIO()
             with contextlib.redirect_stdout(printed):
-                digitize.run(digitize.get_parser().parse_args(argv + [*FLAGS, *flags]))
-            done[pages, flags] = (out, printed.getvalue())
-        return done[pages, flags]
+                digitize.run(digitize.get_parser().parse_args(argv + [*base, *flags]))
+            done[pages, base, flags] = (out, printed.getvalue())
+        return done[pages, base, flags]
 
     return run
 
@@ -640,12 +648,12 @@ def drawn_snr(folder, name):
 
 
 def test_run_reads_every_drawn_page_straight(runs):
-    out, _ = runs()
+    out, _ = runs(*OFF)
     assert all(float(row["rotation_angle"]) == 0.0 for row in qc_rows(out).values())
 
 
-def test_run_without_the_flag_writes_off_and_falls_back_as_before(runs):
-    out, printed = runs()
+def test_run_with_the_flag_off_writes_off_and_falls_back_as_before(runs):
+    out, printed = runs(*OFF)
     rows = qc_rows(out)
     assert sorted(rows) == sorted(PAGES)
     assert all(row["grid_rescue"] == "off" for row in rows.values())
@@ -661,17 +669,58 @@ def test_run_without_the_flag_writes_off_and_falls_back_as_before(runs):
         assert (
             len(lines_of(printed, name, "WARNING: grid lines not used for record")) == 1
         )
-    # --grid_rescue off is the run without the flag.
+
+
+def test_a_run_that_does_not_name_the_flag_is_the_run_with_map(runs):
+    # map is the default: --grid_rescue map is the run without the flag, to the lines it
+    # prints, and --grid_rescue off is not.
     out, printed = runs(pages=ONE)
-    off, printed_off = runs("--grid_rescue", "off", pages=ONE)
-    assert printed_off == printed
-    assert all(signals(off, name) == signals(out, name) for name in ONE)
-    assert qc_rows(off) == qc_rows(out)
+    named, printed_named = runs(*MAP, pages=ONE)
+    off, _ = runs(*OFF, pages=ONE)
+    assert printed_named == printed
+    assert all(signals(named, name) == signals(out, name) for name in ONE)
+    assert qc_rows(named) == qc_rows(out)
+    assert {name: row["grid_rescue"] for name, row in qc_rows(out).items()} == {
+        name: RESCUED[name] for name in ONE
+    }
+    assert all(signals(off, name) != signals(out, name) for name in ONE)
+    assert all(row["grid_rescue"] == "off" for row in qc_rows(off).values())
+
+
+def test_a_run_that_names_neither_flag_is_the_run_with_both_written_out(runs):
+    # map and lines are the defaults. On a page of each check that is tried again, the
+    # run that names neither --grid_rescue nor --row_mapping is the run with both
+    # written out, to the signals, the QC rows and the lines it prints: the page is
+    # rescued, and its rows are measured against the map it was rescued on. With both
+    # off it is another run.
+    default, printed = runs(pages=FEW, base=STAGES)
+    named, printed_named = runs(*MAP, "--row_mapping", "lines", pages=FEW, base=STAGES)
+    off, _ = runs(*OFF, "--row_mapping", "off", pages=FEW, base=STAGES)
+    rows, rows_off = qc_rows(default), qc_rows(off)
+    assert sorted(rows) == sorted(FEW)
+    assert printed == printed_named
+    assert rows == qc_rows(named)
+    for name in FEW:
+        assert signals(default, name) == signals(named, name), name
+        assert signals(default, name) != signals(off, name), name
+        assert rows[name]["grid_rescue"] == RESCUED[name], name
+        assert rows[name]["row_mapping"] == "lines 4/4", name
+        assert rows[name]["column_mapping"] == "lines", name
+        assert (rows_off[name]["grid_rescue"], rows_off[name]["row_mapping"]) == (
+            "off",
+            "off",
+        )
+        assert len(lines_of(printed, name, "Grid rescue for record")) == 1, name
+        assert len(lines_of(printed, name, "Row mapping for record")) == 4, name
+    # The rows are part of the default: the run with the rescue alone is a third one.
+    rescue_only, _ = runs(*MAP, pages=FEW)
+    assert all(row["row_mapping"] == "off" for row in qc_rows(rescue_only).values())
+    assert any(signals(default, name) != signals(rescue_only, name) for name in FEW)
 
 
 def test_run_rescues_the_pages_whose_map_stands(runs):
-    plain, _ = runs()
-    out, printed = runs("--grid_rescue", "map")
+    plain, _ = runs(*OFF)
+    out, printed = runs(*MAP)
     rows, rows_plain = qc_rows(out), qc_rows(plain)
     for name, how in RESCUED.items():
         assert rows[name]["grid_rescue"] == how, name
@@ -699,8 +748,8 @@ def test_run_rescues_the_pages_whose_map_stands(runs):
 
 
 def test_run_reads_a_rescued_page_as_it_was_drawn(runs):
-    plain, _ = runs()
-    out, _ = runs("--grid_rescue", "map")
+    plain, _ = runs(*OFF)
+    out, _ = runs(*MAP)
     even = drawn_snr(plain, "even")
     for name in RESCUED:
         before, after = drawn_snr(plain, name), drawn_snr(out, name)
@@ -708,21 +757,21 @@ def test_run_reads_a_rescued_page_as_it_was_drawn(runs):
         # within 5 dB of it; aVL is drawn 0.1 mV high and reads 14 dB on any page.
         assert np.median(list(after.values())) > 30.0, (name, after)
         assert all(after[lead] > even[lead] - 5.0 for lead in after), (name, after)
-        # Without it the page is read on bbox or on the grid of the masks: the rhythm
+        # With off the page is read on bbox or on the grid of the masks: the rhythm
         # strip is lost (0 dB) and the median lead is 7 dB or more behind.
         assert before[RHYTHM_LEAD] < 5.0 and after[RHYTHM_LEAD] > 30.0, (name, before)
         gain = np.median(list(after.values())) - np.median(list(before.values()))
         assert gain > 5.0, (name, gain)
 
 
-def test_run_leaves_a_refused_page_exactly_as_without_the_flag(runs):
-    plain, printed_plain = runs()
-    out, printed = runs("--grid_rescue", "map")
+def test_run_leaves_a_refused_page_exactly_as_with_the_flag_off(runs):
+    plain, printed_plain = runs(*OFF)
+    out, printed = runs(*MAP)
     rows, rows_plain = qc_rows(out), qc_rows(plain)
     for name, pattern in REFUSED.items():
         assert signals(out, name) == signals(plain, name), name
         assert re.fullmatch(pattern, rows[name]["grid_rescue"]), rows[name]["grid_rescue"]
-        # The QC row but for that column, and every WARNING line, are those without it.
+        # The QC row but for that column, and every WARNING line, are those with off.
         ours = {key: value for key, value in rows[name].items() if key != "grid_rescue"}
         theirs = {k: v for k, v in rows_plain[name].items() if k != "grid_rescue"}
         assert ours == theirs, name
@@ -737,8 +786,8 @@ def test_run_leaves_a_refused_page_exactly_as_without_the_flag(runs):
 
 
 def test_run_leaves_a_page_without_a_failed_check_alone(runs):
-    plain, printed_plain = runs()
-    out, printed = runs("--grid_rescue", "map")
+    plain, printed_plain = runs(*OFF)
+    out, printed = runs(*MAP)
     rows, rows_plain = qc_rows(out), qc_rows(plain)
     for name in UNTOUCHED:
         assert signals(out, name) == signals(plain, name), name
@@ -751,8 +800,8 @@ def test_run_leaves_a_page_without_a_failed_check_alone(runs):
 
 def test_run_says_a_rescue_without_verbose_and_a_refusal_only_with_it(runs):
     pages = ("fit", "phase", "fitgap", "phasebad")
-    loud, printed_loud = runs("--grid_rescue", "map")
-    out, printed = runs("--grid_rescue", "map", "--no-verbose", pages=pages)
+    loud, printed_loud = runs(*MAP)
+    out, printed = runs(*MAP, "--no-verbose", pages=pages)
     assert all(signals(out, name) == signals(loud, name) for name in pages)
     rows_loud = qc_rows(loud)
     assert qc_rows(out) == {name: rows_loud[name] for name in pages}
@@ -832,8 +881,8 @@ def test_run_measures_the_map_of_a_rescued_page_once(tmp_path, monkeypatch):
     ],
 )
 def test_run_needs_the_flags_of_the_column_map(runs, others, pages):
-    plain, printed_plain = runs(*others, pages=pages)
-    out, printed = runs(*others, "--grid_rescue", "map", pages=pages)
+    plain, printed_plain = runs(*others, *OFF, "--verbose", pages=pages)
+    out, printed = runs(*others, *MAP, "--verbose", pages=pages)
     assert all(signals(out, name) == signals(plain, name) for name in pages)
     assert qc_rows(out) == qc_rows(plain)
     assert all(row["grid_rescue"] == "off" for row in qc_rows(out).values())
@@ -843,6 +892,17 @@ def test_run_needs_the_flags_of_the_column_map(runs, others, pages):
         "grid, --grid_origin lines and --column_mapping lines."
     ]
     assert printed.replace(note[0] + "\n", "") == printed_plain
+    # map is the default, so the run that does not name the flag is that run, and it
+    # has not asked for a second try: the line is one of --verbose only, and the QC
+    # column says off with or without it.
+    default, printed_default = runs(*others, "--verbose", pages=pages)
+    assert printed_default == printed
+    assert qc_rows(default) == qc_rows(out)
+    for flags in ((), MAP):
+        quiet, printed_quiet = runs(*others, *flags, "--no-verbose", pages=pages)
+        assert "Grid rescue" not in printed_quiet
+        assert all(signals(quiet, name) == signals(plain, name) for name in pages)
+        assert qc_rows(quiet) == qc_rows(plain)
 
 
 # ----------------------------------------------------------------------------- QC

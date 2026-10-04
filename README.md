@@ -274,17 +274,18 @@ lines falls back to the behaviour without them if the page shows none.
 5. **Segmentation:** nnU-Net predicts the lead masks of the corrected page.
 6. **Column grid:** all leads are put on one shared column grid, with the column pitch
    from the page height, the origin refined to sub-pixel accuracy on the grid lines and
-   moved by the grid line offset. With `--grid_rescue map` (off by default) a page that
-   fails a check of this grid because one of its columns is distorted is tried a second
-   time, and kept on that try only if the column map of stage 7 stands on it.
+   moved by the grid line offset. A page that fails a check of this grid because one of
+   its columns is distorted is tried a second time, and kept on that try only if the
+   column map of stage 7 stands on it. `--grid_rescue off` does not try again.
 7. **Column mapping:** the time axis is read off the grid lines themselves: the 1 mm
    lines, each named by the bold 5 mm lines, say where every millimetre of the page is,
    so a page whose grid and traces are stretched, compressed or stepped in places by
    printing, paper feed or scanning is read at the x of each sample's own millimetre.
    A page that the map moves by less than a pixel, or whose map cannot be trusted, keeps
-   the uniform columns of the column grid. With `--row_mapping lines` (off by default)
-   each of the four rows of leads is read on a map of its own, the map of the page moved
-   by what the grid lines in the band of that row say.
+   the uniform columns of the column grid. On a page that is read on its map, each of
+   the four rows of leads is read on a map of its own, the map of the page moved by what
+   the grid lines in the band of that row say. `--row_mapping off` reads every lead on
+   the map of the page.
 8. **Trace reading:** every column of a lead gives one row, the mean row of its mask
    weighted by the ink of the page under it, read on a column axis moved by the trace
    shift measured on the page.
@@ -310,9 +311,9 @@ lines falls back to the behaviour without them if the page shows none.
 | `--grid_line_offset` | any number of pixels | `0.5` | How far right of the traces the printed grid lines sit. `0.5` is the matplotlib Agg snap of the generator images, `0` is for scans and photographs. It is a page unit, so it survives `--resolution`. |
 | `--column_mapping` | `uniform`, `lines` | `lines` | `lines` reads the time axis off the printed grid lines themselves: in windows about half a line apart the 1 mm lines say where every millimetre is and the bold 5 mm lines which millimetre that is, so a sample is read at the x of its own millimetre (1/20 mm at 25 mm/s and 500 Hz) on a page whose grid and traces are stretched, compressed or stepped in places by printing, paper feed or scanning. The origin is the grid line the mask edges of all leads agree on, and the ripple of grid lines snapped to the pixels of a drawn page is taken out with `--column_mapping_median`. It needs `--time_mapping grid` and `--grid_origin lines` with the grid lines used, keeps the uniform grid with a `WARNING` when the map cannot be trusted (5 mm and 1 mm lines disagree, too few windows, a gap, a jump of a line, mask edges off the lines) and, byte identical, when it moves no sample by 1 px. On the development set (115 PTB-XL records, split by patient) of the ECG-Image-Database (v2, part D0: PTB-XL records printed, then scanned or photographed; references below the table), scored per lead against PTB-XL, the median lead SNR of the colour scans rises from 9.06 to 13.40 dB (paired median +3.41 dB, patient bootstrap 95 % CI 2.75 to 3.90) and that of the greyscale scans from 8.82 to 13.14 dB (+3.40, 2.84 to 3.95); the leads without a usable signal (no signal or an SNR below 0 dB) drop from 15.2 to 3.6 % and from 17.2 to 4.3 %. In the paired median of its leads, the fourth column gains 9.9 / 10.5 dB (colour / greyscale) and the rhythm strip II 6.7 / 7.5 dB, while the third column (V1–V3) changes by −0.59 / 0.00 dB. The rendered pages of the same records and all 208 synthetic pages (generator pages and synthetic defects applied to them, every page of the results below included) keep byte identical signals (dead band on 178 pages; on 26 augmented generator pages and 4 faint-grid pages the map is not trusted); on mould-damaged scans the map is used on 20–28 % of the pages, with a paired median of +0.85 to +1.06 dB on those. On the colour and the greyscale scans alike, a PTB-XL diagnostic classifier changes 3.8 % instead of 4.9 % of its record and class decisions against the digital signal. On the evaluation set of the same database (84 records of other patients, read once with this setting fixed beforehand), the colour scans rise from 8.92 to 12.83 dB (+2.55, 1.57 to 3.30) and the greyscale scans from 8.87 to 13.25 dB (+3.44, 2.70 to 4.05), the leads without a usable signal drop from 18.3 to 6.6 % and from 18.5 to 5.1 %, the rendered pages keep byte identical signals, and on the mould-damaged scans the pages that use the map gain +1.35 and +0.59 dB; the classifier's changed decisions, however, stay at 4.8 % on the colour scans and go from 2.9 to 3.6 % on the greyscale scans (pooled +0.4 points, patient bootstrap 95 % CI −0.6 to +1.3), so on these 84 records the SNR gain did not show as fewer changed decisions. It costs about 0.08 s per page. `uniform` makes every column P pixels wide from the grid origin on, the time axis before the column mapping. |
 | `--column_mapping_median` | any width in grid mm, `0` = none | `13.5` | Only for `--column_mapping lines`: the width of the running median of the map's displacement from the uniform columns. The grid lines of a page drawn at 200 dpi are snapped to its pixels, its traces are not, and on the bold lines that snap repeats every 13.5 mm; scanned printouts carry the same ripple. A running median over that period takes it out and keeps a step or a stretch of the lines as it is. Without it the map follows that ripple, which the traces lack, and costs V1–V3 about 1.6 dB; the median recovers about half of that. `0` reads the samples on the map as measured. |
-| `--grid_rescue` | `off`, `map` | `off` | Only with `--time_mapping grid`, `--grid_origin lines` and `--column_mapping lines`; with other flags it does nothing and the run says so. A printed and scanned sheet can have a column a few per cent narrower than the others. The mask edges of such a page are off one uniform column grid, so the page falls back to `--time_mapping bbox`, or its grid lines are off the origin of the mask grid, so the page keeps the grid of the masks and gets no column map. `map` tries such a page a second time: the fit with twice the edge tolerance (4 % of the column pitch instead of 2 %), the grid lines on their own pitch, with the mask grid turned about its centre and without the origin that was refused. The second try is kept only if the column map then stands on it, and the page is read on that map (`column_mapping` is `lines`); a page whose map does not stand is exactly what it is without the flag: the same signals, the same `WARNING` lines and, but for `grid_rescue`, the same `qc.csv` row. A page that fails for another reason (no rhythm strip, a column without a short lead, no grid lines) is not tried again. A rescued page prints one line with or without `--verbose`, `Grid rescue for record <record>: <fit, phase or fit+phase>, read on the column map of the second try (…)` with the grid and the numbers of its map, in place of the `WARNING` of the check it failed; `--verbose` also says why a second try was refused. Development-set numbers and limits are under *Results on real pages* below. `off` does not try again. |
-| `--row_mapping` | `off`, `lines` | `off` | Only on a page that is read on its column map. That map is one for the page, measured on all its rows together, while a printed and scanned sheet moves its rows against each other by fractions of a pixel, and a lead follows the grid lines of its own row. `lines` measures the 1 mm lines once more in the band of each of the four layout rows (three rows of short leads and the rhythm strip) against the page map, which says which line a window is on, and reads the leads of a row on the page map moved by what the lines of that row say, smoothed with `--row_mapping_median`. A row keeps the page map when its lines carry no map of its own: fewer than 80 % of its windows within 0.3 line of the page map, a quarter of a column without one, or a map that does not grow along x. A page without a column map in use (dead band, map not trusted, `--column_mapping uniform`) is read as without the flag, byte for byte. Development-set numbers and limits are under *Results on real pages* below. `off` reads every lead on the page map. |
-| `--row_mapping_median` | any width in grid mm, `0` or less = none | `27` | Only for `--row_mapping lines`: the width of the running median of a row's displacement from the page map, which takes the ripple of grid lines snapped to the pixels out of it, as `--column_mapping_median` does for the page map. The default is two periods of that ripple, twice the width the page map takes: on the development scans it left 250 leads more than 1 dB worse where one period, 13.5 mm, left 295 (only these two widths were read). `0` or less reads a row on its displacement as measured. |
+| `--grid_rescue` | `off`, `map` | `map` | Only with `--time_mapping grid`, `--grid_origin lines` and `--column_mapping lines`; with other flags it does nothing, `qc.csv` says `off` and the run says so in one line that is printed with `--verbose` only (which is on unless `--no-verbose` is given), since `map` is the default and such a run has not asked for it. A printed and scanned sheet can have a column a few per cent narrower than the others. The mask edges of such a page are off one uniform column grid, so the page falls back to `--time_mapping bbox`, or its grid lines are off the origin of the mask grid, so the page keeps the grid of the masks and gets no column map. `map` tries such a page a second time: the fit with twice the edge tolerance (4 % of the column pitch instead of 2 %), the grid lines on their own pitch, with the mask grid turned about its centre and without the origin that was refused. The second try is kept only if the column map then stands on it, and the page is read on that map (`column_mapping` is `lines`); a page whose map does not stand is exactly what it is with `off`: the same signals, the same `WARNING` lines and, but for `grid_rescue`, the same `qc.csv` row. A page that fails for another reason (no rhythm strip, a column without a short lead, no grid lines) is not tried again. A rescued page prints one line with or without `--verbose`, `Grid rescue for record <record>: <fit, phase or fit+phase>, read on the column map of the second try (…)` with the grid and the numbers of its map, in place of the `WARNING` of the check it failed; `--verbose` also says why a second try was refused. Development-set numbers and limits are under *Results on real pages* below. `off` does not try again: such a page falls back to `--time_mapping bbox` or keeps the grid of the masks, the behaviour before `map` became the default. |
+| `--row_mapping` | `off`, `lines` | `lines` | Only on a page that is read on its column map. That map is one for the page, measured on all its rows together, while a printed and scanned sheet moves its rows against each other by fractions of a pixel, and a lead follows the grid lines of its own row. `lines` measures the 1 mm lines once more in the band of each of the four layout rows (three rows of short leads and the rhythm strip) against the page map, which says which line a window is on, and reads the leads of a row on the page map moved by what the lines of that row say, smoothed with `--row_mapping_median`. A row keeps the page map when its lines carry no map of its own: fewer than 80 % of its windows within 0.3 line of the page map, a quarter of a column without one, or a map that does not grow along x. A page without a column map in use (dead band, map not trusted, `--column_mapping uniform`) is read as with `off`, byte for byte. Development-set numbers and limits are under *Results on real pages* below. `off` reads every lead on the page map, the reading before `lines` became the default. |
+| `--row_mapping_median` | any width in grid mm, `0` or less = none | `27` | Only for `--row_mapping lines`: the width of the running median of a row's displacement from the page map, which takes the ripple of grid lines snapped to the pixels out of it, as `--column_mapping_median` does for the page map. The default is two periods of that ripple, twice the width the page map takes: on the development scans, read with `--grid_rescue map` and `--row_mapping lines` and compared with both `off`, it left 250 leads more than 1 dB worse where one period, 13.5 mm, left 295 (only these two widths were read). `0` or less reads a row on its displacement as measured. |
 | `--trace_estimator` | `mask`, `ink` | `ink` | `ink` weights the mean row of a column by the ink under the mask, which puts the row on the core of the stroke; a lead whose stroke is too faint keeps the mask mean. `mask` is the mean row of the binary mask. |
 | `--trace_shift` | `off`, `page` | `page` | `page` measures once per page how far right of the lead masks the ink of the steep strokes sits and reads every lead on a column axis moved by that. `off` reads every lead where its mask is. |
 | `--sharpen` | `none`, `bandlimited` | `bandlimited` | `bandlimited` restores the 20–40 Hz band that the column aperture and the linear interpolation attenuate: the aperture-corrected (a = 1/8) cubic spline through the columns minus the linear trace, low-passed at 35 Hz (zero-phase Butterworth, order 4), is added to the linear trace, so only the band below 35 Hz changes and steep QRS spikes cannot ring. Paired on the same masks, the median gain per lead is 1.41 dB on the 96 generator pages below, with no lead of the 15 conditions below more than 1 dB worse, and 1.17 dB on 2,000 synthetic pages of 500 PTB-XL records (clean, augmented, rotated, simulated scan); on those pages a PTB-XL diagnostic classifier changes 138 instead of 233 of its 10,000 record and class decisions against the digital signal. It costs about 8–14 ms per page. `none` interpolates the column profile linearly, the trace before the sharpening. |
@@ -369,8 +370,12 @@ was used as given: the page to give then is the view the mask was predicted on. 
 The real-page numbers in the table, in the quality control section and under *Results on
 real pages* below are on the ECG-Image-Database, version 2
 (<https://www.kaggle.com/datasets/physionet/ecg-image-database>), whose images are
-licensed CC BY-ND 4.0, so only aggregate numbers are given here. Its dataset page asks
-for these citations:
+licensed CC BY-ND 4.0, so only aggregate numbers are given here. Those in the table and
+in the quality control section were measured before `--grid_rescue map` and
+`--row_mapping lines` became the defaults: unless it says otherwise (the row of
+`--row_mapping_median` does), they are read with `--grid_rescue off --row_mapping off`.
+What the two flags change on the same pages is under *Results on real pages*. The
+dataset page asks for these citations:
 
 1. M. A. Reyna et al., "ECG-Image-Database: large-scale paired ECG images and time-series
    with real-world artifacts; a foundation for computerized ECG digitization and
@@ -428,15 +433,16 @@ columns:
   `uniform` with `--column_mapping uniform`, and `column_mapping_shift_px`, the largest
   move in pixels the map, after `--column_mapping_median`, makes to any sample the page
   reads against the uniform grid (NaN when it was not measured).
-- **Grid rescue:** `grid_rescue`, `off` without `--grid_rescue map` or in a run without
-  the flags it needs. With it: empty for a page that failed no check that is tried
-  again, `fit`, `phase` or `fit+phase` for a page that is read on the column map of its
-  second try, after the fit, the grid lines or both were tried again, and
-  `refused: <reason>` for a page whose second try was not kept, which is then read as
-  without the flag.
-- **Row mapping:** `row_mapping`, `off` without `--row_mapping lines`. With it:
+- **Grid rescue:** `grid_rescue`, under the default `--grid_rescue map` empty for a page
+  that failed no check that is tried again, `fit`, `phase` or `fit+phase` for a page
+  that is read on the column map of its second try, after the fit, the grid lines or
+  both were tried again, and `refused: <reason>` for a page whose second try was not
+  kept, which is then read as with `--grid_rescue off`; `off` with `--grid_rescue off`
+  or in a run without the flags the rescue needs.
+- **Row mapping:** `row_mapping`, under the default `--row_mapping lines`
   `lines <k>/4`, the number of layout rows read on a map of their own, the others on the
-  page map, or `page map not used` for a page that has no column map in use.
+  page map, or `page map not used` for a page that has no column map in use; `off` with
+  `--row_mapping off`.
   These two columns are the 33rd and the 34th, appended after `column_mapping_shift_px`,
   so no column that was there moves; as for `paper_normalisation`, do not append to a
   `qc.csv` written by an older version, but use a fresh output folder.
@@ -456,9 +462,10 @@ estimate disagree by more than the tolerance, so the page baseline is kept; the 
 line map of `--column_mapping lines` cannot be trusted, so the uniform grid is kept; or
 a lead mask has a gap inside its column, which is interpolated linearly. A page whose fitted
 column pitch does not match the pitch of the page height prints a line as well and uses
-the fitted one. With `--grid_rescue map`, a page that is rescued prints its
+the fitted one. Under the default `--grid_rescue map`, a page that is rescued prints its
 `Grid rescue for record <record>: …` line in place of the `WARNING` about the column grid
-or the grid origin, and a page whose second try is refused keeps that `WARNING`.
+or the grid origin, and a page whose second try is refused keeps that `WARNING`; with
+`--grid_rescue off` every such page prints it.
 
 Two more `WARNING` lines come without a fallback. The first is the Einthoven check.
 Every page with signals prints a `QC <record>: Einthoven RMS …` line with its lead
@@ -476,7 +483,8 @@ page, not a diagnosis, and it changes neither the signals nor `qc.csv`. The thre
 was fitted on the development set of the ECG-Image-Database named above (115 records):
 the highest ratio that flags at least 90 % of the clean colour and greyscale scans whose
 page SNR (the median SNR of their 12 leads, a missing lead counting as the lowest) is
-below 12 dB, 0.17976, rounded down to 0.1797. On that set, read with the defaults, it
+below 12 dB, 0.17976, rounded down to 0.1797. On that set, read with the defaults but
+for `--grid_rescue off --row_mapping off`, it
 flags 56 of these 62 scans and 57 of the 168 others, so 57 of the 113 flagged clean scans
 are at or above 12 dB (AUROC 0.880 over the pairs of a scan below and a scan above 12 dB
 of the same scan type, patient bootstrap 95 % CI 0.817 to 0.932). These numbers are
@@ -516,14 +524,14 @@ not flag.
 
 #### Results on real pages
 
-`--grid_rescue map` and `--row_mapping lines` are off by default, and the numbers here
-are **development-set numbers**: the tolerance of the second fit, the pitch of the
-second try and the width of the row median were chosen on these pages, and the
-evaluation set of the database has not been read with either flag. They are on the 230
-clean colour and greyscale scans of the development set of the ECG-Image-Database (115
-PTB-XL records, split by patient; references above), read from saved masks, scored per
-lead against PTB-XL, and compared, paired on record and lead, with the same pages read
-with the defaults.
+`--grid_rescue map` and `--row_mapping lines` are the defaults since this change; both
+were `off` before it. The numbers here are **development-set numbers**: the tolerance
+of the second fit, the pitch of the second try and the width of the row median were
+chosen on these pages, and the evaluation set of the database has not been read with
+either flag. They are on the 230 clean colour and greyscale scans of the development set
+of the ECG-Image-Database (115 PTB-XL records, split by patient; references above), read
+from saved masks, scored per lead against PTB-XL, and compared, paired on record and
+lead, with the same pages read with `--grid_rescue off --row_mapping off`.
 
 With both flags as they are given above (row median 27 mm), the median lead SNR of the
 scans rises from 13.24 to 15.02 dB (paired median +1.39 dB, patient bootstrap 95 % CI
@@ -539,8 +547,8 @@ sit on their threshold:
 - the mean absolute change of its class probabilities falls from 0.0264 to 0.0194 (by
   0.0069, 95 % CI 0.0042 to 0.0102);
 - on the pages that print no `WARNING` of a stage (resolution, rotation, perspective,
-  column grid, grid origin or column mapping; 205 pages with both flags, 196 with the
-  defaults) it changes 19 of 1,025 decisions (1.9 %) instead of 22 of 980 (2.2 %).
+  column grid, grid origin or column mapping; 205 pages with both flags, 196 with both
+  `off`) it changes 19 of 1,025 decisions (1.9 %) instead of 22 of 980 (2.2 %).
 
 With a row median of 13.5 mm, one period of the ripple, the same reading gives
 15.03 dB (+1.33 dB, 1.20 to 1.53), 34 changed decisions (−21 to 0), 8 of those at
@@ -573,7 +581,7 @@ the 345 photographs (three conditions; original pages with the saved masks and t
 with the rescue alone), 382 instead of 402 of the 1,452 that the digital signal puts
 at least 1 logit from the threshold, and the mean absolute change of its class
 probabilities falls by 0.0085 (0.0049 to 0.0127). Both kinds of page stay far from the
-digital signal with or without the flags (median lead SNR below 1 dB on the
+digital signal with the flags or with both `off` (median lead SNR below 1 dB on the
 mould-damaged scans and below 0 dB on the photographs), and so few of them print no
 `WARNING` of a stage (59 mould-damaged scans, 16 photographs) that the last reading
 above cannot be made there.
@@ -592,7 +600,8 @@ sharpening byte for byte, with medians 0.9 (scale080) to 2.5 dB (gridblue) lower
 map moves no sample of these pages by a pixel or, on augmented pages and pages with a
 faint grid whose lines it cannot read, is not trusted. So does `--paper_normalisation
 off`: the saved masks have no record of the paper normalisation, so their pages are
-used as given.
+used as given. And so does `--grid_rescue off --row_mapping off`: none of these pages
+fails a check that is tried again and none has a column map in use.
 
 | Condition | Pages | Description | Median SNR (dB) |
 | --- | --- | --- | --- |

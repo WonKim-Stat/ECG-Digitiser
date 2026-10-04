@@ -599,10 +599,14 @@ def run_page(tmp_path, name, image, label, column_mapping, capsys=None, extra=()
         folder.mkdir(exist_ok=True)
     write_png(image, str(data / f"{name}.png"))
     write_png(torch.from_numpy(label)[None], str(masks / f"{name}_mask.png"))
+    # The runs of this file are about the map of the page alone, and their numbers were
+    # fixed with it: no second try of a failed grid check and no row maps, which were
+    # the defaults then. On the compressed page the rows would get maps of their own.
     argv = [
         "-d", str(data), "-o", str(out), "--mask_folder", str(masks),
         "--rotation", "hough", "--perspective", "off", "--resolution", "keep",
         "--trace_estimator", "mask", "--trace_shift", "off", "--grid_line_offset", "0.5",
+        "--grid_rescue", "off", "--row_mapping", "off",
         "--verbose", *extra,
     ]
     if column_mapping is not None:
