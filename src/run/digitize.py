@@ -199,6 +199,51 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--grid_rescue",
+        type=str,
+        choices=["off", "map"],
+        default="off",
+        help=(
+            "Only for --time_mapping grid with --grid_origin lines and "
+            "--column_mapping lines. map = a page whose mask edges are off one uniform "
+            "column grid, or whose grid lines are off the origin of the masks, is "
+            "tried once more, with twice the edge tolerance or on the pitch of the "
+            "lines about the centre of the mask grid, and read on that grid only if "
+            "the column map then stands on it; a page whose map does not stand is "
+            "what it is without the flag, with the same warnings; off (default) = "
+            "such a page falls back to --time_mapping bbox or to the grid of the "
+            "masks."
+        ),
+    )
+    parser.add_argument(
+        "--row_mapping",
+        type=str,
+        choices=["off", "lines"],
+        default="off",
+        help=(
+            "Only on a page whose column map is in use (--column_mapping lines). "
+            "lines = one map per row of leads instead of one for the page: the grid "
+            "lines in the band of each of the four layout rows are measured against "
+            "the page map, and the leads of a row are read on the map of their own "
+            "row, since a printed and scanned sheet moves its rows against each "
+            "other by fractions of a pixel; a row whose lines do not carry a map of "
+            "its own keeps the page map; off (default) = every lead on the page map."
+        ),
+    )
+    # ROW_MAPPING_MEDIAN_MM is defined below as well.
+    parser.add_argument(
+        "--row_mapping_median",
+        type=float,
+        default=ROW_MAPPING_MEDIAN_MM,
+        help=(
+            "Only for --row_mapping lines. Width in grid millimetres of the running "
+            "median of a row's displacement from the page map, which takes out the "
+            "ripple of grid lines snapped to the pixels, as --column_mapping_median "
+            "does for the page map (27 = two periods of it); 0 or less = the "
+            "displacement as measured."
+        ),
+    )
+    parser.add_argument(
         "--trace_estimator",
         type=str,
         choices=["mask", "ink"],
@@ -694,26 +739,42 @@ BASELINE_DISAGREEMENT_TOLERANCE = 0.004
 NUM_COLUMNS = int(LONG_SIGNAL_LENGTH_SEC / SHORT_SIGNAL_LENGTH_SEC)
 
 
-def _grid_inliers(lead_edges):
-    """Flag the lead edges within GRID_RESIDUAL_TOLERANCE of a Theil-Sen grid."""
+def _grid_inliers(lead_edges, tolerance=None):
+    """Flag the lead edges within GRID_RESIDUAL_TOLERANCE of a Theil-Sen grid.
+
+    tolerance is another one for the same check, relative to the pitch as well.
+    """
+    if tolerance is None:
+        tolerance = GRID_RESIDUAL_TOLERANCE
     boundaries = np.array([edge[0] for edge in lead_edges], float)
     edges = np.array([edge[1] for edge in lead_edges], float)
     i, j = np.triu_indices(len(edges), 1)
     distinct = boundaries[i] != boundaries[j]
     P = np.median((edges[j] - edges[i])[distinct] / (boundaries[j] - boundaries[i])[distinct])
     residuals = edges - boundaries * P
-    return np.abs(residuals - np.median(residuals)) <= GRID_RESIDUAL_TOLERANCE * P
+    return np.abs(residuals - np.median(residuals)) <= tolerance * P
 
 
 def fit_column_grid(
-    signal_masks, signal_positions, image_height, pitch="page", record=""
+    signal_masks,
+    signal_positions,
+    image_height,
+    pitch="page",
+    record="",
+    tolerance=None,
+    quiet=False,
 ):
     """Fit the shared column grid of the standard 3x4 layout with rhythm strip.
 
     Returns (g0, P, long_leads, reason). g0 is the x position of the left edge of
     the first column, P the width of one 2.5 s column in pixels. If the layout is
     not the expected one, g0 and P are None and reason says why.
+    tolerance is how far a column edge may be off the grid, relative to the pitch,
+    GRID_RESIDUAL_TOLERANCE unless given; quiet leaves out the line about a page
+    pitch that does not match. Both are for the second try of rescue_grid_fit().
     """
+    if tolerance is None:
+        tolerance = GRID_RESIDUAL_TOLERANCE
     widths = {
         lead: mask.shape[2] for lead, mask in signal_masks.items() if mask is not None
     }
@@ -751,7 +812,7 @@ def fit_column_grid(
 
     # A mask that runs on past its column (into the margin or the next lead) must
     # not set the column edge, so edges far off the consensus grid are left out.
-    inliers = _grid_inliers(lead_edges)
+    inliers = _grid_inliers(lead_edges, tolerance)
     # Column starts = min x1 per column, column ends = max x-end per column.
     starts, ends = {}, {}
     for (boundary, edge, is_start), inlier in zip(lead_edges, inliers):
@@ -777,13 +838,13 @@ def fit_column_grid(
             # With a fixed pitch no single edge pixel moves the origin by more than 1/n.
             P = P_page
             g0 = np.mean(edges - boundaries * P)
-        else:
+        elif not quiet:
             print(
                 f"Page pitch {P_page:.2f} px does not match the fitted pitch "
                 f"{P_fit:.2f} px for record {record}, using the fitted one."
             )
     residual = np.max(np.abs(edges - (g0 + boundaries * P)))
-    if residual > GRID_RESIDUAL_TOLERANCE * P:
+    if residual > tolerance * P:
         return None, None, long_leads, f"column edges are {residual:.1f} px off the grid"
 
     return float(g0), float(P), long_leads, ""
@@ -857,10 +918,16 @@ def refine_grid_from_lines(image_rotated, g0, P, snap_offset=GRID_LINE_SNAP_OFFS
     snap_offset is how far in pixels the drawn lines sit right of the traces, 0.5 for
     the matplotlib generator and 0 for a scanned page.
     Returns (g0, P, info). Without usable grid lines g0 and P come back unchanged and
-    info["reason"] says why.
+    info["reason"] says why. info["pitch"] is the column pitch the lines have, also
+    when their origin is refused, and NaN when no lines were found.
     """
     profiles, _ = _band_profiles(_darkness(image_rotated))
-    info = {"contrast": float("nan"), "shift": float("nan"), "reason": ""}
+    info = {
+        "contrast": float("nan"),
+        "shift": float("nan"),
+        "pitch": float("nan"),
+        "reason": "",
+    }
     if profiles.shape[0] == 0:
         info["reason"] = "image too small for the grid line profile"
         return g0, P, info
@@ -889,6 +956,7 @@ def refine_grid_from_lines(image_rotated, g0, P, snap_offset=GRID_LINE_SNAP_OFFS
         return g0, P, info
 
     P_lines = period * GRID_LINES_PER_COLUMN
+    info["pitch"] = float(P_lines)
     phase = -np.angle(_grid_line_comb(profiles, period).sum()) / (2 * np.pi) * period
     phase -= snap_offset
     # A new pitch turns the mask grid about its centre, not about its origin.
@@ -2800,6 +2868,519 @@ def measure_column_mapping(
     return x_map, info
 
 
+# Residual tolerance of the column grid on the second try of --grid_rescue map, twice
+# GRID_RESIDUAL_TOLERANCE. A printed and scanned sheet can have a column a few per cent
+# narrower than the others, which puts its mask edges further off one uniform grid than
+# the first try allows. That is the distortion the column map measures, so the second
+# try is kept only if the map then stands on it. Development pages of the
+# ECG-Image-Database (see the README), 230 clean scans read with this value and no
+# other: the rescue changes 14 of them and leaves 216 byte identical, the leads without
+# a usable signal drop from 3.9 to 1.8 %, and the 5 colour scans it rescues go from a
+# median lead SNR of 1.20 to 12.73 dB; 4 colour scans are tried and refused by the map.
+GRID_RESCUE_RESIDUAL_TOLERANCE = 0.04
+
+
+def _fit_failed_on_edges(reason):
+    """True for the failures of fit_column_grid() that --grid_rescue map tries again.
+
+    They are the two that a distorted column causes, its edges being off the grid of
+    the other columns. Every other failure is a page that is not the 3x4 layout with
+    rhythm strip, which no column map mends.
+    """
+    return reason == "a column has all its edges off the grid" or (
+        reason.startswith("column edges are ") and reason.endswith(" px off the grid")
+    )
+
+
+def _lines_refused_by_phase(reason):
+    """True for the refusal of refine_grid_from_lines() that --grid_rescue map tries
+    again: grid lines that were found, but further off the mask origin than allowed."""
+    return reason.startswith("next grid line is ") and reason.endswith(
+        " px off the mask origin"
+    )
+
+
+def _map_refusal(x_map, map_info):
+    """Why a column map is not in use, "" if it is."""
+    if x_map is not None:
+        return ""
+    return map_info["reason"] or "dead band"
+
+
+def rescue_grid_phase(
+    image_rotated,
+    g0,
+    P,
+    grid_lines,
+    edges,
+    snap_offset=GRID_LINE_SNAP_OFFSET,
+    median_mm=COLUMN_MAPPING_MEDIAN_MM,
+):
+    """Second try of a page whose grid lines are off the origin of the mask grid.
+
+    refine_grid_from_lines() refuses lines whose nearest one is further off the mask
+    origin than GRID_LINE_SHIFT_TOLERANCE, and the page then keeps the grid of the
+    masks without a column map. On a scanned sheet with a distorted column it is the
+    uniform grid of the masks that is off, not the lines, and the column map does not
+    need that origin: it finds its own on the mask edges of all leads, each read at its
+    own millimetre. So the map is measured on the grid the lines give without the
+    origin that was refused, their pitch with the mask grid turned about its centre, as
+    refine_grid_from_lines() turns it before it looks for the next line. With the
+    pitch of the masks instead, the 5 development colour scans the rescue reads came
+    to 11.19 dB in place of 12.73 dB.
+    g0 and P are the grid of the masks, grid_lines the info of the refusal and edges
+    column_mapping_edges(); snap_offset and median_mm are those of
+    measure_column_mapping().
+    Returns a dict: "refused" is "" when the map stands, and then "g0" and "P" are the
+    grid it was measured on, "grid_lines" the info of the lines without its reason
+    (contrast and shift as measured) and "x_map" and "map_info" the map, which run()
+    reads the page on without measuring it again; otherwise "refused" says why the
+    map does not stand and the page is to be left as it was. "how" is "phase" and
+    "was" the reason of the refusal that was tried again.
+    """
+    P_lines = grid_lines["pitch"]
+    g0_lines = float(g0 + NUM_COLUMNS / 2 * (P - P_lines))
+    x_map, map_info = measure_column_mapping(
+        image_rotated,
+        g0_lines,
+        P_lines,
+        edges,
+        snap_offset=snap_offset,
+        median_mm=median_mm,
+    )
+    used = dict(grid_lines)
+    used["reason"] = ""
+    return {
+        "how": "phase",
+        "was": grid_lines["reason"],
+        "refused": _map_refusal(x_map, map_info),
+        "g0": g0_lines,
+        "P": P_lines,
+        "grid_lines": used,
+        "x_map": x_map,
+        "map_info": map_info,
+    }
+
+
+def rescue_grid_fit(
+    image_rotated,
+    signal_masks,
+    signal_positions,
+    pitch,
+    record,
+    was,
+    snap_offset=GRID_LINE_SNAP_OFFSET,
+    median_mm=COLUMN_MAPPING_MEDIAN_MM,
+):
+    """Second try of a page whose mask edges are off one uniform column grid.
+
+    fit_column_grid() gives no grid when the edges of a column are further off it than
+    GRID_RESIDUAL_TOLERANCE, and the page then falls back to --time_mapping bbox. The
+    fit is tried again with GRID_RESCUE_RESIDUAL_TOLERANCE, the grid lines refine that
+    grid as they refine every other, through rescue_grid_phase() if they are refused
+    by their origin, and the column map is measured on the result. The grid is kept
+    only if that map stands: a page whose edges are off the grid for another reason
+    than a distorted column has no map to show for it and stays as it was.
+    signal_masks, signal_positions, pitch and record are those of fit_column_grid(),
+    was the reason it failed with; snap_offset and median_mm are those of
+    measure_column_mapping().
+    Returns the dict of rescue_grid_phase() with "long_leads" of the fit added. "how"
+    is "fit", or "fit+phase" when the grid lines were tried again as well, and "g0"
+    and "P" are the grid after the lines, so run() does not refine it again. A second
+    try that does not get as far as a map has only "how", "was" and "refused".
+    """
+    # The second fit says nothing: its grid is in the line of the rescue, or dropped.
+    g0, P, long_leads, reason = fit_column_grid(
+        signal_masks,
+        signal_positions,
+        image_rotated.shape[1],
+        pitch,
+        record,
+        tolerance=GRID_RESCUE_RESIDUAL_TOLERANCE,
+        quiet=True,
+    )
+    if g0 is None:
+        return {"how": "fit", "was": was, "refused": f"second fit: {reason}"}
+    edges = column_mapping_edges(signal_masks, signal_positions, long_leads)
+    g0, P, grid_lines = refine_grid_from_lines(
+        image_rotated, g0, P, snap_offset=snap_offset
+    )
+    if _lines_refused_by_phase(grid_lines["reason"]):
+        rescue = rescue_grid_phase(
+            image_rotated, g0, P, grid_lines, edges, snap_offset, median_mm
+        )
+        rescue["how"] = "fit+phase"
+        rescue["was"] = f"{was}; {grid_lines['reason']}"
+    elif grid_lines["reason"]:
+        refused = f"grid lines: {grid_lines['reason']}"
+        return {"how": "fit", "was": was, "refused": refused}
+    else:
+        x_map, map_info = measure_column_mapping(
+            image_rotated, g0, P, edges, snap_offset=snap_offset, median_mm=median_mm
+        )
+        rescue = {
+            "how": "fit",
+            "was": was,
+            "refused": _map_refusal(x_map, map_info),
+            "g0": g0,
+            "P": P,
+            "grid_lines": grid_lines,
+            "x_map": x_map,
+            "map_info": map_info,
+        }
+    rescue["long_leads"] = long_leads
+    return rescue
+
+
+def grid_rescue_line(record, rescue):
+    """The line of a page --grid_rescue map tried again, rescued or refused.
+
+    rescue is the dict of rescue_grid_fit() or rescue_grid_phase(). A rescued page
+    names which check was tried again and the numbers of the map it is read on.
+    """
+    if rescue["refused"]:
+        return (
+            f"Grid rescue for record {record}: refused ({rescue['refused']}), page "
+            f"left as it is; {rescue['how']} tried again, was: {rescue['was']}"
+        )
+    map_info = rescue["map_info"]
+    return (
+        f"Grid rescue for record {record}: {rescue['how']}, read on the column map "
+        f"of the second try (g0 {rescue['g0']:.2f} px, P {rescue['P']:.2f} px, shift "
+        f"{map_info['shift']:.2f} px, windows {map_info['windows']}, agreement "
+        f"{map_info['agreement']:.3f}, origin offset "
+        f"{map_info['origin_offset']:+.2f} px); was: {rescue['was']}"
+    )
+
+
+def grid_rescue_qc(rescue):
+    """The grid_rescue column of qc.csv for a page of a run with --grid_rescue map.
+
+    "" for a page that failed no check that is tried again (rescue None), which check
+    was tried again for a rescued page, "refused: <reason>" for one that is left as
+    it is.
+    """
+    if rescue is None:
+        return ""
+    if rescue["refused"]:
+        return f"refused: {rescue['refused']}"
+    return rescue["how"]
+
+
+# Layout row of every short lead of the standard 3x4 page, from the top: the rows of
+# Y_SHIFT_RATIO in config.py. The rhythm strip is the row below them.
+LAYOUT_ROW = {
+    "I": 0,
+    "aVR": 0,
+    "V1": 0,
+    "V4": 0,
+    "II": 1,
+    "aVL": 1,
+    "V2": 1,
+    "V5": 1,
+    "III": 2,
+    "aVF": 2,
+    "V3": 2,
+    "V6": 2,
+}
+RHYTHM_ROW = 3
+NUM_ROWS = 4
+# A row band lower than this many pixel rows has no grid line profile to measure: a
+# tenth of the band of a row on a 200 dpi page.
+ROW_MAPPING_MIN_BAND_ROWS = 30
+# Width in grid millimetres of the running median of a row's displacement from the page
+# map (--row_mapping_median): two periods of the 13.5 mm ripple of grid lines snapped to
+# the pixels, where the page map takes one (COLUMN_MAPPING_MEDIAN_MM); the profile of a
+# row has about a sixth of the rows of the page under it. Chosen on the development
+# clean scans of the ECG-Image-Database (230 pages, --grid_rescue map and --row_mapping
+# lines against neither), where only these two widths were read: with 13.5 mm the
+# paired median gain of a lead is +1.33 dB (patient bootstrap 95 % CI 1.20 to 1.53) and
+# 295 leads are more than 1 dB worse; with 27 mm it is +1.39 dB (1.21 to 1.58) and 250
+# leads, and a PTB-XL diagnostic classifier changes 32 instead of 34 of its 1,150
+# record and class decisions (44 with neither flag).
+ROW_MAPPING_MEDIAN_MM = 27.0
+
+
+def lead_row(lead, long_leads):
+    """Layout row of a lead: RHYTHM_ROW for a rhythm strip, None for a lead in no row."""
+    if lead in long_leads:
+        return RHYTHM_ROW
+    return LAYOUT_ROW.get(lead)
+
+
+def _column_map_m(knots_m, knots_x, period, x):
+    """The grid millimetre of a trace x on a column map: _column_map_x() inverted."""
+    x = np.asarray(x, dtype=float)
+    m = np.interp(x, knots_x, knots_m)
+    m = np.where(x < knots_x[0], knots_m[0] + (x - knots_x[0]) / period, m)
+    return np.where(x > knots_x[-1], knots_m[-1] + (x - knots_x[-1]) / period, m)
+
+
+def measure_row_mapping(
+    image_rotated,
+    g0,
+    P,
+    signal_masks,
+    signal_positions,
+    long_leads,
+    map_info,
+    snap_offset=GRID_LINE_SNAP_OFFSET,
+    median_mm=ROW_MAPPING_MEDIAN_MM,
+):
+    """One x -> time map per layout row, measured against the column map of the page.
+
+    measure_column_mapping() sums the grid line profiles of all bands of rows, so its
+    map is the mean of the page. A printed and scanned sheet moves its rows against
+    each other by fractions of a pixel, and a lead follows the lines of its own row:
+    on development scans the lag left in a lead after the page map followed the
+    displacement of the printed grid in the band of its row (r -0.63 to -0.79). So the
+    lines are measured once more in the band of each row, and a row is given the page
+    map moved by what its own lines say.
+    Rows: 0 to 2 the short leads as LAYOUT_ROW has them, 3 the rhythm strip. The centre
+    of a row is the median over its leads of the median row of their mask pixels, its
+    band reaches halfway to the neighbouring centres and half a row spacing beyond the
+    outer ones. The band is cut into sub-bands of about GRID_LINE_BAND_HEIGHT rows,
+    each reduced to its median profile, and those whose comb is weaker than
+    GRID_LINE_MIN_BAND_AMPLITUDE of the median comb of the page's bands are left out.
+    The 1 mm offset of the windows of _column_mapping_windows() along that profile is
+    known modulo a line only, and the page map says which line: the displacement d of
+    a window is its line next to the page line at its centre, minus that page line.
+    A window is kept with a comb of COLUMN_MAPPING_MIN_WINDOW_AMPLITUDE of the row's
+    median and |d| within COLUMN_MAPPING_BRANCH_TOLERANCE of a line; d is smoothed with
+    a running median over median_mm grid millimetres (0 or less for none), and the
+    knots of the row are those of the page moved by d, held beyond the outer windows.
+    A row keeps the page map unless its windows cover COLUMN_MAPPING_MIN_COVERAGE of
+    those inside the columns its leads read, leave no stretch of COLUMN_MAPPING_MAX_GAP
+    columns there without one, and give knots that grow along x. A row whose lines are
+    further off the page map than the branch tolerance loses its windows that way and
+    stays on the page map, which is then off for it by that much: its reason says so.
+    image_rotated, g0, P and snap_offset are what measure_column_mapping() was called
+    with and map_info what it returned with its map; signal_masks, signal_positions
+    and long_leads are those of column_mapping_edges().
+    Returns a list of NUM_ROWS dicts: "accepted", "why" (the reason a row keeps the
+    page map), "x_map" (None unless accepted; as the map of measure_column_mapping()),
+    "knots_x", "windows" kept of "inside" the row's columns, "beyond" (windows with
+    lines further off than the branch tolerance), "coverage", "gap", "shift" (the
+    largest move of a sample the row reads, px), "columns" the row reads, "band" and
+    "d" (per column the median, smallest and largest move of its samples, px).
+    """
+    period = P / GRID_LINES_PER_COLUMN
+    knots_m = np.asarray(map_info["knots_m"], dtype=float)
+    knots_x = np.asarray(map_info["knots_x"], dtype=float)
+    nan = float("nan")
+    rows = [
+        {
+            "row": row,
+            "accepted": False,
+            "why": "",
+            "x_map": None,
+            "knots_x": None,
+            "windows": 0,
+            "inside": 0,
+            "beyond": 0,
+            "coverage": nan,
+            "gap": nan,
+            "shift": nan,
+            "columns": [],
+            "band": None,
+            "d": [(nan, nan, nan)] * NUM_COLUMNS,
+        }
+        for row in range(NUM_ROWS)
+    ]
+
+    def fail(why):
+        for out in rows:
+            out["why"] = why
+        return rows
+
+    # The rows of the layout, from the masks the page was cut into.
+    centres, read = {}, {}
+    for lead, mask in signal_masks.items():
+        if mask is None:
+            continue
+        row = lead_row(lead, long_leads)
+        if row is None:
+            continue
+        if row == RHYTHM_ROW:
+            lead_columns = range(NUM_COLUMNS)
+        else:
+            lead_columns = [
+                int(STANDARD_LEAD_OFFSETS_SEC[lead] / SHORT_SIGNAL_LENGTH_SEC)
+            ]
+        counts = (mask[0].numpy() > 0).sum(axis=1)
+        total = counts.sum()
+        if total == 0:
+            continue
+        # Median row of the mask pixels; pixel row r covers [r, r+1).
+        middle = int(np.searchsorted(np.cumsum(counts), total / 2))
+        centres.setdefault(row, []).append(signal_positions[lead]["y1"] + middle + 0.5)
+        read.setdefault(row, set()).update(lead_columns)
+    missing = [str(row) for row in range(NUM_ROWS) if row not in centres]
+    if missing:
+        return fail(f"row bands: no lead of row {' '.join(missing)}")
+    centre = np.array([np.median(centres[row]) for row in range(NUM_ROWS)])
+    if np.any(np.diff(centre) <= 0):
+        return fail("row bands: row centres not in order")
+    darkness = _darkness(image_rotated)
+    band_edges = np.clip(
+        np.r_[
+            centre[0] - (centre[1] - centre[0]) / 2,
+            (centre[1:] + centre[:-1]) / 2,
+            centre[-1] + (centre[-1] - centre[-2]) / 2,
+        ],
+        0,
+        darkness.shape[0],
+    )
+    page_profiles, _ = _band_profiles(darkness)
+    if page_profiles.shape[0] == 0:
+        return fail("image too small for the grid line profile")
+    page_weight = float(np.median(np.abs(_grid_line_comb(page_profiles, period))))
+    low = g0 - COLUMN_MAPPING_REACH * P
+    high = g0 + (NUM_COLUMNS + COLUMN_MAPPING_REACH) * P
+    # The columns as the page map places them, in the coordinate of the lines.
+    column_x = (
+        _column_map_x(
+            knots_m, knots_x, period, np.arange(NUM_COLUMNS + 1) * GRID_LINES_PER_COLUMN
+        )
+        + snap_offset
+    )
+    # Every sample of a column, as vectorise_grid() reads them.
+    samples_per_column = int(SHORT_SIGNAL_LENGTH_SEC * FREQUENCY)
+    column_mm = [
+        (column + np.arange(samples_per_column) / samples_per_column)
+        * GRID_LINES_PER_COLUMN
+        for column in range(NUM_COLUMNS)
+    ]
+    page_x = [_column_map_x(knots_m, knots_x, period, mm) for mm in column_mm]
+
+    def row_map(row_knots):
+        def x_map(m):
+            return _column_map_x(knots_m, row_knots, period, m)
+
+        return x_map
+
+    for out in rows:
+        row = out["row"]
+        out["columns"] = sorted(read[row])
+        out["band"] = (float(band_edges[row]), float(band_edges[row + 1]))
+        top, bottom = int(np.ceil(band_edges[row])), int(np.floor(band_edges[row + 1]))
+        height = bottom - top
+        if height < ROW_MAPPING_MIN_BAND_ROWS:
+            out["why"] = f"row band of {height} rows"
+            continue
+        count = max(1, height // GRID_LINE_BAND_HEIGHT)
+        band_height = height // count
+        profiles = np.array(
+            [
+                np.median(darkness[start : start + band_height], axis=0)
+                for start in top + np.arange(count) * band_height
+            ]
+        )
+        weights = np.abs(_grid_line_comb(profiles, period))
+        kept_bands = weights >= GRID_LINE_MIN_BAND_AMPLITUDE * page_weight
+        if not np.any(kept_bands):
+            out["why"] = "no grid lines in the row band"
+            continue
+        profile = profiles[kept_bands].sum(axis=0)
+        window_x, fine, _ = _column_mapping_windows(profile, period, low, high)
+        if window_x.size < 2:
+            out["why"] = "image too small for the row map"
+            continue
+        # Where the lines of the row are, modulo one line, against the page line next
+        # to the centre of every window.
+        offset = (-np.angle(fine) / (2 * np.pi) * period) % period
+        window_m = _column_map_m(knots_m, knots_x, period, window_x - snap_offset)
+        page_line = (
+            _column_map_x(knots_m, knots_x, period, np.round(window_m)) + snap_offset
+        )
+        d = (offset - page_line) % period
+        d = np.where(d > period / 2, d - period, d)
+        amplitude = np.abs(fine)
+        strong = (amplitude > 0) & (
+            amplitude >= COLUMN_MAPPING_MIN_WINDOW_AMPLITUDE * np.median(amplitude)
+        )
+        near = np.abs(d) <= COLUMN_MAPPING_BRANCH_TOLERANCE * period
+        kept = strong & near
+        in_column = [
+            (window_x >= column_x[column]) & (window_x <= column_x[column + 1])
+            for column in range(NUM_COLUMNS)
+        ]
+        inside = np.zeros(window_x.size, dtype=bool)
+        for column in out["columns"]:
+            inside |= in_column[column]
+        out["inside"] = int(np.count_nonzero(inside))
+        out["windows"] = int(np.count_nonzero(kept & inside))
+        out["coverage"] = out["windows"] / max(out["inside"], 1)
+        # Lines that are there but further off the page map than a branch can be told:
+        # the row then keeps the page map although it is displaced against it.
+        out["beyond"] = int(np.count_nonzero(strong & ~near & inside))
+        if np.count_nonzero(kept) < 2:
+            out["why"] = (
+                f"{out['beyond']} of {out['inside']} windows beyond the branch tolerance"
+                if out["beyond"]
+                else "no grid lines along the row"
+            )
+            continue
+        kept_m, kept_d = window_m[kept], d[kept]
+        if median_mm > 0:
+            # As for the page map: the ripple of lines snapped to the pixels is in the
+            # windows of the row and not in the smoothed page map, so it is in d.
+            kept_d = _running_median(kept_m, kept_d, median_mm)
+        row_knots = knots_x + np.interp(knots_m, kept_m, kept_d)
+        moved = [
+            _column_map_x(knots_m, row_knots, period, mm) - page
+            for mm, page in zip(column_mm, page_x)
+        ]
+        out["d"] = [
+            (float(np.median(part)), float(np.min(part)), float(np.max(part)))
+            for part in moved
+        ]
+        out["shift"] = float(
+            max(np.max(np.abs(moved[column])) for column in out["columns"])
+        )
+        # The longest stretch without a kept window, over every run of columns the row
+        # reads.
+        gap, kept_x = 0.0, window_x[kept]
+        for column in out["columns"]:
+            if column - 1 in out["columns"]:
+                continue
+            last = column
+            while last + 1 in out["columns"]:
+                last += 1
+            start, end = column_x[column], column_x[last + 1]
+            between = kept_x[(kept_x > start) & (kept_x < end)]
+            gap = max(gap, float(np.max(np.diff(np.r_[start, between, end])) / P))
+        out["gap"] = gap
+        out["knots_x"] = row_knots
+        if out["coverage"] < COLUMN_MAPPING_MIN_COVERAGE:
+            out["why"] = f"row keeps {100 * out['coverage']:.0f} % of its windows" + (
+                f", {out['beyond']} beyond the branch tolerance" if out["beyond"] else ""
+            )
+        elif gap > COLUMN_MAPPING_MAX_GAP:
+            out["why"] = f"row has a gap of {gap:.2f} columns"
+        elif np.any(np.diff(row_knots) <= 0):
+            out["why"] = "row map does not grow along x"
+        else:
+            out["accepted"] = True
+            out["x_map"] = row_map(row_knots)
+    return rows
+
+
+def row_mapping_line(record, out):
+    """The --verbose line of one row of measure_row_mapping()."""
+    verdict = "own map" if out["accepted"] else f"page map kept ({out['why']})"
+    moves = " ".join(
+        f"c{column + 1} "
+        + ("-" if np.isnan(median) else f"{median:+.2f}/{low:+.2f}/{high:+.2f}")
+        for column, (median, low, high) in enumerate(out["d"])
+    )
+    return (
+        f"Row mapping for record {record}: row {out['row']} {verdict}, windows "
+        f"{out['windows']}/{out['inside']}, move against the page map "
+        f"(median/min/max per column) {moves} px"
+    )
+
+
 def vectorise_grid(
     image_rotated,
     mask,
@@ -3217,6 +3798,8 @@ def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
         "trace_shift_rows",
         "column_mapping",
         "column_mapping_shift_px",
+        "grid_rescue",
+        "row_mapping",
     ]
     write_header = not os.path.exists(qc_path)
     with open(qc_path, "a", newline="") as f:
@@ -3291,6 +3874,19 @@ def run(args):
     # Run the team's models on the Challenge data.
     if args.verbose:
         print("Running digitization model...")
+
+    # --grid_rescue map decides on the column map, so it needs the flags the map needs.
+    grid_rescue_on = (
+        args.grid_rescue == "map"
+        and args.time_mapping == "grid"
+        and args.grid_origin == "lines"
+        and args.column_mapping == "lines"
+    )
+    if args.grid_rescue == "map" and not grid_rescue_on:
+        print(
+            "Grid rescue is off for this run: --grid_rescue map needs --time_mapping "
+            "grid, --grid_origin lines and --column_mapping lines."
+        )
 
     # Iterate over the records.
     image_files = [
@@ -3531,6 +4127,11 @@ def run(args):
         g0, P, long_leads = None, None, []
         grid_lines = {"contrast": float("nan"), "shift": float("nan")}
         baseline_scale = 1.0
+        # --grid_rescue map: the second try of a page that failed a check of the grid,
+        # None for a page that failed none, and the column map of a rescued page. Such
+        # a page takes its grid, its grid lines and that map from the second try; a
+        # refused one goes on as without the flag.
+        rescue, rescued_map = None, None
         if args.time_mapping == "grid":
             g0, P, long_leads, reason = fit_column_grid(
                 signal_masks_cropped,
@@ -3539,16 +4140,48 @@ def run(args):
                 args.grid_pitch,
                 record,
             )
+            if grid_rescue_on and g0 is None and _fit_failed_on_edges(reason):
+                rescue = rescue_grid_fit(
+                    image_rotated,
+                    signal_masks_cropped,
+                    signal_positions_cropped,
+                    args.grid_pitch,
+                    record,
+                    reason,
+                    snap_offset=args.grid_line_offset,
+                    median_mm=args.column_mapping_median,
+                )
+                if not rescue["refused"]:
+                    g0, P, long_leads = rescue["g0"], rescue["P"], rescue["long_leads"]
             if g0 is None:
                 print(
                     f"WARNING: no column grid for record {record} ({reason}), "
                     f"falling back to --time_mapping bbox."
                 )
             else:
-                if args.grid_origin == "lines":
+                if args.grid_origin == "lines" and rescue is None:
                     g0, P, grid_lines = refine_grid_from_lines(
                         image_rotated, g0, P, snap_offset=args.grid_line_offset
                     )
+                    if grid_rescue_on and _lines_refused_by_phase(grid_lines["reason"]):
+                        rescue = rescue_grid_phase(
+                            image_rotated,
+                            g0,
+                            P,
+                            grid_lines,
+                            column_mapping_edges(
+                                signal_masks_cropped, signal_positions_cropped, long_leads
+                            ),
+                            snap_offset=args.grid_line_offset,
+                            median_mm=args.column_mapping_median,
+                        )
+                        if not rescue["refused"]:
+                            g0, P = rescue["g0"], rescue["P"]
+                if rescue is not None and not rescue["refused"]:
+                    # Neither is measured again: the map is what the page was kept on.
+                    grid_lines = rescue["grid_lines"]
+                    rescued_map = rescue["x_map"], rescue["map_info"]
+                if args.grid_origin == "lines":
                     if grid_lines["reason"]:
                         print(
                             f"WARNING: grid lines not used for record {record} "
@@ -3559,6 +4192,10 @@ def run(args):
                 baseline_scale = P / (image_rotated.shape[1] * PAGE_PITCH_RATIO)
                 if args.verbose:
                     print(f"Column grid for record {record}: g0 {g0:.2f} px, P {P:.2f} px")
+            # A rescued page says so with or without --verbose, as the WARNING of the
+            # check it failed would have; a refused one has printed that WARNING.
+            if rescue is not None and (args.verbose or not rescue["refused"]):
+                print(grid_rescue_line(record, rescue))
         mm_per_pixel = 25 * sec_per_pixel
         mV_per_pixel = mm_per_pixel / 10
         # The ink of the page, read once for all its leads. Only the grid sampling
@@ -3602,7 +4239,8 @@ def run(args):
                 if args.verbose:
                     print(f"Column mapping for record {record}: {column_mapping}")
             else:
-                x_map, map_info = measure_column_mapping(
+                # A rescued page has its map already, the one it was rescued on.
+                x_map, map_info = rescued_map or measure_column_mapping(
                     image_rotated,
                     g0,
                     P,
@@ -3638,6 +4276,30 @@ def run(args):
                         + "/".join(f"{s:.2f}" for s in map_info["column_shift"])
                         + " px"
                     )
+        # One map per layout row, on a page that is read on its column map.
+        row_maps, row_mapping = {}, "off"
+        if args.row_mapping == "lines":
+            if x_map is None:
+                row_mapping = "page map not used"
+                if args.verbose:
+                    print(f"Row mapping for record {record}: {row_mapping}")
+            else:
+                rows = measure_row_mapping(
+                    image_rotated,
+                    g0,
+                    P,
+                    signal_masks_cropped,
+                    signal_positions_cropped,
+                    long_leads,
+                    map_info,
+                    snap_offset=args.grid_line_offset,
+                    median_mm=args.row_mapping_median,
+                )
+                row_maps = {out["row"]: out["x_map"] for out in rows if out["accepted"]}
+                row_mapping = f"lines {len(row_maps)}/{NUM_ROWS}"
+                if args.verbose:
+                    for out in rows:
+                        print(row_mapping_line(record, out))
         signals_predicted = {}
         for lead, mask in signal_masks_cropped.items():
             if mask is None:
@@ -3684,7 +4346,8 @@ def run(args):
                     info=ink,
                     x_shift=x_shift,
                     sharpen=args.sharpen,
-                    x_map=x_map,
+                    # The map of the lead's row, or the page map where it has none.
+                    x_map=row_maps.get(lead_row(lead, long_leads), x_map),
                 )
                 if ink:
                     ink_measured.append(ink)
@@ -3802,6 +4465,8 @@ def run(args):
         qc["trace_shift_rows"] = trace_shift_rows
         qc["column_mapping"] = column_mapping
         qc["column_mapping_shift_px"] = column_mapping_shift
+        qc["grid_rescue"] = grid_rescue_qc(rescue) if grid_rescue_on else "off"
+        qc["row_mapping"] = row_mapping
         append_qc_row(
             args.output_folder, record, args.lead_placement, qc, max_offset_deviation
         )
