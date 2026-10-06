@@ -335,25 +335,28 @@ def get_parser():
             "straight enough already; off = keep the rotated page."
         ),
     )
-    # GRID_LINE_MAX_SLOPE_RESIDUAL and parse_perspective_tolerance() are defined below
-    # as well.
+    # PERSPECTIVE_TOLERANCE and parse_perspective_tolerance() are defined below as well.
     parser.add_argument(
         "--perspective_tolerance",
         type=parse_perspective_tolerance,
-        default=GRID_LINE_MAX_SLOPE_RESIDUAL,
+        default=PERSPECTIVE_TOLERANCE,
         help=(
             "Only for --perspective lines. The largest residual of the grid line fit "
             "that the perspective stage accepts, as a share of the period of the "
-            "lines it measures on, from 0.1 to 0.5. 0.1 (default) = the tolerance the "
-            "stage has always had: a page above it keeps the rotated page, with a "
-            "warning. The grid of a printed and scanned sheet is not exactly the "
-            "projective image of a square one, so its fit can end a little above "
-            "0.1, and a larger value rectifies such a page. Only the perspective "
-            "stage of the run takes the value: the rotation stage keeps 0.1, and so "
-            "does the paper normalisation where it decides whether the stages read a "
-            "page as it is. A page that is rectified above 0.1 is in another frame "
-            "than without the flag, so a mask saved for it without the flag does not "
-            "fit; --verbose names such a page in one line, and the QC column "
+            "lines it measures on, from 0.1 to 0.5: a page above it keeps the rotated "
+            "page, with a warning. 0.15 (default): the grid of a printed and scanned "
+            "sheet is not exactly the projective image of a square one, so its fit "
+            "can end a little above 0.1, and such a page is rectified; on photographs "
+            "a page it rectifies can read worse (README). 0.1 = the "
+            "tolerance of the stage itself, the reading before 0.15 became the "
+            "default, which reproduces older outputs. Only the perspective stage of "
+            "the run takes the value: the rotation stage keeps 0.1, and so does the "
+            "paper normalisation where it decides whether the stages read a page as "
+            "it is. A page that is rectified above 0.1 is in another frame than at "
+            "0.1, so a mask saved for it at 0.1 does not fit, and a run that did not "
+            "name the flag saved its masks at 0.1 before 0.15 became the default: "
+            "read those with --perspective_tolerance 0.1. --verbose names a page that "
+            "is accepted above 0.1 in one line, and the QC column "
             "perspective_residual_rel holds its residual."
         ),
     )
@@ -1311,14 +1314,31 @@ PERSPECTIVE_MASK_SHIFT_TOLERANCE = 0.1
 # to, so no residual is above half a period and a tolerance beyond it means nothing.
 # The smallest is GRID_LINE_MAX_SLOPE_RESIDUAL, the tolerance of the stage itself.
 PERSPECTIVE_MAX_TOLERANCE = 0.5
+# Largest residual, relative to the carrier period, that the perspective stage of run()
+# accepts unless --perspective_tolerance says otherwise: the default of the flag, and
+# of nothing else. The tolerance of the stage itself stays GRID_LINE_MAX_SLOPE_RESIDUAL,
+# 0.1: the rotation stage, the chain of the paper normalisation and a call of
+# estimate_perspective() without a tolerance read that, and it was the default of the
+# flag before this one, so --perspective_tolerance 0.1 gives the run of before, with
+# its outputs and the frame its masks were predicted in. The grid of a printed and
+# scanned sheet is not exactly the projective image of a square one, so its fit can
+# end a little above 0.1. Chosen on the development clean scans of the
+# ECG-Image-Database (230 pages, read with --grid_rescue map and --row_mapping lines):
+# the stage refuses 24 of them at 0.1, with a residual of 0.100 to 0.139 of the period,
+# and rectifies all 24 at 0.15, where their median page SNR is 13.92 instead of 5.49 dB
+# and none is more than 1 dB worse. On the mould-damaged scans and the photographs of
+# that set it moves 189 pages into another frame, and 6 of the 89 scans and 20 of the
+# 100 photographs among them lose more than 1 dB of page SNR (README, Results on real
+# pages).
+PERSPECTIVE_TOLERANCE = 0.15
 
 
 def parse_perspective_tolerance(text):
     """The value of --perspective_tolerance, for argparse.
 
-    A share of the carrier period from GRID_LINE_MAX_SLOPE_RESIDUAL, the tolerance the
-    perspective stage has without the flag, to PERSPECTIVE_MAX_TOLERANCE: the flag only
-    widens the stage. Anything else, a text that is no number or NaN included, is an
+    A share of the carrier period from GRID_LINE_MAX_SLOPE_RESIDUAL, the tolerance of
+    the perspective stage itself, to PERSPECTIVE_MAX_TOLERANCE: the flag only widens
+    the stage. Anything else, a text that is no number or NaN included, is an
     argparse error that says so.
     """
     try:
@@ -1672,8 +1692,9 @@ def estimate_perspective(image, tolerance=None):
     the corners are no longer washed out, and the two are composed.
     tolerance is the largest residual the fit of a round is kept at, relative to its
     carrier period: GRID_LINE_MAX_SLOPE_RESIDUAL, which the rotation stage reads as
-    well, unless given (--perspective_tolerance). The grid of a printed and scanned
-    sheet is not exactly projective, and its fit can be a little above that.
+    well, unless given, as run() gives the one of --perspective_tolerance when it is
+    above that (PERSPECTIVE_TOLERANCE by default). The grid of a printed and scanned
+    sheet is not exactly projective, and its fit can be a little above the constant.
     Returns (H_rect, info). H_rect is None when info["reason"] says why the grid lines
     gave no homography, and also, with an empty reason, when the page is straight
     enough to be left alone. info["residual"] is the residual of the last round in
@@ -1725,9 +1746,10 @@ def perspective_tolerance_line(record, tolerance, info, applied):
 
     info is the info of estimate_perspective() at that tolerance, of a fit that was
     accepted with a residual above GRID_LINE_MAX_SLOPE_RESIDUAL of the period in one
-    of its rounds: without the flag the stage refuses the page. applied says whether
-    the page is warped by the homography of the fit, which puts it in another frame
-    than without the flag, or is left alone inside the dead band.
+    of its rounds: at the tolerance of the stage itself, --perspective_tolerance 0.1,
+    the page is refused. applied says whether the page is warped by the homography of
+    the fit, which puts it in another frame than at that tolerance, or is left alone
+    inside the dead band.
     """
     done = "homography applied" if applied else "inside the dead band, page kept"
     return (
@@ -1994,10 +2016,11 @@ def paper_chain(image):
     read is one the paper normalisation has to leave alone.
     Returns (info, stages). info holds the numbers and the reasons of the three stages,
     and info["ok"] says that none of them fell back, which is the page run() prints no
-    "grid lines not used" warning for. stages holds what the stages returned, so that
-    run() need not measure the same page a second time: the resampled page and its
-    info, the angle as estimate_rotation() gave it, None or NaN included, and its info,
-    the page the perspective was measured on, and its homography and info.
+    "grid lines not used" warning for at --perspective_tolerance 0.1. stages holds what
+    the stages returned, so that run() need not measure the same page a second time:
+    the resampled page and its info, the angle as estimate_rotation() gave it, None or
+    NaN included, and its info, the page the perspective was measured on, and its
+    homography and info.
     """
     rescaled, resolution_info = normalise_resolution(image)
     info = {
@@ -4147,8 +4170,9 @@ def run(args):
                 # Measured by the paper stage already, on the page in that frame.
                 H_rect, perspective_info = stages["H_rect"], stages["perspective_info"]
             else:
-                # The tolerance goes along only when the flag widens the stage:
-                # without it this is the call it always was.
+                # The tolerance goes along only when it widens the stage, as the
+                # default of the flag does: at --perspective_tolerance 0.1 this is
+                # the call it always was.
                 asked = {"tolerance": tolerance} if widened else {}
                 H_rect, perspective_info = estimate_perspective(measured, **asked)
             if perspective_info["reason"]:
@@ -4164,8 +4188,9 @@ def run(args):
                     f"{perspective_info['period']:.2f} px, "
                     f"windows {perspective_info['windows']}"
                 )
-                # A fit that only the flag let through: the stage itself refuses it,
-                # so a run without the flag never prints this.
+                # A fit that only a tolerance above the one of the stage let through:
+                # the stage itself refuses it, so a run at --perspective_tolerance 0.1
+                # never prints this.
                 if (
                     widened
                     and not perspective_info["reason"]

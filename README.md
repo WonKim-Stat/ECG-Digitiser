@@ -271,8 +271,9 @@ lines falls back to the behaviour without them if the page shows none.
    from the top to the bottom of the page.
 4. **Perspective:** the shear and the perspective that the phase field of the grid lines
    shows are taken out, in the same warp as the rotation. A page whose grid lines are
-   more than a tenth of their period off the fit is kept as it was rotated, with a
-   `WARNING`; `--perspective_tolerance` accepts a larger share.
+   more than 0.15 of their period off the fit is kept as it was rotated, with a
+   `WARNING`. `--perspective_tolerance 0.1` keeps every page above a tenth as it was
+   rotated, the reading before 0.15 became the default.
 5. **Segmentation:** nnU-Net predicts the lead masks of the corrected page.
 6. **Column grid:** all leads are put on one shared column grid, with the column pitch
    from the page height, the origin refined to sub-pixel accuracy on the grid lines and
@@ -303,11 +304,11 @@ lines falls back to the behaviour without them if the page shows none.
 
 | Flag | Choices | Default | What it does |
 | --- | --- | --- | --- |
-| `--paper_normalisation` | `off`, `auto` | `auto` | `auto` puts a photographed page into the frame the model was trained on, before every other stage and on the signals of the image alone. A page whose printed grid lines the resolution, the rotation and the perspective stage all read as it is is left as it is (`pass_chain`), and so is one without a background to find a paper edge in: the image reaches at most 8 mm beyond a Letter sheet, or no paper edge is found and the grid is within 12 mm of the border on all four sides, or the paper found covers 95 % of the image (`pass_fullframe`). Otherwise the four edges of the sheet are looked for (the region of the red grid, then in 24 bands per side the step from the print or its white margin to the background, then each side again at full resolution) and the sheet is warped in one bicubic pass onto a US Letter landscape page at 200 dpi (2200 × 1700 px), long side horizontal, in the orientation that puts the trace ink in the lower part, and scaled so that the 1 mm grid has the period it has on a scanned printout, 0.954 × 200 dpi (`normalised`). A page whose paper is not found, runs off the image or gives an implausible sheet or grid is kept, with a `WARNING` (`failed`); such a page, or a `pass_fullframe` one, whose grid the resolution stage could not read while the extent of its grid says it is more than 12 % above 200 dpi of paper is shrunk to that and not rectified, with a `WARNING` as well (`scaled`). The curl of a sheet is not taken out, and the print gets the scale of the frame, not its position. A page without a readable grid is not told from a photograph by its content, as in the view builder: a blank page is `pass_fullframe`, and a large image without a grid, blank or with content that looks like a sheet at the scale of a photograph (4000 × 3000 px, say), is taken to show a whole Letter sheet and shrunk to 200 dpi of it (`scaled`). The stage is the image code of the view builder that made the photograph results of the quality control section, function for function, with the thresholds chosen there on the 345 development photographs of the ECG-Image-Database (115 records, three photo conditions; references below the table). With that builder, outside this repository, 301 of those pages were normalised, 22 scaled, 12 passed and 10 failed; scored per lead against PTB-XL, the median lead SNR of the three conditions rose from −6.20, −3.63 and −4.53 dB to −1.87, −1.10 and −0.52 dB (paired median, pooled over the three, +3.71 dB, 95 % CI 2.87 to 4.41; +3.55 dB with the time axis left uniform, so from the normalisation alone), a PTB-XL diagnostic classifier changed 26.3, 32.7 and 30.6 % instead of 47.5, 51.3 and 40.2 % of its record and class decisions against the digital signal, and the 903 rendered pages, scans and synthetic pages it was checked on were all left as they are. So photographs are read better, not well: most of what is left is the time axis of a sheet that does not lie flat. The stage itself, run on those 345 pages with their saved masks, gives the same view, pixel for pixel, and the same signals, byte for byte, so these numbers are its numbers. With the flag itself, the 575 rendered and scanned development pages of that database and all 208 synthetic pages (every page of the results below included) were left as they are and keep byte identical signals. On a page that is left as it is, with `--resolution`, `--rotation` and `--perspective` at `lines`, the three stages are measured once and used twice, and the stage costs about 0.1 s (the digests of the page); with one of them set otherwise the stages are measured a second time, 1 to 4 s per page on generator pages, and a synthetic 12-megapixel photograph takes 5 to 8 s. What was done to a page is recorded next to its mask, see below the table. `off` takes the page as it is, the behaviour before `auto` became the default. |
+| `--paper_normalisation` | `off`, `auto` | `auto` | `auto` puts a photographed page into the frame the model was trained on, before every other stage and on the signals of the image alone. A page whose printed grid lines the resolution, the rotation and the perspective stage all read as it is is left as it is (`pass_chain`), and so is one without a background to find a paper edge in: the image reaches at most 8 mm beyond a Letter sheet, or no paper edge is found and the grid is within 12 mm of the border on all four sides, or the paper found covers 95 % of the image (`pass_fullframe`). Otherwise the four edges of the sheet are looked for (the region of the red grid, then in 24 bands per side the step from the print or its white margin to the background, then each side again at full resolution) and the sheet is warped in one bicubic pass onto a US Letter landscape page at 200 dpi (2200 × 1700 px), long side horizontal, in the orientation that puts the trace ink in the lower part, and scaled so that the 1 mm grid has the period it has on a scanned printout, 0.954 × 200 dpi (`normalised`). A page whose paper is not found, runs off the image or gives an implausible sheet or grid is kept, with a `WARNING` (`failed`); such a page, or a `pass_fullframe` one, whose grid the resolution stage could not read while the extent of its grid says it is more than 12 % above 200 dpi of paper is shrunk to that and not rectified, with a `WARNING` as well (`scaled`). The curl of a sheet is not taken out, and the print gets the scale of the frame, not its position. A page without a readable grid is not told from a photograph by its content, as in the view builder: a blank page is `pass_fullframe`, and a large image without a grid, blank or with content that looks like a sheet at the scale of a photograph (4000 × 3000 px, say), is taken to show a whole Letter sheet and shrunk to 200 dpi of it (`scaled`). The stage is the image code of the view builder that made the photograph results of the quality control section, function for function, with the thresholds chosen there on the 345 development photographs of the ECG-Image-Database (115 records, three photo conditions; references below the table). With that builder, outside this repository, 301 of those pages were normalised, 22 scaled, 12 passed and 10 failed; scored per lead against PTB-XL, the median lead SNR of the three conditions rose from −6.20, −3.63 and −4.53 dB to −1.87, −1.10 and −0.52 dB (paired median, pooled over the three, +3.71 dB, 95 % CI 2.87 to 4.41; +3.55 dB with the time axis left uniform, so from the normalisation alone), a PTB-XL diagnostic classifier changed 26.3, 32.7 and 30.6 % instead of 47.5, 51.3 and 40.2 % of its record and class decisions against the digital signal, and the 903 rendered pages, scans and synthetic pages it was checked on were all left as they are. So photographs are read better, not well: most of what is left is the time axis of a sheet that does not lie flat. The stage itself, run on those 345 pages with their saved masks, gives the same view, pixel for pixel, and the same signals, byte for byte, so these numbers are its numbers. With the flag itself, the 575 rendered and scanned development pages of that database and all 208 synthetic pages (every page of the results below included) were left as they are and keep byte identical signals. On a page that is left as it is, with `--resolution`, `--rotation` and `--perspective` at `lines`, the three stages are measured once and used twice, and the stage costs about 0.1 s (the digests of the page); only the perspective of a page whose grid line fit was refused in that first measurement is measured again, at `--perspective_tolerance`, when that is above 0.1, as its default is; with one of them set otherwise the stages are measured a second time, 1 to 4 s per page on generator pages, and a synthetic 12-megapixel photograph takes 5 to 8 s. What was done to a page is recorded next to its mask, see below the table. `off` takes the page as it is, the behaviour before `auto` became the default. |
 | `--resolution` | `keep`, `lines` | `lines` | `lines` resamples the page so that the printed 1 mm grid lines have the period of a 200 dpi page, the scale the model was trained on. A page within about a tenth of that scale keeps its pixels, because resampling it costs more than the scale does. |
 | `--rotation` | `hough`, `lines` | `lines` | `lines` refines a 0.1° Hough angle with the phase drift of the grid lines, which resolves fractions of a degree. `hough` is the Hough transform of the page in whole degrees only. |
 | `--perspective` | `off`, `lines` | `lines` | `lines` takes the shear and the perspective that the grid lines show out of the rotated page, and leaves a page alone that is straight enough already. `off` keeps the rotated page. |
-| `--perspective_tolerance` | a share of the grid line period, `0.1` to `0.5` | `0.1` | Only for `--perspective lines`: the largest residual of the grid line fit that the perspective stage accepts, as a share of the period of the lines it measures on. `0.1` is the tolerance the stage has always had: a page whose fit is above it keeps the rotated page, with a `WARNING`. The grid of a printed and scanned sheet is not exactly the projective image of a square one, so the fit of such a page can end a little above 0.1, and a larger value rectifies it. Only the perspective stage of the run takes the value. The rotation stage keeps 0.1, and so does `--paper_normalisation auto` where it decides whether the stages read a page as it is, so the decisions of the paper normalisation are those without the flag. A value below 0.1 or above 0.5 is refused when the arguments are read: the flag only widens the stage. A page that is rectified with a residual above 0.1 is in another frame than without the flag, so a mask saved for it without the flag does not fit, and `--mask_folder` says so with its frame `WARNING`. `--verbose` names such a page in one line, `Perspective for record <record>: accepted at --perspective_tolerance <k>, residual <share> of the period (the stage's own tolerance is 0.1), homography applied`, or `…, inside the dead band, page kept` for a page that is accepted and straight enough to be left alone, and `qc.csv` holds the share in `perspective_residual_rel`. Development-set numbers and limits are under *Results on real pages* below. |
+| `--perspective_tolerance` | a share of the grid line period, `0.1` to `0.5` | `0.15` | Only for `--perspective lines`: the largest residual of the grid line fit that the perspective stage accepts, as a share of the period of the lines it measures on. A page whose fit is above it keeps the rotated page, with a `WARNING`. `0.1` is the tolerance of the stage itself. The grid of a printed and scanned sheet is not exactly the projective image of a square one, so the fit of such a page can end a little above 0.1, and the default, `0.15`, rectifies it. Only the perspective stage of the run takes the value. The rotation stage keeps 0.1, and so does `--paper_normalisation auto` where it decides whether the stages read a page as it is, so the decisions of the paper normalisation are those at 0.1. A value below 0.1 or above 0.5 is refused when the arguments are read: the flag only widens the stage. A page that is rectified with a residual above 0.1 is in another frame than at 0.1, so a mask saved for it at 0.1 does not fit, and `--mask_folder` says so with its frame `WARNING`; what that means for masks saved before 0.15 became the default is below the table. `--verbose` names a page that is accepted above 0.1 in one line, `Perspective for record <record>: accepted at --perspective_tolerance <k>, residual <share> of the period (the stage's own tolerance is 0.1), homography applied`, or `…, inside the dead band, page kept` for a page that is accepted and straight enough to be left alone, and `qc.csv` holds the share in `perspective_residual_rel`. Development-set numbers and limits are under *Results on real pages* below: the scans gain, though 6 of the 89 mould-damaged scans that 0.15 moves into another frame lose more than 1 dB of page SNR, and so do 20 of the 100 photographs it moves, where the change of the classifier's decisions has an interval that includes zero. `0.1` is the reading before `0.15` became the default: it reproduces older outputs, and it is the frame that masks saved without the flag before the change were predicted in. |
 | `--time_mapping` | `bbox`, `grid` | `grid` | `grid` samples all leads on one shared column grid, for the standard 3x4 layout with rhythm strip. `bbox` stretches the bounding box of every lead to its length. |
 | `--grid_pitch` | `page`, `fit` | `page` | Where the column pitch of that grid comes from: `page` from the page height, checked against the least squares fit of the column edges, `fit` from that fit. |
 | `--grid_origin` | `masks`, `lines` | `lines` | `lines` refines origin and pitch of the column grid on the printed grid lines, assuming the first column starts on a grid line. `masks` uses the mask edges only. |
@@ -370,6 +371,27 @@ the record that has another size than its page stops the run as it always did
 was used as given: the page to give then is the view the mask was predicted on. With
 `--mask_folder` and `--save_mask` together the record is written out again unchanged.
 
+The frame of a mask also depends on `--perspective_tolerance`. A page whose perspective
+fit lies between 0.1 and 0.15 of the grid line period was kept as it was rotated while
+0.1 was the default; now it is rectified, unless it is straight enough to be left
+alone. A mask that a run without the flag saved for such a page before 0.15 became the
+default was therefore predicted in another frame than a run with the defaults puts the
+page in. The run does not stop for that: it prints
+`WARNING: mask of record <record> was predicted in a frame whose corners are <distance> px off the one used now; the mask does not fit.`
+and reads the page with a mask that does not fit it. The warning compares the frame
+recorded in `<record>_mask.json`, so a mask folder without that file gets no warning.
+Read a mask folder that was saved at 0.1, with or without those files, with
+`--perspective_tolerance 0.1`, which gives the frames and the signals it gave before;
+masks saved at 0.15 are read at 0.15. A mask that is saved again by a run with
+`--mask_folder` and `--save_mask` carries the frame of that run in its JSON, whatever
+frame it was predicted in, so do not save masks of before the change again under the
+default. On the development set of the ECG-Image-Database named below, the pages in
+another frame at 0.15 are 24 of the 230 clean scans, 89 of the 230 mould-damaged scans
+and 100 of the 345 photographs, and none of the 115 rendered pages. The mask of every
+other page fits at either tolerance: a page whose fit is within 0.1, one that is
+refused at 0.15 as well, and one that is accepted above 0.1 but straight enough to be
+left alone are in the same frame at both.
+
 The real-page numbers in the table, in the quality control section and under *Results on
 real pages* below are on the ECG-Image-Database, version 2
 (<https://www.kaggle.com/datasets/physionet/ecg-image-database>), whose images are
@@ -377,8 +399,11 @@ licensed CC BY-ND 4.0, so only aggregate numbers are given here. Those in the ta
 in the quality control section were measured before `--grid_rescue map` and
 `--row_mapping lines` became the defaults: unless it says otherwise (the row of
 `--row_mapping_median` does), they are read with `--grid_rescue off --row_mapping off`.
-What the two flags change on the same pages is under *Results on real pages*. The
-dataset page asks for these citations:
+What the two flags change on the same pages is under *Results on real pages*. And
+every real-page number that is not about `--perspective_tolerance` itself (the numbers
+in the table, those of the quality control section, the evaluation-set numbers and the
+paragraphs on the two flags) was measured before 0.15 became the default of that flag,
+and is read at 0.1. The dataset page asks for these citations:
 
 1. M. A. Reyna et al., "ECG-Image-Database: large-scale paired ECG images and time-series
    with real-world artifacts; a foundation for computerized ECG digitization and
@@ -423,10 +448,11 @@ columns:
   causes on the page, `perspective_residual_px`, the residual of its fit, and
   `perspective_residual_rel`, the residual as a share of the grid line period it was
   measured on, the largest of the rounds of the fit (NaN when the stage did not
-  measure or its fit got no residual). It is the number the stage compares with its
-  tolerance, 0.1 or `--perspective_tolerance`, so it reads the same on pages of any
+  measure or its fit got no residual). It is the number the stage compares with
+  `--perspective_tolerance`, 0.15 by default, so it reads the same on pages of any
   grid line period, and a share above 0.1 on a page without a `WARNING` for the
-  perspective is a page that only the flag let through. This column is the 35th,
+  perspective is a page that the stage's own tolerance of 0.1 refuses and only the
+  wider one lets through, as `--verbose` says of it in one line. This column is the 35th,
   appended after `row_mapping`, so no column that was there moves; as for
   `paper_normalisation`, do not append to a `qc.csv` written by an older version, but
   use a fresh output folder.
@@ -496,7 +522,7 @@ was fitted on the development set of the ECG-Image-Database named above (115 rec
 the highest ratio that flags at least 90 % of the clean colour and greyscale scans whose
 page SNR (the median SNR of their 12 leads, a missing lead counting as the lowest) is
 below 12 dB, 0.17976, rounded down to 0.1797. On that set, read with the defaults but
-for `--grid_rescue off --row_mapping off`, it
+for `--grid_rescue off --row_mapping off --perspective_tolerance 0.1`, it
 flags 56 of these 62 scans and 57 of the 168 others, so 57 of the 113 flagged clean scans
 are at or above 12 dB (AUROC 0.880 over the pairs of a scan below and a scan above 12 dB
 of the same scan type, patient bootstrap 95 % CI 0.817 to 0.932). These numbers are
@@ -536,14 +562,18 @@ not flag.
 
 #### Results on real pages
 
-`--grid_rescue map` and `--row_mapping lines` are the defaults since this change; both
-were `off` before it. The numbers here are **development-set numbers**: the tolerance
-of the second fit, the pitch of the second try and the width of the row median were
-chosen on these pages, and the evaluation set of the database has not been read with
-either flag. They are on the 230 clean colour and greyscale scans of the development set
-of the ECG-Image-Database (115 PTB-XL records, split by patient; references above), read
-from saved masks, scored per lead against PTB-XL, and compared, paired on record and
-lead, with the same pages read with `--grid_rescue off --row_mapping off`.
+`--grid_rescue map` and `--row_mapping lines` are the defaults; both were `off` before
+they became that. The numbers on the two flags, in this and the next four paragraphs,
+were all read at `--perspective_tolerance 0.1`, the tolerance of the perspective stage
+itself and the reading when they were made; what 0.15, the default now, changes on the
+same pages is at the end of this section. The numbers here are **development-set
+numbers**: the tolerance of the second fit, the pitch of the second try and the width
+of the row median were chosen on these pages, and the evaluation set of the database
+has not been read with either flag. They are on the 230 clean colour and greyscale
+scans of the development set of the ECG-Image-Database (115 PTB-XL records, split by
+patient; references above), read from saved masks, scored per lead against PTB-XL, and
+compared, paired on record and lead, with the same pages read with
+`--grid_rescue off --row_mapping off`.
 
 With both flags as they are given above (row median 27 mm), the median lead SNR of the
 scans rises from 13.24 to 15.02 dB (paired median +1.39 dB, patient bootstrap 95 % CI
@@ -594,29 +624,100 @@ with the rescue alone), 382 instead of 402 of the 1,452 that the digital signal 
 at least 1 logit from the threshold, and the mean absolute change of its class
 probabilities falls by 0.0085 (0.0049 to 0.0127). Both kinds of page stay far from the
 digital signal with the flags or with both `off` (median lead SNR below 1 dB on the
-mould-damaged scans and below 0 dB on the photographs), and so few of them print no
-`WARNING` of a stage (59 mould-damaged scans, 16 photographs) that the last reading
-above cannot be made there.
+mould-damaged scans and below 0 dB on the photographs), and at
+`--perspective_tolerance 0.1` so few of them print no `WARNING` of a stage (59
+mould-damaged scans, 16 photographs) that the last reading above stands on few pages
+there; it is given below, next to the one at 0.15.
 
-`--perspective_tolerance` is not a default: it stays at 0.1, the tolerance the
-perspective stage has always had. On the same 230 clean scans, read with
-`--grid_rescue map --row_mapping lines` and `--perspective_tolerance 0.15` and compared
-with the same reading at 0.1, the perspective stage refuses 24 pages at 0.1, with a
-residual of 0.100 to 0.139 of the grid line period, and rectifies all 24 at 0.15 (their
-masks were predicted once more, in the frame the flag puts them in). On those 24 pages
-the median page SNR rises from 5.49 to 13.92 dB (lead SNR, paired median +6.73 dB,
-patient bootstrap 95 % CI 3.77 to 8.94), and the classifier changes 4 instead of 13 of
-its 120 record and class decisions against the digital signal (−9, 95 % CI −15.4 to
-−3.3). Over the 230 pages, none instead of 12 has a page SNR below 5 dB, the median
-lead SNR goes from 15.02 to 15.26 dB, the classifier changes 23 instead of 32 of its
-1,150 decisions (2.00 instead of 2.78 %) and 1 instead of 7 of the 968 that the digital
-signal puts at least 1 logit from the threshold, and the mean absolute change of its
-class probabilities falls from 0.0194 to 0.0149. The other 206 scans and every
-synthetic page keep byte identical signals. The value 0.15 was chosen on these same
-development pages, so the numbers say what it does there, not what it would do on
-pages it was not chosen on. The mould-damaged scans and the photographs have not been
-measured with it: a page the flag rectifies is in another frame, which the saved masks
-of those pages do not fit.
+`--perspective_tolerance 0.15` is the default; it was 0.1, the tolerance of the
+perspective stage itself, before, and everything above in this section was read at 0.1.
+The numbers of the tolerance are **development-set numbers** as well: the value 0.15
+was chosen on the 24 clean development scans named next, and the evaluation set of the
+database has not been read with it. They are on the same development pages, read with
+`--grid_rescue map --row_mapping lines` at 0.15 and compared, paired, with the same
+reading at 0.1 (patient bootstrap 95 % CI). A page that 0.15 rectifies and 0.1 does not
+is in another frame, which its saved mask does not fit, so the masks of those pages
+were predicted once more, in that frame.
+
+On the 230 clean scans the perspective stage refuses 24 pages at 0.1, with a residual
+of 0.100 to 0.139 of the grid line period, and rectifies all 24 at 0.15. On those 24
+pages the median page SNR rises from 5.49 to 13.92 dB (lead SNR, paired median
++6.73 dB, 95 % CI 3.77 to 8.94), no page is more than 1 dB worse, and the classifier
+changes 4 instead of 13 of its 120 record and class decisions against the digital
+signal (−9, 95 % CI −15.4 to −3.3). Over the 230 pages, none instead of 12 has a page
+SNR below 5 dB, the median lead SNR goes from 15.02 to 15.26 dB, the classifier changes
+23 instead of 32 of its 1,150 decisions (2.00 instead of 2.78 %) and 1 instead of 7 of
+the 968 that the digital signal puts at least 1 logit from the threshold, and the mean
+absolute change of its class probabilities falls from 0.0194 to 0.0149. The other 206
+scans keep byte identical signals.
+
+On the 230 mould-damaged scans 89 pages change frame at 0.15, 48 colour and 41
+black-and-white ones. On those 89 the median page SNR rises from −1.52 to 6.59 dB (lead
+SNR, paired median +4.95 dB, 3.23 to 7.00) and the classifier changes 58 instead of 100
+of its 445 decisions (−42, −65.5 to −19.4); 73 pages gain more than 1 dB of page SNR
+and 6 lose more than 1 dB, 3 of them out of the 7 pages that were at or above 12 dB at
+0.1. Over the 230 pages the classifier changes 158 instead of 200 of its 1,150
+decisions, the leads without a usable signal drop from 45.8 to 32.5 %, the median lead
+SNR goes from 0.84 to 4.21 dB, and 114 instead of 151 pages have a page SNR below 5 dB.
+
+On the 345 photographs (three conditions; original pages, `--paper_normalisation auto`)
+100 pages change frame at 0.15 (46, 44 and 10 of the three conditions). On those 100
+the median page SNR rises from 0.64 to 3.33 dB (lead SNR, paired median +1.07 dB, 0.55
+to 1.98), and the classifier changes 96 instead of 119 of its 500 decisions, but the
+interval of that difference includes zero (−23, −45.6 to +1.9), and one page in five
+gets worse: 20 pages lose more than 1 dB of page SNR, while 58 gain more than 1 dB. The
+20 that lose were read better than the rest before (median page SNR 5.11 dB at 0.1,
+against 0.64 dB over the 100, and −1.71 dB at 0.15): 10 of them were at or above 5 dB
+at 0.1, out of 18 such pages among the 100, and 7 of those 18 are below 5 dB at 0.15.
+This looks like a projective correction laid on a curled sheet breaking a page that
+worked; the curl of these pages was not measured. Over the 345 pages the classifier
+changes 470 instead of 493 of its 1,725 decisions (−23, −48.7 to +1.0, an interval that
+includes zero as well), the leads without a usable signal go from 57.2 to 53.2 %, the
+median lead SNR from −0.83 to −0.34 dB, and 270 instead of 292 pages have a page SNR
+below 5 dB. The paper normalisation, which keeps 0.1, decided all 100 pages as before
+and gave them the same pixels.
+
+The pages that 0.15 does not move keep byte identical signals on every kind of page, as
+the 206 clean scans above do. A run of all 920 development pages from saved masks at
+0.15 (the 213 pages that change frame from the masks predicted in the new frame, the
+707 others from the masks saved before) gives byte identical signals to those scored
+here on the 213 and to the reading at 0.1 on the 707: the 206 clean scans, the 141
+other mould-damaged scans, the 245 other photographs and all 115 rendered pages of the
+same records. None of the rendered pages is accepted above 0.1.
+
+The pages that print no `WARNING` of a stage (resolution, rotation, perspective, column
+grid, grid origin or column mapping) are another group at 0.15 than at 0.1. A page that
+0.15 accepts no longer prints the `WARNING` of the perspective stage, so the group
+grows by pages that were refused before; such a page is told by a
+`perspective_residual_rel` above 0.1 in `qc.csv` and by the line of `--verbose`. On the
+clean scans 229 instead of 205 of the 230 pages print none, and on them the classifier
+changes 23 of 1,145 decisions (2.0 %) instead of 19 of 1,025 (1.9 %). On the
+mould-damaged scans they are 104 instead of 59 of the 230 pages, with 40 of 520
+decisions changed (7.7 %) instead of 15 of 295 (5.1 %), and on the photographs 45
+instead of 16 of the 345 pages, with 17 of 225 (7.6 %) instead of 2 of 80 (2.5 %). So
+at 0.15 the absence of a `WARNING` of a stage says less about a page than it does at
+0.1, on the mould-damaged scans and the photographs above all.
+
+Limits. The mould-damaged scans and the photographs stay far from the digital signal at
+0.15 as well: 114 of the 230 scans and 270 of the 345 photographs are below 5 dB page
+SNR, 166 and 331 below 12 dB, and the 331 photographs are as many as at 0.1. Eleven
+further pages, 5 black-and-white mould-damaged scans and 6 photographs, that 0.1
+refuses with a logged residual of 0.101 to 0.150 of the period stay refused at 0.15:
+there the first round of their fit is accepted, and the second, measured on the
+rectified page, ends above the tolerance. A smaller tolerance does not do better on
+both kinds: counting only the pages whose residual is within it, 0.125 accounts for
+−31 of the −42 changed decisions on the mould-damaged scans and for −10 of the −23 on
+the photographs, and 0.13 for −43 and −9. And the change of page SNR does not go with
+the size of the
+residual (correlation −0.06 on the mould-damaged scans, +0.07 on the photographs), so
+the pages that lose cannot be told by it. The 96 generator pages of the results below
+(clean, augmented, rotated) and the other synthetic pages keep byte identical signals
+at 0.15. All of this is development-set evidence: 0.15 was chosen on the 24 clean
+scans, the decision to make it the default was taken with the mould-damaged scans and
+the photographs of the same 115 records in view, and the evaluation set has not been
+read with it. So the numbers say what the tolerance does on these pages, not what it
+would do on others. `--perspective_tolerance 0.1` gives the reading before 0.15 became
+the default, and a mask saved at 0.1 is read with it (see below the options table).
 
 
 #### Results on synthetic pages
@@ -633,7 +734,10 @@ map moves no sample of these pages by a pixel or, on augmented pages and pages w
 faint grid whose lines it cannot read, is not trusted. So does `--paper_normalisation
 off`: the saved masks have no record of the paper normalisation, so their pages are
 used as given. And so does `--grid_rescue off --row_mapping off`: none of these pages
-fails a check that is tried again and none has a column map in use.
+fails a check that is tried again and none has a column map in use. And so does
+`--perspective_tolerance 0.1`: the perspective fit of each of these pages is far inside
+either tolerance, so the saved masks, predicted at 0.1, are in the frame of the
+defaults.
 
 | Condition | Pages | Description | Median SNR (dB) |
 | --- | --- | --- | --- |

@@ -4,6 +4,9 @@ estimate_perspective() refuses the homography of the grid lines when the residua
 a fit is above GRID_LINE_MAX_SLOPE_RESIDUAL, a tenth, of the carrier period. The flag
 puts another tolerance into that test, for the perspective stage of run() alone: the
 rotation stage reads the constant, and so does the chain of the paper normalisation.
+The default of the flag is PERSPECTIVE_TOLERANCE, 0.15, so a run that names no flag
+widens the stage, and --perspective_tolerance 0.1 is the stage at its own tolerance,
+the run before 0.15 became the default.
 No model and no data files: the pages are drawn here, a quarter of a page with a
 1 mm / 5 mm grid at 200 dpi and no trace, whose line pitch breathes or whose lines
 wave as on a printed and scanned sheet, which no homography describes and which the
@@ -38,7 +41,7 @@ FOLDERS = ["-d", "in", "-o", "out"]
 
 
 @lru_cache(maxsize=None)
-def drawn_page(along=0.0, across=0.0, shear=0.0):
+def drawn_page(along=0.0, across=0.0, shear=0.0, lines=True):
     """A drawn page [3, H, W] uint8: a red 1 mm grid, every fifth line bold, no trace.
 
     along moves the lines of both families along their normal by that many pixels, in
@@ -47,7 +50,7 @@ def drawn_page(along=0.0, across=0.0, shear=0.0):
     perspective fit are off every projective map. across moves the lines by a sine of
     the position along them: lines that wave, which the rotation stage is left with as
     well. shear leans the vertical lines by that many pixels per pixel of height.
-    Cached, so no caller may write into a page.
+    Without lines the page is blank. Cached, so no caller may write into a page.
     """
     y, x = np.mgrid[0:HEIGHT, 0:WIDTH].astype(np.float64)
     x, y = x + 0.5, y + 0.5
@@ -63,7 +66,7 @@ def drawn_page(along=0.0, across=0.0, shear=0.0):
             -0.5 * (bold / 0.8) ** 2
         )
 
-    darkness = np.clip(family(u) + family(v), 0, 200)
+    darkness = np.clip(family(u) + family(v), 0, 200) * bool(lines)
     image = np.full((3, HEIGHT, WIDTH), 255, dtype=np.uint8)
     # Red lines, as on a printed page: darkest in the two lower channels.
     image[1] = image[2] = (255 - darkness).astype(np.uint8)
@@ -86,6 +89,8 @@ PAGES = {
     # Lines that wave by 1.5 px: 0.127 of the period off a line for the rotation
     # stage, 0.126 off a fit that asks for no correction (0.01 px).
     "waved": {"across": 1.5},
+    # No grid at all: no stage finds a period, at any tolerance.
+    "blank": {"lines": False},
 }
 OFF_THE_FIT = r"grid line phase is \d\.\d\d px off the fit"
 OFF_A_LINE = r"grid line phase is \d\.\d\d px off a line"
@@ -138,23 +143,47 @@ def recorded(monkeypatch, name):
 
 
 # ------------------------------------------------------------ flag and constants
-def test_the_flag_is_the_tolerance_of_the_stage_unless_given():
+def test_the_flag_is_0_15_unless_another_tolerance_is_given():
     parse = digitize.get_parser().parse_args
+    # The stage keeps its tenth: the default of the flag is above it, and in the range.
     assert STAGE == 0.1
+    assert digitize.PERSPECTIVE_TOLERANCE == 0.15
     assert digitize.PERSPECTIVE_MAX_TOLERANCE == 0.5
     default = parse(FOLDERS).perspective_tolerance
-    assert default == STAGE and isinstance(default, float)
+    assert default == 0.15 and isinstance(default, float)
+    assert default == digitize.PERSPECTIVE_TOLERANCE
     assert parse(FOLDERS + [FLAG, "0.15"]).perspective_tolerance == 0.15
     # Both ends of the range are in it.
     assert parse(FOLDERS + [FLAG, "0.1"]).perspective_tolerance == STAGE
     assert parse(FOLDERS + [FLAG, "0.5"]).perspective_tolerance == 0.5
 
 
-def test_a_run_that_does_not_name_the_flag_has_the_arguments_of_one_with_a_tenth():
+def test_a_run_that_does_not_name_the_flag_has_the_arguments_of_one_with_0_15():
     parse = digitize.get_parser().parse_args
-    assert parse(FOLDERS) == parse(FOLDERS + [FLAG, "0.1"])
-    assert vars(parse(FOLDERS)) == vars(parse(FOLDERS + [FLAG, "1e-1"]))
-    assert parse(FOLDERS) != parse(FOLDERS + [FLAG, "0.15"])
+    assert parse(FOLDERS) == parse(FOLDERS + [FLAG, "0.15"])
+    assert vars(parse(FOLDERS)) == vars(parse(FOLDERS + [FLAG, "1.5e-1"]))
+    # The tenth written out is another run, in that argument and in no other.
+    tenth = parse(FOLDERS + [FLAG, "0.1"])
+    assert parse(FOLDERS) != tenth
+    default = vars(parse(FOLDERS))
+    assert {key for key in default if default[key] != vars(tenth)[key]} == {
+        "perspective_tolerance"
+    }
+
+
+def test_the_default_of_the_flag_is_no_default_of_the_fit():
+    # 0.15 is what the command line gives a run that names no flag, and nothing else:
+    # the constant of the stage, which the rotation stage and the chain of the paper
+    # normalisation read, stays a tenth, and the fit that is called without a
+    # tolerance refuses a page between the two, as a caller of the function had it.
+    assert digitize.GRID_LINE_MAX_SLOPE_RESIDUAL == 0.1 < digitize.PERSPECTIVE_TOLERANCE
+    refused, info = digitize.estimate_perspective(page("above"))
+    assert refused is None and re.fullmatch(OFF_THE_FIT, info["reason"])
+    assert STAGE < info["residual_rel"] < digitize.PERSPECTIVE_TOLERANCE
+    matrix, info_default = digitize.estimate_perspective(
+        page("above"), digitize.PERSPECTIVE_TOLERANCE
+    )
+    assert matrix is not None and info_default["reason"] == ""
 
 
 @pytest.mark.parametrize(
@@ -225,6 +254,11 @@ def test_the_pages_are_what_they_are_drawn_for():
     matrix, info = digitize.estimate_perspective(page("waved"))
     assert matrix is None and re.fullmatch(OFF_THE_FIT, info["reason"])
     assert 0.12 < info["residual_rel"] < 0.135
+
+    # The blank page has no period to measure a residual on.
+    matrix, info = digitize.estimate_perspective(page("blank"))
+    assert matrix is None and info["reason"] == "no grid line period found"
+    assert np.isnan(info["residual_rel"])
 
 
 def test_a_fit_above_a_tenth_is_refused_unless_the_tolerance_is_above_it(monkeypatch):
@@ -493,7 +527,10 @@ def test_the_chain_of_the_paper_normalisation_measures_at_the_tenth(monkeypatch)
 # ------------------------------------------------------------------- end to end
 # Every run saves its mask, so its output folder is the mask folder of a later run.
 BASE = ("--time_mapping", "bbox", "--save_mask")
+# 0.15 is the default, so TOLERANCE is the default written out, and the run of the
+# stage at its own tolerance, which the run without the flag was before, asks for 0.1.
 TOLERANCE = (FLAG, "0.15")
+TENTH = (FLAG, "0.1")
 FITS_NOT = "the mask does not fit."
 ACCEPTED = "accepted at --perspective_tolerance"
 
@@ -557,6 +594,11 @@ def mask_meta(folder, name):
         return json.load(f)
 
 
+def signal_files(folder, name):
+    """The bytes of the signals a run wrote for a page, header and samples."""
+    return [(folder / f"{name}{end}").read_bytes() for end in (".hea", ".dat")]
+
+
 def lines_of(printed, name, start=""):
     """The lines run() printed that name the record, optionally those starting so."""
     names_it = re.compile(rf"record {re.escape(name)}(?!\w)")
@@ -571,8 +613,8 @@ def perspective_warning(printed, name):
     return lines_of(printed, name, "WARNING: grid lines not used for the perspective")
 
 
-def test_run_without_the_flag_refuses_the_page_as_it_always_did(runs):
-    out, printed = runs("above")
+def test_run_with_a_tenth_refuses_the_page_as_it_always_did(runs):
+    out, printed = runs("above", *TENTH)
     row, header = qc_row(out)
     warning = perspective_warning(printed, "above")
     assert len(warning) == 1
@@ -595,22 +637,39 @@ def test_run_without_the_flag_refuses_the_page_as_it_always_did(runs):
 
 
 @pytest.mark.parametrize("name", ["even", "below", "above", "waved"])
-def test_a_run_that_does_not_name_the_flag_is_the_run_with_a_tenth(runs, name):
+def test_a_run_that_does_not_name_the_flag_is_the_run_with_0_15(runs, name):
+    # 0.15 is the default: --perspective_tolerance 0.15 is the run without the flag, to
+    # the lines it prints, its QC row and the frame of its mask, on a page of every
+    # kind. The signals of these pages, which have no trace, are the same at a tenth
+    # as well, so they are compared as they are and do not tell the default from it.
     out, printed = runs(name)
-    named, printed_named = runs(name, FLAG, "0.1")
+    named, printed_named = runs(name, *TOLERANCE)
     assert printed_named == printed
-    assert ACCEPTED not in printed
     assert same_row(qc_row(named)[0], qc_row(out)[0])
+    assert signal_files(named, name) == signal_files(out, name)
     meta, meta_named = mask_meta(out, name), mask_meta(named, name)
     assert sorted(meta) == sorted(meta_named)
-    assert ("homography" in meta) == (name == "below")
-    if name == "below":
+    assert ("homography" in meta) == (name in ("below", "above"))
+    if "homography" in meta:
         assert np.allclose(
             meta_named["homography"], meta["homography"], rtol=0, atol=1e-9
         )
+    # It lets the pages above the tenth through, and says so of each.
+    above = name in ("above", "waved")
+    assert printed.count(ACCEPTED) == (1 if above else 0)
+    assert perspective_warning(printed, name) == []
+    # The tenth written out is the stage at its own tolerance, the run without the flag
+    # before 0.15 became the default: it lets no page through, rectifies only the page
+    # the stage itself reads, and is the default run on a page inside the tenth alone.
+    tenth, printed_tenth = runs(name, *TENTH)
+    assert ACCEPTED not in printed_tenth
+    assert ("homography" in mask_meta(tenth, name)) == (name == "below")
+    assert len(perspective_warning(printed_tenth, name)) == (1 if above else 0)
+    assert (printed_tenth == printed) == (not above)
+    assert same_row(qc_row(tenth)[0], qc_row(out)[0]) == (not above)
 
 
-def test_run_with_the_flag_rectifies_the_page_and_says_so(runs):
+def test_run_at_0_15_rectifies_the_page_and_says_so(runs):
     out, printed = runs("above", *TOLERANCE)
     row, header = qc_row(out)
     assert perspective_warning(printed, "above") == []
@@ -633,8 +692,8 @@ def test_run_with_the_flag_rectifies_the_page_and_says_so(runs):
     # The mask of this run is in the frame of that homography.
     homography = np.array(mask_meta(out, "above")["homography"])
     assert digitize._homography_shift(homography, WIDTH, HEIGHT) == pytest.approx(shift)
-    # But for the perspective, the row is the one of the run without the flag.
-    plain = qc_row(runs("above")[0])[0]
+    # But for the perspective, the row is the one of the run with a tenth.
+    plain = qc_row(runs("above", *TENTH)[0])[0]
     differ = {key for key in row if not same_row({key: row[key]}, {key: plain[key]})}
     assert differ == {
         "perspective_shift_px",
@@ -644,7 +703,7 @@ def test_run_with_the_flag_rectifies_the_page_and_says_so(runs):
 
 
 def test_a_tolerance_below_the_residual_of_a_page_leaves_it_refused(runs):
-    plain, printed_plain = runs("above")
+    plain, printed_plain = runs("above", *TENTH)
     out, printed = runs("above", FLAG, str(NARROW))
     assert printed == printed_plain
     assert len(perspective_warning(printed, "above")) == 1 and ACCEPTED not in printed
@@ -653,8 +712,8 @@ def test_a_tolerance_below_the_residual_of_a_page_leaves_it_refused(runs):
 
 
 @pytest.mark.parametrize("name", ["even", "below"])
-def test_run_reads_a_page_inside_the_tenth_the_same_with_the_flag(runs, name):
-    plain, printed_plain = runs(name)
+def test_run_reads_a_page_inside_the_tenth_the_same_at_a_wider_tolerance(runs, name):
+    plain, printed_plain = runs(name, *TENTH)
     row = qc_row(plain)[0]
     assert float(row["perspective_residual_rel"]) < STAGE
     assert perspective_warning(printed_plain, name) == []
@@ -662,7 +721,7 @@ def test_run_reads_a_page_inside_the_tenth_the_same_with_the_flag(runs, name):
     assert rectified == (name == "below")
     for tolerance in ("0.15", "0.5"):
         out, printed = runs(name, FLAG, tolerance)
-        # To the lines it prints: no page here is one the flag lets through.
+        # To the lines it prints: no page here is one a wider tolerance lets through.
         assert printed == printed_plain and ACCEPTED not in printed, tolerance
         assert same_row(qc_row(out)[0], qc_row(plain)[0]), tolerance
         meta, meta_plain = mask_meta(out, name), mask_meta(plain, name)
@@ -674,11 +733,11 @@ def test_run_reads_a_page_inside_the_tenth_the_same_with_the_flag(runs, name):
 
 
 def test_a_mask_fits_the_frame_of_the_tolerance_it_was_saved_at(runs):
-    plain, _ = runs("above")
+    plain, _ = runs("above", *TENTH)
     wide, _ = runs("above", *TOLERANCE)
-    # Saved without the flag, the mask lives on the page as it was rotated: it fits a
-    # run without the flag, and not the page the flag rectifies.
-    _, printed = runs("above", masks=plain)
+    # Saved at a tenth, the mask lives on the page as it was rotated: it fits a run at
+    # a tenth, and not the page a wider tolerance rectifies.
+    _, printed = runs("above", *TENTH, masks=plain)
     assert FITS_NOT not in printed
     _, printed = runs("above", *TOLERANCE, masks=plain)
     said = lines_of(printed, "above", "WARNING: mask of record")
@@ -690,16 +749,41 @@ def test_a_mask_fits_the_frame_of_the_tolerance_it_was_saved_at(runs):
     )
     assert found and float(found.group(1)) > 1.0
     assert printed.count(ACCEPTED) == 1
-    # Saved with the flag, it fits a run at the same tolerance, and no other.
+    # Saved at 0.15, it fits a run at the same tolerance, and no other.
     _, printed = runs("above", *TOLERANCE, masks=wide)
     assert FITS_NOT not in printed and printed.count(ACCEPTED) == 1
-    _, printed = runs("above", masks=wide)
+    _, printed = runs("above", *TENTH, masks=wide)
     assert printed.count(FITS_NOT) == 1
     assert len(perspective_warning(printed, "above")) == 1
 
 
+def test_a_mask_saved_before_0_15_was_the_default_needs_the_tenth_written_out(runs):
+    # A run that named no flag saved its masks at a tenth then. Such a mask of a page
+    # between the two tolerances does not fit the run that names no flag now, which
+    # rectifies the page, and the run says so; with --perspective_tolerance 0.1 it
+    # fits as it did.
+    before, _ = runs("above", *TENTH)
+    _, printed = runs("above", masks=before)
+    said = lines_of(printed, "above", "WARNING: mask of record")
+    assert len(said) == 1 and said[0].endswith(FITS_NOT)
+    assert printed.count(FITS_NOT) == 1 and printed.count(ACCEPTED) == 1
+    _, printed = runs("above", *TENTH, masks=before)
+    assert FITS_NOT not in printed and ACCEPTED not in printed
+    # The mask the run of now saves fits that run, and the one with 0.15 written out.
+    now, _ = runs("above")
+    for flags in ((), TOLERANCE):
+        _, printed = runs("above", *flags, masks=now)
+        assert FITS_NOT not in printed and printed.count(ACCEPTED) == 1, flags
+    # A page inside the tenth, and one that is accepted above it and kept, are in the
+    # frame they were in: their masks of then fit the run of now.
+    for name in ("even", "below", "waved"):
+        before, _ = runs(name, *TENTH)
+        _, printed = runs(name, masks=before)
+        assert FITS_NOT not in printed, name
+
+
 def test_run_names_a_page_that_is_kept_inside_the_dead_band(runs):
-    plain, printed_plain = runs("waved")
+    plain, printed_plain = runs("waved", *TENTH)
     out, printed = runs("waved", *TOLERANCE)
     row = qc_row(out)[0]
     assert len(perspective_warning(printed_plain, "waved")) == 1
@@ -712,17 +796,18 @@ def test_run_names_a_page_that_is_kept_inside_the_dead_band(runs):
         "inside the dead band, page kept"
     )
     assert float(row["perspective_shift_px"]) < digitize.PERSPECTIVE_MIN_SHIFT_PX
-    # No homography: the page is in the frame it has without the flag, and a mask
-    # that was saved without the flag fits.
+    # No homography: the page is in the frame it has at a tenth, and a mask that was
+    # saved at a tenth fits.
     assert "homography" not in mask_meta(out, "waved")
     _, printed_again = runs("waved", *TOLERANCE, masks=plain)
     assert FITS_NOT not in printed_again and printed_again.count(ACCEPTED) == 1
 
 
-@pytest.mark.parametrize("tolerance", ["0.15", "0.5"])
-def test_run_leaves_the_rotation_stage_at_its_tenth(runs, tolerance):
-    plain, printed_plain = runs("waved")
-    out, printed = runs("waved", FLAG, tolerance)
+@pytest.mark.parametrize("flags", [(), (FLAG, "0.15"), (FLAG, "0.5")])
+def test_run_leaves_the_rotation_stage_at_its_tenth(runs, flags):
+    # At the default of a run that names no flag as at a tolerance that is given.
+    plain, printed_plain = runs("waved", *TENTH)
+    out, printed = runs("waved", *flags)
     start = "WARNING: grid lines not used for the rotation"
     warning = lines_of(printed, "waved", start)
     assert len(warning) == 1 and warning == lines_of(printed_plain, "waved", start)
@@ -745,6 +830,10 @@ def test_run_says_nothing_of_the_tolerance_without_verbose(runs):
     out, printed = runs("above", *TOLERANCE, "--no-verbose")
     assert "Perspective for record" not in printed
     assert perspective_warning(printed, "above") == []
+    # Nor does the run that names no flag, which is that run.
+    default, printed_default = runs("above", "--no-verbose")
+    assert printed_default == printed
+    assert same_row(qc_row(default)[0], qc_row(out)[0])
     # The page is rectified all the same, and the QC column is what says so.
     assert same_row(qc_row(out)[0], qc_row(loud)[0])
     assert float(qc_row(out)[0]["perspective_residual_rel"]) > STAGE
@@ -757,10 +846,14 @@ def test_run_says_nothing_of_the_tolerance_without_verbose(runs):
 
 
 def test_the_flag_is_one_of_the_perspective_stage_only(runs):
-    plain, printed_plain = runs("above", "--perspective", "off")
+    plain, printed_plain = runs("above", "--perspective", "off", *TENTH)
     out, printed = runs("above", "--perspective", "off", *TOLERANCE)
     assert printed == printed_plain and "Perspective for record" not in printed
     assert qc_row(out)[0] == qc_row(plain)[0]
+    # Nor does the default of the flag reach a run without the stage.
+    default, printed_default = runs("above", "--perspective", "off")
+    assert printed_default == printed_plain
+    assert qc_row(default)[0] == qc_row(plain)[0]
     # The stage did not measure: no residual of either kind.
     row = qc_row(out)[0]
     assert np.isnan(float(row["perspective_residual_px"]))
@@ -768,12 +861,13 @@ def test_the_flag_is_one_of_the_perspective_stage_only(runs):
     assert "homography" not in mask_meta(out, "above")
 
 
-def test_run_hands_the_tolerance_to_the_stage_only_when_the_flag_widens_it(
+def test_run_hands_the_tolerance_to_the_stage_only_when_it_widens_the_stage(
     tmp_path, monkeypatch
 ):
-    # Without the flag, and with the tenth written out, the stage is called with the
-    # page and nothing else, as it always was: a stand-in that takes no tolerance,
-    # as the ones of the drivers and of the other tests, still stands in.
+    # With the tenth written out the stage is called with the page and nothing else,
+    # as it always was: a stand-in that takes no tolerance, as the ones of the drivers
+    # and of the other tests, still stands in. A tolerance above the tenth goes along
+    # by its name, and so does the default of a run that names no flag.
     data, masks = tmp_path / "data", tmp_path / "masks"
     data.mkdir()
     masks.mkdir()
@@ -787,7 +881,7 @@ def test_run_hands_the_tolerance_to_the_stage_only_when_the_flag_widens_it(
             digitize.run(digitize.get_parser().parse_args(argv))
     assert [len(args) for args, _ in calls] == [1, 1, 1, 1]
     assert [kwargs for _, kwargs in calls] == [
-        {},
+        {"tolerance": 0.15},
         {},
         {"tolerance": 0.15},
         {"tolerance": 0.5},
@@ -818,7 +912,8 @@ def test_run_writes_and_names_the_larger_round_when_it_is_not_the_last(
 ):
     # 0.12 of the period in the first round and 0.08 in the second: the last round
     # alone looks like a page the stage itself accepts, and the page is still one
-    # that only the flag let through. The QC column and the line hold the first.
+    # that only a tolerance above the tenth let through. The QC column and the line
+    # hold the first.
     stand_in, seen = two_rounds(0.12, 0.08)
     monkeypatch.setattr(digitize, "_perspective_grid_map", stand_in)
     out, printed = mask_run(tmp_path, "even", *TOLERANCE)
@@ -838,14 +933,15 @@ def test_run_writes_and_names_the_larger_round_when_it_is_not_the_last(
     assert "homography" in mask_meta(out, "even")
 
 
-def test_run_under_a_driver_that_widens_the_constant_does_not_name_the_flag(
+def test_run_under_a_driver_that_widens_the_constant_prints_no_line_of_the_flag(
     tmp_path, monkeypatch
 ):
     # A driver from before the flag widens the stage by the module constant, which it
-    # sets for the time of the call in a stand-in of one argument, and runs without
-    # the flag. The page is rectified, as under that driver it always was, and the
-    # line would say 'accepted at --perspective_tolerance 0.1' of a page that a
-    # tolerance of 0.1 refuses: it is for a run that the flag widens, and no other.
+    # sets for the time of the call in a stand-in of one argument, and ran without
+    # the flag: the run that --perspective_tolerance 0.1 is now. The page is
+    # rectified, as under that driver it always was, and the line would say 'accepted
+    # at --perspective_tolerance 0.1' of a page that a tolerance of 0.1 refuses: it is
+    # for a run whose tolerance widens the stage, and no other.
     stage = digitize.estimate_perspective
 
     def driver(image):
@@ -854,7 +950,7 @@ def test_run_under_a_driver_that_widens_the_constant_does_not_name_the_flag(
             return stage(image)
 
     monkeypatch.setattr(digitize, "estimate_perspective", driver)
-    out, printed = mask_run(tmp_path, "above")
+    out, printed = mask_run(tmp_path, "above", *TENTH)
     assert digitize.GRID_LINE_MAX_SLOPE_RESIDUAL == STAGE
     assert perspective_warning(printed, "above") == []
     said = lines_of(printed, "above", "Perspective for record")
@@ -865,6 +961,13 @@ def test_run_under_a_driver_that_widens_the_constant_does_not_name_the_flag(
     assert "homography" in mask_meta(out, "above")
     # The QC column holds the residual of such a page all the same.
     assert STAGE < float(row["perspective_residual_rel"]) < WIDE
+    # Such a driver has to name the tenth. The run that names no flag hands its 0.15
+    # along by its name, which a stand-in of one argument does not take: the run
+    # stops, and reads no page at another tolerance than the driver set.
+    unpinned = tmp_path / "unpinned"
+    unpinned.mkdir()
+    with pytest.raises(TypeError, match="unexpected keyword argument 'tolerance'"):
+        mask_run(unpinned, "above")
 
 
 # ------------------------------------------- with the paper normalisation (auto)
@@ -877,7 +980,7 @@ def auto_run(folder, name, *flags):
     estimate_perspective() as (args, kwargs) (calls) and what normalise_paper()
     returned for the page (decided).
     """
-    data, out = folder / f"data_{name}", folder / f"out_{name}_{len(flags)}"
+    data, out = folder / f"data_{name}", folder / "_".join(("out", name, *flags))
     if not data.exists():
         data.mkdir()
         write_png(page(name), str(data / f"{name}.png"))
@@ -911,54 +1014,60 @@ def auto_run(folder, name, *flags):
 def test_a_page_the_chain_refused_is_measured_again_at_the_tolerance_of_the_run(
     tmp_path, name
 ):
-    plain = auto_run(tmp_path, name)
+    plain = auto_run(tmp_path, name, *TENTH)
     wide = auto_run(tmp_path, name, *TOLERANCE)
-    # The chain refuses the page for its residual at either tolerance of the run, the
+    default = auto_run(tmp_path, name)
+    # The chain refuses the page for its residual at any tolerance of the run, the
     # paper stage leaves the page as it is, and its decision and what it was made on
-    # are the same in both runs.
-    for run in (plain, wide):
+    # are the same in all three runs.
+    for run in (plain, wide, default):
         _, block, meta, stages = run.decided
         assert block["decision"] == "pass_fullframe" and stages is not None
         assert meta["chain"]["ok"] is False
         assert re.fullmatch(OFF_THE_FIT, meta["chain"]["persp_reason"])
         assert stages["H_rect"] is None
-    assert same_info(wide.decided[2]["chain"], plain.decided[2]["chain"])
-    assert wide.decided[1] == plain.decided[1]
-    for run in (plain, wide):
+        assert same_info(run.decided[2]["chain"], plain.decided[2]["chain"])
+        assert run.decided[1] == plain.decided[1]
         stored = mask_meta(run.out, name)["paper_normalisation"]
         assert stored == plain.decided[1]
 
-    # Without the flag the refusal of the chain is the one of the run: one measurement.
+    # At a tenth the refusal of the chain is the one of the run: one measurement.
     stages = plain.decided[3]
     assert len(plain.calls) == 1
     assert plain.calls[0][0][0] is stages["measured"] and plain.calls[0][1] == {}
     assert len(perspective_warning(plain.log, name)) == 1 and ACCEPTED not in plain.log
     assert "homography" not in mask_meta(plain.out, name)
 
-    # With it the run measures again: the page the chain measured, in the frame the
-    # chain measured it in, at the tolerance of the run.
-    stages = wide.decided[3]
-    assert len(wide.calls) == 2
-    (first,), first_kwargs = wide.calls[0]
-    (second,), second_kwargs = wide.calls[1]
-    assert first is stages["measured"] and first_kwargs == {}
-    assert second is stages["measured"] and second_kwargs == {"tolerance": 0.15}
-    assert (stages["measured"] is stages["image"]) == (name == "above")
-    assert perspective_warning(wide.log, name) == []
-    assert wide.log.count(ACCEPTED) == 1 and "homography applied" in wide.log
-    row, row_plain = qc_row(wide.out)[0], qc_row(plain.out)[0]
-    assert row["paper_normalisation"] == row_plain["paper_normalisation"]
-    assert row["rotation_angle"] == row_plain["rotation_angle"]
-    assert (float(row["rotation_angle"]) == 0.0) == (name == "above")
-    assert STAGE < float(row["perspective_residual_rel"]) < 0.15
-    assert float(row["perspective_shift_px"]) > digitize.PERSPECTIVE_MIN_SHIFT_PX
-    assert "homography" in mask_meta(wide.out, name)
+    # Above it the run measures again: the page the chain measured, in the frame the
+    # chain measured it in, at the tolerance of the run. The run that names no flag
+    # does so at its 0.15.
+    row_plain = qc_row(plain.out)[0]
+    for run in (wide, default):
+        stages = run.decided[3]
+        assert len(run.calls) == 2
+        (first,), first_kwargs = run.calls[0]
+        (second,), second_kwargs = run.calls[1]
+        assert first is stages["measured"] and first_kwargs == {}
+        assert second is stages["measured"] and second_kwargs == {"tolerance": 0.15}
+        assert (stages["measured"] is stages["image"]) == (name == "above")
+        assert perspective_warning(run.log, name) == []
+        assert run.log.count(ACCEPTED) == 1 and "homography applied" in run.log
+        row = qc_row(run.out)[0]
+        assert row["paper_normalisation"] == row_plain["paper_normalisation"]
+        assert row["rotation_angle"] == row_plain["rotation_angle"]
+        assert (float(row["rotation_angle"]) == 0.0) == (name == "above")
+        assert STAGE < float(row["perspective_residual_rel"]) < 0.15
+        assert float(row["perspective_shift_px"]) > digitize.PERSPECTIVE_MIN_SHIFT_PX
+        assert "homography" in mask_meta(run.out, name)
+    assert default.log == wide.log
+    assert same_row(qc_row(default.out)[0], qc_row(wide.out)[0])
 
 
 def test_a_page_the_chain_accepted_is_not_measured_again(tmp_path):
-    plain = auto_run(tmp_path, "below")
+    plain = auto_run(tmp_path, "below", *TENTH)
     wide = auto_run(tmp_path, "below", *TOLERANCE)
-    for run in (plain, wide):
+    default = auto_run(tmp_path, "below")
+    for run in (plain, wide, default):
         _, block, meta, stages = run.decided
         assert block["decision"] == "pass_chain" and meta["chain"]["ok"] is True
         # Taken from the chain: one measurement, at the tolerance of the stage.
@@ -971,9 +1080,37 @@ def test_a_page_the_chain_accepted_is_not_measured_again(tmp_path):
             rtol=0,
             atol=1e-9,
         )
-    assert wide.log == plain.log and ACCEPTED not in wide.log
+    assert wide.log == default.log == plain.log and ACCEPTED not in wide.log
     assert same_row(qc_row(wide.out)[0], qc_row(plain.out)[0])
+    assert same_row(qc_row(default.out)[0], qc_row(plain.out)[0])
     assert float(qc_row(wide.out)[0]["perspective_residual_rel"]) < STAGE
+
+
+def test_a_page_the_chain_refused_for_another_reason_is_refused_again(tmp_path):
+    # The chain refuses a page without grid lines for want of a period, which no
+    # tolerance mends. A run above the tenth, the one that names no flag included,
+    # measures a page the chain refused again whatever the reason: one measurement
+    # more, to the same refusal, and but for that the run with a tenth.
+    plain = auto_run(tmp_path, "blank", *TENTH)
+    wide = auto_run(tmp_path, "blank", *TOLERANCE)
+    default = auto_run(tmp_path, "blank")
+    for run in (plain, wide, default):
+        _, block, meta, stages = run.decided
+        assert block["decision"] == "pass_fullframe" and stages is not None
+        assert meta["chain"]["persp_reason"] == "no grid line period found"
+        assert run.calls[0][0][0] is stages["measured"] and run.calls[0][1] == {}
+        assert len(perspective_warning(run.log, "blank")) == 1
+        assert ACCEPTED not in run.log
+        assert "homography" not in mask_meta(run.out, "blank")
+        assert np.isnan(float(qc_row(run.out)[0]["perspective_residual_rel"]))
+        assert same_row(qc_row(run.out)[0], qc_row(plain.out)[0])
+        assert run.log == plain.log
+    assert len(plain.calls) == 1
+    for run in (wide, default):
+        assert len(run.calls) == 2
+        (second,), second_kwargs = run.calls[1]
+        assert second is run.decided[3]["measured"]
+        assert second_kwargs == {"tolerance": 0.15}
 
 
 # ----------------------------------------------------------------------------- QC

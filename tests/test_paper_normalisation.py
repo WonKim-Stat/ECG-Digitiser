@@ -72,6 +72,15 @@ ONCE = {
     "normalise_resolution": 1, "estimate_rotation": 1, "estimate_perspective": 1,
     "warp_page": 0,
 }
+# The runs of this file are about the paper stage, and their numbers and the calls they
+# count were fixed with the perspective stage at its own tolerance, a tenth of the grid
+# line period, which was the default of --perspective_tolerance then. At 0.1 run() calls
+# estimate_perspective() with the page and nothing else, which is all the wrapper of
+# _run() takes, and takes what the chain measured whatever the chain made of the page.
+# At the default of now, 0.15, it hands the tolerance along by its name, and measures a
+# page the chain refused a second time. One test runs the photograph without the pin,
+# test_a_run_that_names_no_tolerance_reads_the_view_of_the_photo_at_0_15.
+STAGE_TOLERANCE = ("--perspective_tolerance", "0.1")
 # What the record of every page holds, and what a normalised and a scaled one add.
 RECORD_KEYS = [
     "version", "libraries", "decision", "reason", "input_size", "input_sha1",
@@ -277,7 +286,7 @@ def _folder(path, **pages):
     return path
 
 
-def _run(data, out, *flags, label=None, pages=None):
+def _run(data, out, *flags, label=None, pages=None, tolerance=STAGE_TOLERANCE):
     """run() over the pages of a folder, the label in place of the model.
 
     label is the mask the model would give for the page it is asked about, an array
@@ -285,12 +294,16 @@ def _run(data, out, *flags, label=None, pages=None):
     pages are {record: tensor} that read_image hands out in place of the files of
     that name, for a photograph that is not worth a PNG of its own: the folder then
     only holds the names.
-    Returns what was printed (log), how often each stage was called (calls), every
+    tolerance is put in front of the flags of the run: STAGE_TOLERANCE unless given.
+    With an empty one the run names no tolerance, so it has the default of the flag.
+    Returns what was printed (log), how often each stage was called (calls), what
+    every call of estimate_perspective() was handed next to its page (handed), every
     page normalise_paper() was given next to what it returned (decided), and the
     shape and the digest of every page the model was asked about (asked).
     """
     calls = {name: 0 for name in STAGES}
-    decided, asked = [], []
+    decided, asked, handed = [], [], []
+    pinned = bool(tolerance)
     real_paper, real_read = digitize.normalise_paper, digitize.read_image
     if pages is not None:
         data.mkdir(parents=True, exist_ok=True)
@@ -300,7 +313,10 @@ def _run(data, out, *flags, label=None, pages=None):
     real = {name: getattr(digitize, name) for name in STAGES}
 
     # Every wrapper takes the arguments of the function it stands for and no others,
-    # as the wrappers of the drivers do: a call they could not take fails here.
+    # as the wrappers of the drivers do: a call they could not take fails here. The
+    # one of estimate_perspective() takes the page and no tolerance, the call of a
+    # run at STAGE_TOLERANCE. Only a run that names no tolerance gets one that takes
+    # a tolerance as well, as the function itself does, and hands it on as it came.
     def normalise_resolution(image):
         calls["normalise_resolution"] += 1
         return real["normalise_resolution"](image)
@@ -309,9 +325,20 @@ def _run(data, out, *flags, label=None, pages=None):
         calls["estimate_rotation"] += 1
         return real["estimate_rotation"](image, method)
 
-    def estimate_perspective(image):
-        calls["estimate_perspective"] += 1
-        return real["estimate_perspective"](image)
+    if pinned:
+
+        def estimate_perspective(image):
+            calls["estimate_perspective"] += 1
+            handed.append({})
+            return real["estimate_perspective"](image)
+
+    else:
+
+        def estimate_perspective(image, tolerance=None):
+            calls["estimate_perspective"] += 1
+            given = {} if tolerance is None else {"tolerance": tolerance}
+            handed.append(given)
+            return real["estimate_perspective"](image, **given)
 
     def warp_page(image, homography):
         calls["warp_page"] += 1
@@ -350,11 +377,12 @@ def _run(data, out, *flags, label=None, pages=None):
         with contextlib.redirect_stdout(log):
             digitize.run(
                 digitize.get_parser().parse_args(
-                    ["-d", str(data), "-o", str(out), *flags]
+                    ["-d", str(data), "-o", str(out), *tolerance, *flags]
                 )
             )
     return SimpleNamespace(
-        out=out, log=log.getvalue(), calls=calls, decided=decided, asked=asked
+        out=out, log=log.getvalue(), calls=calls, decided=decided, asked=asked,
+        handed=handed,
     )
 
 
@@ -492,8 +520,9 @@ def photo():
 def digitised(photo, tmp_path_factory):
     """The photograph digitised with the flag and its mask saved, once for the module.
 
-    All stage flags at their defaults. The model is handed the label in the frame a
-    normalised page has, whatever the page it is asked about: the sheet on the page.
+    All stage flags at their defaults but for the STAGE_TOLERANCE of _run(). The
+    model is handed the label in the frame a normalised page has, whatever the page it
+    is asked about: the sheet on the page.
     """
     folder = tmp_path_factory.mktemp("photo")
     data = _folder(folder / "data", rec=_tensor(photo.image))
@@ -766,6 +795,27 @@ def test_the_photo_gives_the_signals_drawn_on_the_page(digitised):
     # are read off the ink of the page under the mask, and off the mask alone where
     # there is none: the same label over a view that is upside down gives 0.091 mV.
     assert _error(digitised.out) < 0.05
+
+
+def test_a_run_that_names_no_tolerance_reads_the_view_of_the_photo_at_0_15(
+    photo, digitised, tmp_path
+):
+    # The command line without a flag: the paper normalisation at auto and the
+    # perspective stage at the default of its flag, on a page the paper stage changes.
+    label = _label_in(_onto_page(photo.corners) @ photo.to_photo, (WIDTH, HEIGHT))
+    run = _run(digitised.data, tmp_path / "out", label=label, tolerance=())
+    assert len(run.decided) == 1
+    block = run.decided[0][1][1]
+    assert block["decision"] == "normalised"
+    assert _qc(run.out)["paper_normalisation"] == "normalised"
+    # The chain measured the photograph with the page alone, at the tolerance of the
+    # stage, and run() measured the view with the tolerance of the flag.
+    assert run.handed == [{}, {"tolerance": 0.15}]
+    assert run.calls == digitised.calls and digitised.handed == [{}, {}]
+    # The view is a page the stage reads at a tenth, so the wider tolerance changes
+    # nothing of it: the signals are those of the run at STAGE_TOLERANCE.
+    for name in ("rec.dat", "rec.hea"):
+        assert _file(run.out, name) == _file(digitised.out, name)
 
 
 def test_the_view_of_the_photo_is_built_the_same_twice(photo, digitised):
@@ -1304,9 +1354,10 @@ def _tilted_runs(tmp_path, *flags):
 
 
 def test_a_tilted_page_is_warped_once_under_either_flag(tmp_path):
-    # Every flag at its default: the page is turned by picking pixels, and warped
-    # once, to measure its perspective on. That warp is the chain's with the flag,
-    # and run() takes what was measured on it instead of warping the page again.
+    # Every flag at its default but for STAGE_TOLERANCE: the page is turned by picking
+    # pixels, and warped once, to measure its perspective on. That warp is the chain's
+    # with the flag, and run() takes what was measured on it instead of warping the
+    # page again.
     off, auto = _tilted_runs(tmp_path)
     assert float(_qc(off.out)["rotation_angle"]) == pytest.approx(-0.37, abs=0.02)
     assert off.calls == auto.calls == {**ONCE, "warp_page": 1}
@@ -2051,7 +2102,8 @@ def test_run_calls_what_drivers_wrap_with_the_arguments_it_always_had(
 ):
     """Drivers put wrappers of exactly these arguments in place of the functions.
 
-    The stages and read_image are wrapped that way by every _run() of this file.
+    The stages and read_image are wrapped that way by every _run() of this file that
+    keeps STAGE_TOLERANCE.
     """
     real_check, real_row = digitize.check_mask_rotation, digitize.append_qc_row
     seen = []
