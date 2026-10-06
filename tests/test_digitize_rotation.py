@@ -524,7 +524,7 @@ def test_append_qc_row_writes_the_rotation_columns(tmp_path):
         row = next(reader)
         # The new columns are appended, the old ones keep their order.
         assert reader.fieldnames[:2] == ["record", "placement"]
-        assert reader.fieldnames[-16:-13] == [
+        assert reader.fieldnames[-17:-14] == [
             "rotation_angle",
             "rotation_coarse",
             "rotation_residual_px",

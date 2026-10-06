@@ -1239,7 +1239,7 @@ def test_append_qc_row_writes_the_trace_estimator_columns(tmp_path):
         row = next(reader)
         # The new columns are appended, the old ones keep their order.
         assert reader.fieldnames[:2] == ["record", "placement"]
-        assert reader.fieldnames[-9:-6] == ["trace_estimator", "ink_leads", "ink_p95"]
+        assert reader.fieldnames[-10:-7] == ["trace_estimator", "ink_leads", "ink_p95"]
     assert row["trace_estimator"] == "ink"
     assert int(row["ink_leads"]) == 13
     assert float(row["ink_p95"]) == pytest.approx(232.0)
@@ -1286,7 +1286,7 @@ def test_append_qc_row_writes_the_trace_shift_columns(tmp_path):
         row = next(reader)
         # The new columns are appended, the old ones keep their order.
         assert reader.fieldnames[:2] == ["record", "placement"]
-        assert reader.fieldnames[-6:-4] == ["trace_shift_px", "trace_shift_rows"]
+        assert reader.fieldnames[-7:-5] == ["trace_shift_px", "trace_shift_rows"]
     assert float(row["trace_shift_px"]) == pytest.approx(0.18)
     assert int(row["trace_shift_rows"]) == 4752
 

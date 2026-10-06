@@ -270,7 +270,9 @@ lines falls back to the behaviour without them if the page shows none.
 3. **Rotation:** a 0.1° Hough transform, refined with the phase drift of the grid lines
    from the top to the bottom of the page.
 4. **Perspective:** the shear and the perspective that the phase field of the grid lines
-   shows are taken out, in the same warp as the rotation.
+   shows are taken out, in the same warp as the rotation. A page whose grid lines are
+   more than a tenth of their period off the fit is kept as it was rotated, with a
+   `WARNING`; `--perspective_tolerance` accepts a larger share.
 5. **Segmentation:** nnU-Net predicts the lead masks of the corrected page.
 6. **Column grid:** all leads are put on one shared column grid, with the column pitch
    from the page height, the origin refined to sub-pixel accuracy on the grid lines and
@@ -305,6 +307,7 @@ lines falls back to the behaviour without them if the page shows none.
 | `--resolution` | `keep`, `lines` | `lines` | `lines` resamples the page so that the printed 1 mm grid lines have the period of a 200 dpi page, the scale the model was trained on. A page within about a tenth of that scale keeps its pixels, because resampling it costs more than the scale does. |
 | `--rotation` | `hough`, `lines` | `lines` | `lines` refines a 0.1° Hough angle with the phase drift of the grid lines, which resolves fractions of a degree. `hough` is the Hough transform of the page in whole degrees only. |
 | `--perspective` | `off`, `lines` | `lines` | `lines` takes the shear and the perspective that the grid lines show out of the rotated page, and leaves a page alone that is straight enough already. `off` keeps the rotated page. |
+| `--perspective_tolerance` | a share of the grid line period, `0.1` to `0.5` | `0.1` | Only for `--perspective lines`: the largest residual of the grid line fit that the perspective stage accepts, as a share of the period of the lines it measures on. `0.1` is the tolerance the stage has always had: a page whose fit is above it keeps the rotated page, with a `WARNING`. The grid of a printed and scanned sheet is not exactly the projective image of a square one, so the fit of such a page can end a little above 0.1, and a larger value rectifies it. Only the perspective stage of the run takes the value. The rotation stage keeps 0.1, and so does `--paper_normalisation auto` where it decides whether the stages read a page as it is, so the decisions of the paper normalisation are those without the flag. A value below 0.1 or above 0.5 is refused when the arguments are read: the flag only widens the stage. A page that is rectified with a residual above 0.1 is in another frame than without the flag, so a mask saved for it without the flag does not fit, and `--mask_folder` says so with its frame `WARNING`. `--verbose` names such a page in one line, `Perspective for record <record>: accepted at --perspective_tolerance <k>, residual <share> of the period (the stage's own tolerance is 0.1), homography applied`, or `…, inside the dead band, page kept` for a page that is accepted and straight enough to be left alone, and `qc.csv` holds the share in `perspective_residual_rel`. Development-set numbers and limits are under *Results on real pages* below. |
 | `--time_mapping` | `bbox`, `grid` | `grid` | `grid` samples all leads on one shared column grid, for the standard 3x4 layout with rhythm strip. `bbox` stretches the bounding box of every lead to its length. |
 | `--grid_pitch` | `page`, `fit` | `page` | Where the column pitch of that grid comes from: `page` from the page height, checked against the least squares fit of the column edges, `fit` from that fit. |
 | `--grid_origin` | `masks`, `lines` | `lines` | `lines` refines origin and pitch of the column grid on the printed grid lines, assuming the first column starts on a grid line. `masks` uses the mask edges only. |
@@ -417,7 +420,16 @@ columns:
   the Hough angle before the grid lines, and `rotation_residual_px`, the residual of the
   grid line phase fit.
 - **Perspective:** `perspective_shift_px`, the largest displacement the rectification
-  causes on the page, and `perspective_residual_px`, the residual of its fit.
+  causes on the page, `perspective_residual_px`, the residual of its fit, and
+  `perspective_residual_rel`, the residual as a share of the grid line period it was
+  measured on, the largest of the rounds of the fit (NaN when the stage did not
+  measure or its fit got no residual). It is the number the stage compares with its
+  tolerance, 0.1 or `--perspective_tolerance`, so it reads the same on pages of any
+  grid line period, and a share above 0.1 on a page without a `WARNING` for the
+  perspective is a page that only the flag let through. This column is the 35th,
+  appended after `row_mapping`, so no column that was there moves; as for
+  `paper_normalisation`, do not append to a `qc.csv` written by an older version, but
+  use a fresh output folder.
 - **Column grid:** `grid_line_contrast`, the amplitude of the grid line comb over the
   neighbouring periods, and `grid_line_shift_px`, how far the grid lines moved the
   origin of the mask grid.
@@ -585,6 +597,26 @@ digital signal with the flags or with both `off` (median lead SNR below 1 dB on 
 mould-damaged scans and below 0 dB on the photographs), and so few of them print no
 `WARNING` of a stage (59 mould-damaged scans, 16 photographs) that the last reading
 above cannot be made there.
+
+`--perspective_tolerance` is not a default: it stays at 0.1, the tolerance the
+perspective stage has always had. On the same 230 clean scans, read with
+`--grid_rescue map --row_mapping lines` and `--perspective_tolerance 0.15` and compared
+with the same reading at 0.1, the perspective stage refuses 24 pages at 0.1, with a
+residual of 0.100 to 0.139 of the grid line period, and rectifies all 24 at 0.15 (their
+masks were predicted once more, in the frame the flag puts them in). On those 24 pages
+the median page SNR rises from 5.49 to 13.92 dB (lead SNR, paired median +6.73 dB,
+patient bootstrap 95 % CI 3.77 to 8.94), and the classifier changes 4 instead of 13 of
+its 120 record and class decisions against the digital signal (−9, 95 % CI −15.4 to
+−3.3). Over the 230 pages, none instead of 12 has a page SNR below 5 dB, the median
+lead SNR goes from 15.02 to 15.26 dB, the classifier changes 23 instead of 32 of its
+1,150 decisions (2.00 instead of 2.78 %) and 1 instead of 7 of the 968 that the digital
+signal puts at least 1 logit from the threshold, and the mean absolute change of its
+class probabilities falls from 0.0194 to 0.0149. The other 206 scans and every
+synthetic page keep byte identical signals. The value 0.15 was chosen on these same
+development pages, so the numbers say what it does there, not what it would do on
+pages it was not chosen on. The mould-damaged scans and the photographs have not been
+measured with it: a page the flag rectifies is in another frame, which the saved masks
+of those pages do not fit.
 
 
 #### Results on synthetic pages

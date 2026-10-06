@@ -335,6 +335,28 @@ def get_parser():
             "straight enough already; off = keep the rotated page."
         ),
     )
+    # GRID_LINE_MAX_SLOPE_RESIDUAL and parse_perspective_tolerance() are defined below
+    # as well.
+    parser.add_argument(
+        "--perspective_tolerance",
+        type=parse_perspective_tolerance,
+        default=GRID_LINE_MAX_SLOPE_RESIDUAL,
+        help=(
+            "Only for --perspective lines. The largest residual of the grid line fit "
+            "that the perspective stage accepts, as a share of the period of the "
+            "lines it measures on, from 0.1 to 0.5. 0.1 (default) = the tolerance the "
+            "stage has always had: a page above it keeps the rotated page, with a "
+            "warning. The grid of a printed and scanned sheet is not exactly the "
+            "projective image of a square one, so its fit can end a little above "
+            "0.1, and a larger value rectifies such a page. Only the perspective "
+            "stage of the run takes the value: the rotation stage keeps 0.1, and so "
+            "does the paper normalisation where it decides whether the stages read a "
+            "page as it is. A page that is rectified above 0.1 is in another frame "
+            "than without the flag, so a mask saved for it without the flag does not "
+            "fit; --verbose names such a page in one line, and the QC column "
+            "perspective_residual_rel holds its residual."
+        ),
+    )
     parser.add_argument(
         "--resolution",
         type=str,
@@ -1284,6 +1306,34 @@ PERSPECTIVE_MIN_SHIFT_PX = 1.0
 # Largest disagreement in pixels between the frame a mask was predicted in and the
 # frame used now, measured at the image corners.
 PERSPECTIVE_MASK_SHIFT_TOLERANCE = 0.1
+# Largest residual --perspective_tolerance can ask the fit to accept, relative to the
+# carrier period. Every window is unwrapped onto the line of the model it is nearest
+# to, so no residual is above half a period and a tolerance beyond it means nothing.
+# The smallest is GRID_LINE_MAX_SLOPE_RESIDUAL, the tolerance of the stage itself.
+PERSPECTIVE_MAX_TOLERANCE = 0.5
+
+
+def parse_perspective_tolerance(text):
+    """The value of --perspective_tolerance, for argparse.
+
+    A share of the carrier period from GRID_LINE_MAX_SLOPE_RESIDUAL, the tolerance the
+    perspective stage has without the flag, to PERSPECTIVE_MAX_TOLERANCE: the flag only
+    widens the stage. Anything else, a text that is no number or NaN included, is an
+    argparse error that says so.
+    """
+    try:
+        value = float(text)
+    except ValueError:
+        value = float("nan")
+    low, high = GRID_LINE_MAX_SLOPE_RESIDUAL, PERSPECTIVE_MAX_TOLERANCE
+    # NaN is in no range, so it is refused here as well.
+    if not low <= value <= high:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a share of the grid line period from {low:g}, the "
+            f"tolerance of the stage itself, to {high:g}: the flag only widens the "
+            f"stage"
+        )
+    return value
 
 
 def _grid_phase_field(darkness, period, axis):
@@ -1444,7 +1494,7 @@ def _grid_map_least_squares(points, values, weights, axes, projective):
     return np.array([[1, 0, centre[0]], [0, 1, centre[1]], [0, 0, 1]]) @ matrix
 
 
-def _perspective_grid_map(darkness, width, height):
+def _perspective_grid_map(darkness, width, height, tolerance=None):
     """Projective map from image pixels to the units of the printed grid lines.
 
     Both line families are measured with one carrier period, the vertical one giving
@@ -1454,7 +1504,11 @@ def _perspective_grid_map(darkness, width, height):
     row, and the inliers are picked again in every round so that a window the first
     model put a line off comes back. Returns (M, info), M is None when info["reason"]
     says why the page gives no usable map.
+    tolerance is the largest residual the fit is kept at, relative to the carrier
+    period, GRID_LINE_MAX_SLOPE_RESIDUAL unless given.
     """
+    if tolerance is None:
+        tolerance = GRID_LINE_MAX_SLOPE_RESIDUAL
     info = {"period": float("nan"), "residual": float("nan"), "windows": 0, "reason": ""}
     profiles, _ = _band_profiles(darkness)
     if profiles.shape[0] == 0:
@@ -1536,7 +1590,7 @@ def _perspective_grid_map(darkness, width, height):
     _, residuals, keep = _unwrap_windows(values, model, period)
     info["windows"] = int(np.count_nonzero(keep))
     info["residual"] = float(np.sqrt(np.mean(residuals[keep] ** 2)) * period)
-    if info["residual"] > GRID_LINE_MAX_SLOPE_RESIDUAL * period:
+    if info["residual"] > tolerance * period:
         info["reason"] = f"grid line phase is {info['residual']:.2f} px off the fit"
         return None, info
     span = points[keep].max(axis=0) - points[keep].min(axis=0)
@@ -1607,7 +1661,7 @@ def warp_page(image, homography):
     return torch.from_numpy(warped.transpose(2, 0, 1).copy())
 
 
-def estimate_perspective(image):
+def estimate_perspective(image, tolerance=None):
     """Homography that takes the shear and the perspective out of a page image.
 
     image is the rotation corrected page as read_image gives it ([3, H, W]) or the
@@ -1616,9 +1670,16 @@ def estimate_perspective(image):
     and the homography through those coordinates rectifies the page. A correction of
     more than PERSPECTIVE_REPEAT_SHIFT_PX is measured again on the warped page, where
     the corners are no longer washed out, and the two are composed.
+    tolerance is the largest residual the fit of a round is kept at, relative to its
+    carrier period: GRID_LINE_MAX_SLOPE_RESIDUAL, which the rotation stage reads as
+    well, unless given (--perspective_tolerance). The grid of a printed and scanned
+    sheet is not exactly projective, and its fit can be a little above that.
     Returns (H_rect, info). H_rect is None when info["reason"] says why the grid lines
     gave no homography, and also, with an empty reason, when the page is straight
-    enough to be left alone.
+    enough to be left alone. info["residual"] is the residual of the last round in
+    pixels, info["residual_rel"] the largest residual of the rounds relative to the
+    carrier period of its round, NaN when no round got as far as a residual: the
+    number a tolerance is compared with, whatever the carrier of the page.
     """
     if not torch.is_tensor(image):
         image = torch.from_numpy(np.ascontiguousarray(image))
@@ -1626,15 +1687,23 @@ def estimate_perspective(image):
     info = {
         "shift": float("nan"),
         "residual": float("nan"),
+        "residual_rel": float("nan"),
         "period": float("nan"),
         "windows": 0,
         "reason": "",
     }
+    # The tolerance goes along only when there is one: without it the fit is called
+    # as it always was, and reads the constant itself.
+    asked = {} if tolerance is None else {"tolerance": tolerance}
     total = None
     for _ in range(2):
         page = image if total is None else warp_page(image, total)
-        matrix, fit = _perspective_grid_map(_darkness(page), width, height)
+        matrix, fit = _perspective_grid_map(_darkness(page), width, height, **asked)
         info.update({key: fit[key] for key in ("period", "residual", "windows")})
+        # fmax leaves out a round that did not get as far as a residual.
+        info["residual_rel"] = float(
+            np.fmax(info["residual_rel"], fit["residual"] / fit["period"])
+        )
         if matrix is None:
             info["reason"] = fit["reason"]
             return None, info
@@ -1649,6 +1718,23 @@ def estimate_perspective(image):
     if info["shift"] < PERSPECTIVE_MIN_SHIFT_PX:
         return None, info
     return total, info
+
+
+def perspective_tolerance_line(record, tolerance, info, applied):
+    """The line of a page whose perspective fit only --perspective_tolerance accepts.
+
+    info is the info of estimate_perspective() at that tolerance, of a fit that was
+    accepted with a residual above GRID_LINE_MAX_SLOPE_RESIDUAL of the period in one
+    of its rounds: without the flag the stage refuses the page. applied says whether
+    the page is warped by the homography of the fit, which puts it in another frame
+    than without the flag, or is left alone inside the dead band.
+    """
+    done = "homography applied" if applied else "inside the dead band, page kept"
+    return (
+        f"Perspective for record {record}: accepted at --perspective_tolerance "
+        f"{tolerance:g}, residual {info['residual_rel']:.4f} of the period (the "
+        f"stage's own tolerance is {GRID_LINE_MAX_SLOPE_RESIDUAL:g}), {done}"
+    )
 
 
 # Period in pixels of the printed 1 mm grid lines of a 200 dpi page, which is the
@@ -1930,7 +2016,9 @@ def paper_chain(image):
         angle = 0.0
     info["rot_angle"] = float(angle)
     rotation = rotation_homography(angle, rescaled.shape[2], rescaled.shape[1])
-    # In the frame of the final warp, as run() measures it.
+    # In the frame of the final warp, as run() measures it, but always at the tolerance
+    # of the stage itself: --perspective_tolerance widens the stage of run(), not the
+    # test of which pages the paper normalisation leaves alone.
     measured = rescaled if angle == 0.0 else warp_page(rescaled, rotation)
     H_rect, perspective_info = estimate_perspective(measured)
     info["persp_reason"] = perspective_info["reason"]
@@ -3801,6 +3889,7 @@ def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
         "column_mapping_shift_px",
         "grid_rescue",
         "row_mapping",
+        "perspective_residual_rel",
     ]
     write_header = not os.path.exists(qc_path)
     with open(qc_path, "a", newline="") as f:
@@ -4025,23 +4114,43 @@ def run(args):
 
         # Rectify
         homography = None
-        perspective_info = {"shift": float("nan"), "residual": float("nan")}
+        perspective_info = {
+            "shift": float("nan"),
+            "residual": float("nan"),
+            "residual_rel": float("nan"),
+        }
         if args.perspective == "lines":
             # The page has to be measured in the frame of the final warp, because
             # rotate() interpolates nearest, which below a twentieth of a degree moves
             # no pixel at all. The bicubic page already is that frame and the warp of a
-            # straight page gives its own pixels back, so neither is warped twice.
+            # straight page gives its own pixels back, so neither is warped twice, and
+            # the paper stage has warped the page it measured into that frame as well.
             if rot_angle == 0.0:
                 measured = image
             elif args.interpolation == "bicubic":
                 measured = image_rotated
-            elif not reuse_perspective:
+            elif reuse_perspective:
+                measured = stages["measured"]
+            else:
                 measured = warp_page(image, rotation)
-            if reuse_perspective:
+            # The paper stage measures at the tolerance of the stage itself, whatever
+            # --perspective_tolerance says. What it returned is what this stage returns
+            # at that tolerance, and at a wider one as well if it came without a
+            # reason: a fit that every round accepted, the dead band included, passes
+            # a wider check as it is. A page it refused is measured again, the same
+            # page in the same frame, at the tolerance of the run.
+            tolerance = args.perspective_tolerance
+            widened = tolerance > GRID_LINE_MAX_SLOPE_RESIDUAL
+            if reuse_perspective and not (
+                widened and stages["perspective_info"]["reason"]
+            ):
                 # Measured by the paper stage already, on the page in that frame.
                 H_rect, perspective_info = stages["H_rect"], stages["perspective_info"]
             else:
-                H_rect, perspective_info = estimate_perspective(measured)
+                # The tolerance goes along only when the flag widens the stage:
+                # without it this is the call it always was.
+                asked = {"tolerance": tolerance} if widened else {}
+                H_rect, perspective_info = estimate_perspective(measured, **asked)
             if perspective_info["reason"]:
                 print(
                     f"WARNING: grid lines not used for the perspective of record "
@@ -4055,6 +4164,18 @@ def run(args):
                     f"{perspective_info['period']:.2f} px, "
                     f"windows {perspective_info['windows']}"
                 )
+                # A fit that only the flag let through: the stage itself refuses it,
+                # so a run without the flag never prints this.
+                if (
+                    widened
+                    and not perspective_info["reason"]
+                    and perspective_info["residual_rel"] > GRID_LINE_MAX_SLOPE_RESIDUAL
+                ):
+                    print(
+                        perspective_tolerance_line(
+                            record, tolerance, perspective_info, H_rect is not None
+                        )
+                    )
             if H_rect is not None:
                 # From the image, so that the page is interpolated only once.
                 homography = H_rect @ rotation
@@ -4470,6 +4591,7 @@ def run(args):
         qc["column_mapping_shift_px"] = column_mapping_shift
         qc["grid_rescue"] = grid_rescue_qc(rescue) if grid_rescue_on else "off"
         qc["row_mapping"] = row_mapping
+        qc["perspective_residual_rel"] = perspective_info["residual_rel"]
         append_qc_row(
             args.output_folder, record, args.lead_placement, qc, max_offset_deviation
         )

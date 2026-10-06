@@ -362,7 +362,7 @@ def test_append_qc_row_writes_the_perspective_columns(tmp_path):
         row = next(reader)
         # The new columns are appended, the old ones keep their order.
         assert reader.fieldnames[:2] == ["record", "placement"]
-        assert reader.fieldnames[-13:-11] == [
+        assert reader.fieldnames[-14:-12] == [
             "perspective_shift_px",
             "perspective_residual_px",
         ]
