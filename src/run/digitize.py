@@ -2,6 +2,7 @@
 import argparse
 import csv
 import cv2
+import hashlib
 import json
 import numpy as np
 import matplotlib.pyplot as plt
@@ -12,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import warnings
+from types import SimpleNamespace
 from scipy.interpolate import CubicSpline
 from scipy.signal import butter, sosfiltfilt
 from tqdm import tqdm
@@ -34,6 +36,8 @@ from config import (
     ADC_GAIN,
     BASELINE,
 )
+from src.run import paper_normalisation
+from src.run import sheet_curl
 
 
 # Parse arguments.
@@ -197,6 +201,52 @@ def get_parser():
         ),
     )
     parser.add_argument(
+        "--grid_rescue",
+        type=str,
+        choices=["off", "map"],
+        default="map",
+        help=(
+            "Only for --time_mapping grid with --grid_origin lines and "
+            "--column_mapping lines. map (default) = a page whose mask edges are off "
+            "one uniform column grid, or whose grid lines are off the origin of the "
+            "masks, is tried once more, with twice the edge tolerance or on the pitch "
+            "of the lines about the centre of the mask grid, and read on that grid "
+            "only if the column map then stands on it; a page whose map does not "
+            "stand is what it is with off, with the same warnings; off = such a page "
+            "falls back to --time_mapping bbox or to the grid of the masks, the "
+            "behaviour before map became the default."
+        ),
+    )
+    parser.add_argument(
+        "--row_mapping",
+        type=str,
+        choices=["off", "lines"],
+        default="lines",
+        help=(
+            "Only on a page whose column map is in use (--column_mapping lines). "
+            "lines (default) = one map per row of leads instead of one for the page: "
+            "the grid lines in the band of each of the four layout rows are measured "
+            "against the page map, and the leads of a row are read on the map of "
+            "their own row, since a printed and scanned sheet moves its rows against "
+            "each other by fractions of a pixel; a row whose lines do not carry a map "
+            "of its own keeps the page map; off = every lead on the page map, the "
+            "reading before lines became the default."
+        ),
+    )
+    # ROW_MAPPING_MEDIAN_MM is defined below as well.
+    parser.add_argument(
+        "--row_mapping_median",
+        type=float,
+        default=ROW_MAPPING_MEDIAN_MM,
+        help=(
+            "Only for --row_mapping lines. Width in grid millimetres of the running "
+            "median of a row's displacement from the page map, which takes out the "
+            "ripple of grid lines snapped to the pixels, as --column_mapping_median "
+            "does for the page map (27 = two periods of it); 0 or less = the "
+            "displacement as measured."
+        ),
+    )
+    parser.add_argument(
         "--trace_estimator",
         type=str,
         choices=["mask", "ink"],
@@ -287,6 +337,116 @@ def get_parser():
             "straight enough already; off = keep the rotated page."
         ),
     )
+    # PERSPECTIVE_TOLERANCE and parse_perspective_tolerance() are defined below as well.
+    parser.add_argument(
+        "--perspective_tolerance",
+        type=parse_perspective_tolerance,
+        default=PERSPECTIVE_TOLERANCE,
+        help=(
+            "Only for --perspective lines. The largest residual of the grid line fit "
+            "that the perspective stage accepts, as a share of the period of the "
+            "lines it measures on, from 0.1 to 0.5: a page above it keeps the rotated "
+            "page, with a warning. 0.15 (default): the grid of a printed and scanned "
+            "sheet is not exactly the projective image of a square one, so its fit "
+            "can end a little above 0.1, and such a page is rectified; on photographs "
+            "a page it rectifies can read worse (README). 0.1 = the "
+            "tolerance of the stage itself, the reading before 0.15 became the "
+            "default, which reproduces older outputs. Only the perspective stage of "
+            "the run takes the value: the rotation stage keeps 0.1, and so does the "
+            "paper normalisation where it decides whether the stages read a page as "
+            "it is. A page that is rectified above 0.1 is in another frame than at "
+            "0.1, so a mask saved for it at 0.1 does not fit, and a run that did not "
+            "name the flag saved its masks at 0.1 before 0.15 became the default: "
+            "read those with --perspective_tolerance 0.1. --verbose names a page that "
+            "is accepted above 0.1 in one line, and the QC column "
+            "perspective_residual_rel holds its residual."
+        ),
+    )
+    parser.add_argument(
+        "--sheet_curl",
+        type=str,
+        choices=["off", "lines"],
+        default="off",
+        help=(
+            "lines = after the perspective, straighten a sheet that is bent, by the "
+            "printed grid lines: a smooth map from the pixels of the page to the "
+            "coordinates of its lines, a projective part and a polynomial per line "
+            "family, is measured in windows over the page, and the page is warped "
+            "into the frame in which the lines are straight before it is segmented. "
+            "A page the map moves by less than --sheet_curl_min_shift is left as it "
+            "is, and so is, with a warning, a page whose lines carry no such map. A "
+            "bend of the whole sheet is taken out, a fold or a local dent is not. "
+            "What was done to a page is written next to its mask by --save_mask: a "
+            "mask saved for a straightened page only fits a run that straightens the "
+            "page by the same map, keeps that record when it is saved again, and a "
+            "mask saved without the stage is warped with its page. off (default) = "
+            "keep the page of the perspective stage."
+        ),
+    )
+    # The defaults of the stage are constants of sheet_curl, the three parse functions
+    # are defined below.
+    parser.add_argument(
+        "--sheet_curl_tolerance",
+        type=parse_sheet_curl_tolerance,
+        default=sheet_curl.TOLERANCE,
+        help=(
+            "Only for --sheet_curl lines. The largest RMS residual of the fit of that "
+            "map that is accepted, as a share of the period of the grid lines, above "
+            "0 and up to 0.5: a page above it is kept as it is, with a warning, and "
+            "so is one whose lines are further than that from straight after the "
+            "warp. 0.25 (default) was chosen on photographs, whose fit leaves 0.10 "
+            "to 0.25 of a period; a clean synthetic page stays below 0.1, and a fit "
+            "above 0.1 can be a wrong map that is accepted."
+        ),
+    )
+    parser.add_argument(
+        "--sheet_curl_passes",
+        type=parse_sheet_curl_passes,
+        default=sheet_curl.PASSES,
+        help=(
+            "Only for --sheet_curl lines. How many measurements may be composed into "
+            "the map, from 1 to 5: the straightened page is measured again, and "
+            "while it still asks for 1 px or more (the threshold of the estimator, "
+            "or --sheet_curl_min_shift where that is smaller) and this number is "
+            "not reached, what it asks for is added to the map; the last "
+            "measurement is the check that the lines are straight. 3 (default) was "
+            "chosen on photographs."
+        ),
+    )
+    parser.add_argument(
+        "--sheet_curl_min_shift",
+        type=parse_sheet_curl_min_shift,
+        default=sheet_curl.MIN_SHIFT_PX,
+        help=(
+            "Only for --sheet_curl lines. The dead band in pixels, 0 or more: a page "
+            "whose accepted map, all passes composed, moves no measured point by "
+            "this much is left as it is, without a warning; a map that moves one by "
+            "exactly this much is applied. It decides whether a map is used, not "
+            "how it is measured: the estimator has a threshold of its own, 1 px, "
+            "for its first measurement, the end of its passes and its check, and "
+            "only a value below 1 takes the place of that threshold. A page left "
+            "alone here was still measured, and a page whose lines carry no map "
+            "is refused with its warning whatever this value is. 15 (default) was "
+            "chosen on development scans and photographs: below it the second "
+            "resampling of a page that reads well, and the warp of its mask, cost "
+            "more than the map gains."
+        ),
+    )
+    parser.add_argument(
+        "--sheet_curl_scope",
+        type=str,
+        choices=list(sheet_curl.SCOPES),
+        default=sheet_curl.SCOPE,
+        help=(
+            "Only for --sheet_curl lines. all (default) = every page; the dead band "
+            "of --sheet_curl_min_shift is what leaves a flat page alone. normalised "
+            "= only a page that the paper normalisation warped onto the Letter "
+            "page, which is a photographed sheet. With --mask_folder that decision "
+            "is the one in the record of the mask and is not made again: under "
+            "normalised a page whose mask has no paper normalisation record, a "
+            "normalised view given as the page included, is out of scope."
+        ),
+    )
     parser.add_argument(
         "--resolution",
         type=str,
@@ -301,6 +461,27 @@ def get_parser():
             "the rotation and the perspective included, sees the resampled "
             "page, and --grid_line_offset is a page unit, so its default stays right "
             "for generator pages of any resolution. keep = take the page as it is."
+        ),
+    )
+    parser.add_argument(
+        "--paper_normalisation",
+        type=str,
+        choices=["off", "auto"],
+        default="auto",
+        help=(
+            "auto (default) = before everything else, put a photographed page into "
+            "the frame the model was trained on: a page whose printed grid lines the "
+            "resolution, the rotation and the perspective stage all read is left as "
+            "it is, and so is one whose grid fills the image; otherwise the four "
+            "edges of the paper are looked for and the sheet is warped onto a US "
+            "Letter landscape page at 200 dpi, long side horizontal, traces in the "
+            "lower part; a page whose paper cannot be found is kept, with a warning, "
+            "or only shrunk to 200 dpi of paper when its grid says it is much larger. "
+            "What was done to a page is written next to its mask by --save_mask, and "
+            "--mask_folder replays it from there instead of deciding again; a mask "
+            "without that record is laid over the page as it is given. "
+            "off = take the page as it is, the behaviour before auto became the "
+            "default; the record of a saved mask is still checked."
         ),
     )
     parser.add_argument(
@@ -671,26 +852,42 @@ BASELINE_DISAGREEMENT_TOLERANCE = 0.004
 NUM_COLUMNS = int(LONG_SIGNAL_LENGTH_SEC / SHORT_SIGNAL_LENGTH_SEC)
 
 
-def _grid_inliers(lead_edges):
-    """Flag the lead edges within GRID_RESIDUAL_TOLERANCE of a Theil-Sen grid."""
+def _grid_inliers(lead_edges, tolerance=None):
+    """Flag the lead edges within GRID_RESIDUAL_TOLERANCE of a Theil-Sen grid.
+
+    tolerance is another one for the same check, relative to the pitch as well.
+    """
+    if tolerance is None:
+        tolerance = GRID_RESIDUAL_TOLERANCE
     boundaries = np.array([edge[0] for edge in lead_edges], float)
     edges = np.array([edge[1] for edge in lead_edges], float)
     i, j = np.triu_indices(len(edges), 1)
     distinct = boundaries[i] != boundaries[j]
     P = np.median((edges[j] - edges[i])[distinct] / (boundaries[j] - boundaries[i])[distinct])
     residuals = edges - boundaries * P
-    return np.abs(residuals - np.median(residuals)) <= GRID_RESIDUAL_TOLERANCE * P
+    return np.abs(residuals - np.median(residuals)) <= tolerance * P
 
 
 def fit_column_grid(
-    signal_masks, signal_positions, image_height, pitch="page", record=""
+    signal_masks,
+    signal_positions,
+    image_height,
+    pitch="page",
+    record="",
+    tolerance=None,
+    quiet=False,
 ):
     """Fit the shared column grid of the standard 3x4 layout with rhythm strip.
 
     Returns (g0, P, long_leads, reason). g0 is the x position of the left edge of
     the first column, P the width of one 2.5 s column in pixels. If the layout is
     not the expected one, g0 and P are None and reason says why.
+    tolerance is how far a column edge may be off the grid, relative to the pitch,
+    GRID_RESIDUAL_TOLERANCE unless given; quiet leaves out the line about a page
+    pitch that does not match. Both are for the second try of rescue_grid_fit().
     """
+    if tolerance is None:
+        tolerance = GRID_RESIDUAL_TOLERANCE
     widths = {
         lead: mask.shape[2] for lead, mask in signal_masks.items() if mask is not None
     }
@@ -728,7 +925,7 @@ def fit_column_grid(
 
     # A mask that runs on past its column (into the margin or the next lead) must
     # not set the column edge, so edges far off the consensus grid are left out.
-    inliers = _grid_inliers(lead_edges)
+    inliers = _grid_inliers(lead_edges, tolerance)
     # Column starts = min x1 per column, column ends = max x-end per column.
     starts, ends = {}, {}
     for (boundary, edge, is_start), inlier in zip(lead_edges, inliers):
@@ -754,13 +951,13 @@ def fit_column_grid(
             # With a fixed pitch no single edge pixel moves the origin by more than 1/n.
             P = P_page
             g0 = np.mean(edges - boundaries * P)
-        else:
+        elif not quiet:
             print(
                 f"Page pitch {P_page:.2f} px does not match the fitted pitch "
                 f"{P_fit:.2f} px for record {record}, using the fitted one."
             )
     residual = np.max(np.abs(edges - (g0 + boundaries * P)))
-    if residual > GRID_RESIDUAL_TOLERANCE * P:
+    if residual > tolerance * P:
         return None, None, long_leads, f"column edges are {residual:.1f} px off the grid"
 
     return float(g0), float(P), long_leads, ""
@@ -834,10 +1031,16 @@ def refine_grid_from_lines(image_rotated, g0, P, snap_offset=GRID_LINE_SNAP_OFFS
     snap_offset is how far in pixels the drawn lines sit right of the traces, 0.5 for
     the matplotlib generator and 0 for a scanned page.
     Returns (g0, P, info). Without usable grid lines g0 and P come back unchanged and
-    info["reason"] says why.
+    info["reason"] says why. info["pitch"] is the column pitch the lines have, also
+    when their origin is refused, and NaN when no lines were found.
     """
     profiles, _ = _band_profiles(_darkness(image_rotated))
-    info = {"contrast": float("nan"), "shift": float("nan"), "reason": ""}
+    info = {
+        "contrast": float("nan"),
+        "shift": float("nan"),
+        "pitch": float("nan"),
+        "reason": "",
+    }
     if profiles.shape[0] == 0:
         info["reason"] = "image too small for the grid line profile"
         return g0, P, info
@@ -866,6 +1069,7 @@ def refine_grid_from_lines(image_rotated, g0, P, snap_offset=GRID_LINE_SNAP_OFFS
         return g0, P, info
 
     P_lines = period * GRID_LINES_PER_COLUMN
+    info["pitch"] = float(P_lines)
     phase = -np.angle(_grid_line_comb(profiles, period).sum()) / (2 * np.pi) * period
     phase -= snap_offset
     # A new pitch turns the mask grid about its centre, not about its origin.
@@ -1192,6 +1396,51 @@ PERSPECTIVE_MIN_SHIFT_PX = 1.0
 # Largest disagreement in pixels between the frame a mask was predicted in and the
 # frame used now, measured at the image corners.
 PERSPECTIVE_MASK_SHIFT_TOLERANCE = 0.1
+# Largest residual --perspective_tolerance can ask the fit to accept, relative to the
+# carrier period. Every window is unwrapped onto the line of the model it is nearest
+# to, so no residual is above half a period and a tolerance beyond it means nothing.
+# The smallest is GRID_LINE_MAX_SLOPE_RESIDUAL, the tolerance of the stage itself.
+PERSPECTIVE_MAX_TOLERANCE = 0.5
+# Largest residual, relative to the carrier period, that the perspective stage of run()
+# accepts unless --perspective_tolerance says otherwise: the default of the flag, and
+# of nothing else. The tolerance of the stage itself stays GRID_LINE_MAX_SLOPE_RESIDUAL,
+# 0.1: the rotation stage, the chain of the paper normalisation and a call of
+# estimate_perspective() without a tolerance read that, and it was the default of the
+# flag before this one, so --perspective_tolerance 0.1 gives the run of before, with
+# its outputs and the frame its masks were predicted in. The grid of a printed and
+# scanned sheet is not exactly the projective image of a square one, so its fit can
+# end a little above 0.1. Chosen on the development clean scans of the
+# ECG-Image-Database (230 pages, read with --grid_rescue map and --row_mapping lines):
+# the stage refuses 24 of them at 0.1, with a residual of 0.100 to 0.139 of the period,
+# and rectifies all 24 at 0.15, where their median page SNR is 13.92 instead of 5.49 dB
+# and none is more than 1 dB worse. On the mould-damaged scans and the photographs of
+# that set it moves 189 pages into another frame, and 6 of the 89 scans and 20 of the
+# 100 photographs among them lose more than 1 dB of page SNR (README, Results on real
+# pages).
+PERSPECTIVE_TOLERANCE = 0.15
+
+
+def parse_perspective_tolerance(text):
+    """The value of --perspective_tolerance, for argparse.
+
+    A share of the carrier period from GRID_LINE_MAX_SLOPE_RESIDUAL, the tolerance of
+    the perspective stage itself, to PERSPECTIVE_MAX_TOLERANCE: the flag only widens
+    the stage. Anything else, a text that is no number or NaN included, is an
+    argparse error that says so.
+    """
+    try:
+        value = float(text)
+    except ValueError:
+        value = float("nan")
+    low, high = GRID_LINE_MAX_SLOPE_RESIDUAL, PERSPECTIVE_MAX_TOLERANCE
+    # NaN is in no range, so it is refused here as well.
+    if not low <= value <= high:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a share of the grid line period from {low:g}, the "
+            f"tolerance of the stage itself, to {high:g}: the flag only widens the "
+            f"stage"
+        )
+    return value
 
 
 def _grid_phase_field(darkness, period, axis):
@@ -1352,7 +1601,7 @@ def _grid_map_least_squares(points, values, weights, axes, projective):
     return np.array([[1, 0, centre[0]], [0, 1, centre[1]], [0, 0, 1]]) @ matrix
 
 
-def _perspective_grid_map(darkness, width, height):
+def _perspective_grid_map(darkness, width, height, tolerance=None):
     """Projective map from image pixels to the units of the printed grid lines.
 
     Both line families are measured with one carrier period, the vertical one giving
@@ -1362,7 +1611,11 @@ def _perspective_grid_map(darkness, width, height):
     row, and the inliers are picked again in every round so that a window the first
     model put a line off comes back. Returns (M, info), M is None when info["reason"]
     says why the page gives no usable map.
+    tolerance is the largest residual the fit is kept at, relative to the carrier
+    period, GRID_LINE_MAX_SLOPE_RESIDUAL unless given.
     """
+    if tolerance is None:
+        tolerance = GRID_LINE_MAX_SLOPE_RESIDUAL
     info = {"period": float("nan"), "residual": float("nan"), "windows": 0, "reason": ""}
     profiles, _ = _band_profiles(darkness)
     if profiles.shape[0] == 0:
@@ -1444,7 +1697,7 @@ def _perspective_grid_map(darkness, width, height):
     _, residuals, keep = _unwrap_windows(values, model, period)
     info["windows"] = int(np.count_nonzero(keep))
     info["residual"] = float(np.sqrt(np.mean(residuals[keep] ** 2)) * period)
-    if info["residual"] > GRID_LINE_MAX_SLOPE_RESIDUAL * period:
+    if info["residual"] > tolerance * period:
         info["reason"] = f"grid line phase is {info['residual']:.2f} px off the fit"
         return None, info
     span = points[keep].max(axis=0) - points[keep].min(axis=0)
@@ -1515,7 +1768,7 @@ def warp_page(image, homography):
     return torch.from_numpy(warped.transpose(2, 0, 1).copy())
 
 
-def estimate_perspective(image):
+def estimate_perspective(image, tolerance=None):
     """Homography that takes the shear and the perspective out of a page image.
 
     image is the rotation corrected page as read_image gives it ([3, H, W]) or the
@@ -1524,9 +1777,17 @@ def estimate_perspective(image):
     and the homography through those coordinates rectifies the page. A correction of
     more than PERSPECTIVE_REPEAT_SHIFT_PX is measured again on the warped page, where
     the corners are no longer washed out, and the two are composed.
+    tolerance is the largest residual the fit of a round is kept at, relative to its
+    carrier period: GRID_LINE_MAX_SLOPE_RESIDUAL, which the rotation stage reads as
+    well, unless given, as run() gives the one of --perspective_tolerance when it is
+    above that (PERSPECTIVE_TOLERANCE by default). The grid of a printed and scanned
+    sheet is not exactly projective, and its fit can be a little above the constant.
     Returns (H_rect, info). H_rect is None when info["reason"] says why the grid lines
     gave no homography, and also, with an empty reason, when the page is straight
-    enough to be left alone.
+    enough to be left alone. info["residual"] is the residual of the last round in
+    pixels, info["residual_rel"] the largest residual of the rounds relative to the
+    carrier period of its round, NaN when no round got as far as a residual: the
+    number a tolerance is compared with, whatever the carrier of the page.
     """
     if not torch.is_tensor(image):
         image = torch.from_numpy(np.ascontiguousarray(image))
@@ -1534,15 +1795,23 @@ def estimate_perspective(image):
     info = {
         "shift": float("nan"),
         "residual": float("nan"),
+        "residual_rel": float("nan"),
         "period": float("nan"),
         "windows": 0,
         "reason": "",
     }
+    # The tolerance goes along only when there is one: without it the fit is called
+    # as it always was, and reads the constant itself.
+    asked = {} if tolerance is None else {"tolerance": tolerance}
     total = None
     for _ in range(2):
         page = image if total is None else warp_page(image, total)
-        matrix, fit = _perspective_grid_map(_darkness(page), width, height)
+        matrix, fit = _perspective_grid_map(_darkness(page), width, height, **asked)
         info.update({key: fit[key] for key in ("period", "residual", "windows")})
+        # fmax leaves out a round that did not get as far as a residual.
+        info["residual_rel"] = float(
+            np.fmax(info["residual_rel"], fit["residual"] / fit["period"])
+        )
         if matrix is None:
             info["reason"] = fit["reason"]
             return None, info
@@ -1557,6 +1826,24 @@ def estimate_perspective(image):
     if info["shift"] < PERSPECTIVE_MIN_SHIFT_PX:
         return None, info
     return total, info
+
+
+def perspective_tolerance_line(record, tolerance, info, applied):
+    """The line of a page whose perspective fit only --perspective_tolerance accepts.
+
+    info is the info of estimate_perspective() at that tolerance, of a fit that was
+    accepted with a residual above GRID_LINE_MAX_SLOPE_RESIDUAL of the period in one
+    of its rounds: at the tolerance of the stage itself, --perspective_tolerance 0.1,
+    the page is refused. applied says whether the page is warped by the homography of
+    the fit, which puts it in another frame than at that tolerance, or is left alone
+    inside the dead band.
+    """
+    done = "homography applied" if applied else "inside the dead band, page kept"
+    return (
+        f"Perspective for record {record}: accepted at --perspective_tolerance "
+        f"{tolerance:g}, residual {info['residual_rel']:.4f} of the period (the "
+        f"stage's own tolerance is {GRID_LINE_MAX_SLOPE_RESIDUAL:g}), {done}"
+    )
 
 
 # Period in pixels of the printed 1 mm grid lines of a 200 dpi page, which is the
@@ -1784,6 +2071,384 @@ def normalise_resolution(image):
     )
     info["scale"] = float(scale)
     return torch.from_numpy(resized.transpose(2, 0, 1).copy()), info
+
+
+# The decisions of the paper normalisation, each with what its record has to hold, on
+# top of the sizes and the digests every record holds, for the view to be built again
+# from the record alone: nothing for a page that was left as it is.
+PAPER_BLOCK_KEYS = {
+    "pass_chain": (),
+    "pass_fullframe": (),
+    "failed": (),
+    "normalised": ("pre_size", "warp"),
+    "scaled": ("resize",),
+}
+
+
+def page_sha1(image):
+    """SHA-1 of the pixels of a page tensor [C, H, W], read row by row, channels last.
+
+    That is the digest of the H x W x C array of the page, so two pages agree in it
+    only if they agree in every pixel, whatever file either of them was read from.
+    """
+    array = np.ascontiguousarray(image.permute(1, 2, 0).numpy())
+    return hashlib.sha1(array.tobytes()).hexdigest()
+
+
+def paper_chain(image):
+    """What the stages before the segmentation make of a page as it is.
+
+    The resolution, the rotation and the perspective stage in the order of run(), each
+    with the grid lines whatever the flags of the run say: a page all three of them
+    read is one the paper normalisation has to leave alone.
+    Returns (info, stages). info holds the numbers and the reasons of the three stages,
+    and info["ok"] says that none of them fell back, which is the page run() prints no
+    "grid lines not used" warning for at --perspective_tolerance 0.1. stages holds what
+    the stages returned, so that run() need not measure the same page a second time:
+    the resampled page and its info, the angle as estimate_rotation() gave it, None or
+    NaN included, and its info, the page the perspective was measured on, and its
+    homography and info.
+    """
+    rescaled, resolution_info = normalise_resolution(image)
+    info = {
+        "res_reason": resolution_info.get("reason", ""),
+        "res_scale": resolution_info["scale"],
+        "res_period": resolution_info["period"],
+        "res_contrast": resolution_info.get("contrast", float("nan")),
+        "res_harmonic": resolution_info.get("harmonic", 0),
+    }
+    rot_angle, rotation_info = estimate_rotation(rescaled, "lines")
+    info["rot_reason"] = rotation_info["reason"]
+    info["rot_contrast"] = rotation_info["contrast"]
+    info["rot_coarse"] = rotation_info["coarse"]
+    angle = rot_angle
+    if angle is None or np.isnan(angle):
+        angle = 0.0
+    info["rot_angle"] = float(angle)
+    rotation = rotation_homography(angle, rescaled.shape[2], rescaled.shape[1])
+    # In the frame of the final warp, as run() measures it, but always at the tolerance
+    # of the stage itself: --perspective_tolerance widens the stage of run(), not the
+    # test of which pages the paper normalisation leaves alone.
+    measured = rescaled if angle == 0.0 else warp_page(rescaled, rotation)
+    H_rect, perspective_info = estimate_perspective(measured)
+    info["persp_reason"] = perspective_info["reason"]
+    info["persp_shift"] = perspective_info["shift"]
+    info["persp_residual"] = perspective_info["residual"]
+    info["persp_windows"] = perspective_info["windows"]
+    info["persp_applied"] = int(H_rect is not None)
+    info["ok"] = not (
+        info["res_reason"] or info["rot_reason"] or info["persp_reason"]
+    )
+    info["size"] = f"{rescaled.shape[2]}x{rescaled.shape[1]}"
+    stages = {
+        "image": rescaled,
+        "resolution_info": resolution_info,
+        "rot_angle": rot_angle,
+        "rotation_info": rotation_info,
+        "measured": measured,
+        "H_rect": H_rect,
+        "perspective_info": perspective_info,
+    }
+    return info, stages
+
+
+def paper_frame_periods(page):
+    """Period of the printed 1 mm grid lines of a page along x and along y.
+
+    page is an H x W x 3 array, the sheet as the paper normalisation warped it.
+    measure_grid_period() on the page and on the page transposed, each NaN when it
+    rejects the comb, with the period before that rejection (raw) and the contrast of
+    the comb.
+    """
+    t = torch.from_numpy(np.ascontiguousarray(page.transpose(2, 0, 1)))
+    px, ix = measure_grid_period(t)
+    py, iy = measure_grid_period(t.permute(0, 2, 1).contiguous())
+    return {
+        "px": float(px),
+        "py": float(py),
+        "px_raw": float(ix.get("period", np.nan)),
+        "py_raw": float(iy.get("period", np.nan)),
+        "cx": float(ix.get("contrast", np.nan)),
+        "cy": float(iy.get("contrast", np.nan)),
+    }
+
+
+def normalise_paper(image):
+    """Put a photographed page into the frame the model reads, or leave the page alone.
+
+    image is the page as read_image gives it. What is done with it is decided by
+    paper_normalisation.normalise_page() on the pixels alone, with paper_chain() as
+    the test of a page that needs nothing and paper_frame_periods() as the check of a
+    warped one: pass_chain and pass_fullframe leave the page as it is, normalised is
+    the sheet warped onto the 2200 x 1700 page, scaled the page shrunk to 200 dpi of
+    paper, and failed a page whose paper was not found, left as it is as well.
+    Returns (view, block, meta, stages). view is the page to go on with, the very
+    tensor that came in when the page was left as it is. block is the record of what
+    was done, in plain values for the JSON next to a mask: the view is built again
+    from it alone, see check_paper_block(). meta is everything the decision was made
+    on. stages is what paper_chain() measured on a page that was left as it is, for
+    run() to use, and None for a page that was changed.
+    """
+    width, height = int(image.shape[2]), int(image.shape[1])
+    kept = {}
+    if image.shape[0] != 3:
+        # The paper search reads colour. A page of another number of channels only
+        # goes through the chain, which raises on what the stages cannot read.
+        info, kept["stages"] = paper_chain(image)
+        meta = {
+            "decision": "pass_chain" if info["ok"] else "failed",
+            "reason": "" if info["ok"] else f"page has {image.shape[0]} channels",
+            "size": f"{width}x{height}",
+            "chain": info,
+        }
+        pixels = None
+    else:
+        rgb = np.ascontiguousarray(image.permute(1, 2, 0).numpy())
+
+        def chain(_):
+            # On the tensor run() goes on with, not on the copy of its pixels, so that
+            # what the stages return here is what they would return there.
+            info, kept["stages"] = paper_chain(image)
+            return info
+
+        pixels, meta = paper_normalisation.normalise_page(
+            rgb, chain, paper_frame_periods
+        )
+    view = image if pixels is None else torch.from_numpy(pixels).permute(2, 0, 1)
+
+    block = {
+        "version": paper_normalisation.VERSION,
+        # A warp is only the same pixels under the same libraries.
+        "libraries": f"numpy {np.__version__} cv2 {cv2.__version__}",
+        "decision": meta["decision"],
+        "reason": meta["reason"],
+        "input_size": [width, height],
+        "input_sha1": page_sha1(image),
+        "output_size": [int(view.shape[2]), int(view.shape[1])],
+    }
+    block["view_sha1"] = block["input_sha1"] if pixels is None else page_sha1(view)
+    if meta["decision"] == "normalised":
+        block["pre_size"] = [int(side) for side in meta["pre_size"]]
+        block["warp"] = np.asarray(meta["warp"], float).tolist()
+        block["homography"] = np.asarray(meta["homography"], float).tolist()
+        block["orientation"] = int(meta["orientation"])
+    elif meta["decision"] == "scaled":
+        block["resize"] = [int(side) for side in meta["resize"]]
+        block["scaled_from"] = meta["scaled_from"]
+        block["scale_factor"] = float(meta["scale_factor"])
+    return view, block, meta, kept["stages"] if pixels is None else None
+
+
+def check_paper_block(block, image, record, flag):
+    """The page a saved mask was predicted on, from the record next to the mask.
+
+    block is the paper normalisation record of the mask, image the page of this run
+    and flag its --paper_normalisation. A normalised page has the size of every other
+    one, so the size check of the mask cannot tell a mask of that view from a mask of
+    another: the digests of the record can. The page is never decided again. Either
+    it already is the view the mask was predicted on, with either flag, or, with
+    "auto", it is the page that view was made from and the view is built again from
+    the numbers of the record, pixel for pixel. Everything else is a ValueError that
+    names the record and says how to go on, before any stage has run: a mask laid
+    over another page gives signals that look like signals.
+    Returns (view, how), how is "view" for a page that already was the view, which
+    then is the very tensor that came in, and "replayed" for one built again.
+    """
+
+    def refusal(what):
+        # Every refusal names the record and ends on the two ways out of it.
+        return ValueError(
+            f"Mask of record {record} {what} Give the page the mask was predicted "
+            f"on, or remove the paper_normalisation key from the mask's JSON to "
+            f"take the page as given."
+        )
+
+    known = ", ".join(repr(v) for v in paper_normalisation.REPLAYABLE)
+    if not isinstance(block, dict):
+        raise refusal(
+            "has a paper normalisation record that is not an object; "
+            "the mask does not fit."
+        )
+    if "version" not in block:
+        raise refusal(
+            f"has a paper normalisation record without a version, this code reads "
+            f"{known}; the mask does not fit."
+        )
+    version = block["version"]
+    if version not in paper_normalisation.REPLAYABLE:
+        raise refusal(
+            f"has a paper normalisation record of version {version!r}, this code "
+            f"reads {known}; the mask does not fit."
+        )
+    decision = block.get("decision")
+    if not isinstance(decision, str) or decision not in PAPER_BLOCK_KEYS:
+        raise refusal(
+            f"has a paper normalisation record with the decision {decision!r}, "
+            f"known are {', '.join(PAPER_BLOCK_KEYS)}; the mask does not fit."
+        )
+    needed = ("input_size", "output_size", "input_sha1", "view_sha1")
+    missing = [key for key in needed + PAPER_BLOCK_KEYS[decision] if key not in block]
+    if missing:
+        raise refusal(
+            f"has a paper normalisation record of a {decision} page without "
+            f"{', '.join(missing)}; the mask does not fit."
+        )
+
+    size = [int(image.shape[2]), int(image.shape[1])]
+    digest = page_sha1(image)
+    if size == block["output_size"] and digest == block["view_sha1"]:
+        return image, "view"
+
+    # A page of the size of the one a normalised or a scaled view was made from.
+    input_sized = decision in ("normalised", "scaled") and size == block["input_size"]
+    if flag == "auto" and input_sized:
+        if digest != block["input_sha1"]:
+            raise refusal(
+                f"was predicted on the {decision} view of a page with SHA-1 "
+                f"{block['input_sha1']}, the page of this size given now has SHA-1 "
+                f"{digest}: another input page; the mask does not fit."
+            )
+        try:
+            rgb = np.ascontiguousarray(image.permute(1, 2, 0).numpy())
+            pixels = paper_normalisation.replay_page(rgb, block)
+            view = torch.from_numpy(pixels).permute(2, 0, 1)
+            replayed = [int(view.shape[2]), int(view.shape[1])]
+            replayed_digest = page_sha1(view)
+        except Exception as error:
+            # Numbers no view is built from, as in a record that was written or
+            # changed by hand: whatever numpy, cv2 or torch say to them.
+            raise refusal(
+                f"has the paper normalisation record of a {decision} page: the "
+                f"record cannot be replayed ({type(error).__name__}: "
+                f"{' '.join(str(error).split())}); the mask does not fit."
+            ) from error
+        # What differs comes first. The libraries are told as well, because a warp
+        # is only the same pixels under the same ones.
+        libraries = (
+            f"(libraries then: {block.get('libraries', 'not recorded')}, now: "
+            f"numpy {np.__version__} cv2 {cv2.__version__})"
+        )
+        if replayed != block["output_size"]:
+            raise refusal(
+                f"was predicted on a {decision} view of {block['output_size']} px "
+                f"(width, height), the view built again from its record is "
+                f"{replayed} px: another size {libraries}; the mask does not fit."
+            )
+        if replayed_digest != block["view_sha1"]:
+            raise refusal(
+                f"was predicted on a {decision} view of {replayed} px (width, "
+                f"height) with SHA-1 {block['view_sha1']}, the view built again "
+                f"from its record has that size and SHA-1 {replayed_digest}: other "
+                f"pixels {libraries}; the mask does not fit."
+            )
+        return view, "replayed"
+
+    if (
+        block["input_size"] == block["output_size"]
+        and block["input_sha1"] == block["view_sha1"]
+    ):
+        # The view is the page it was made from, as for every page that was left
+        # as it is: one size and one digest, said once.
+        predicted = (
+            f"a {decision} page of {block['output_size']} px (width, height) with "
+            f"SHA-1 {block['view_sha1']}"
+        )
+        remedy = "the mask was predicted on another page"
+    else:
+        predicted = (
+            f"a {decision} view of {block['output_size']} px (width, height) with "
+            f"SHA-1 {block['view_sha1']}, made from a page of "
+            f"{block['input_size']} px with SHA-1 {block['input_sha1']}"
+        )
+        if input_sized and digest == block["input_sha1"]:
+            # Only with the flag off: under auto this page has been replayed above.
+            remedy = "pass --paper_normalisation auto to replay the mask's record"
+        elif input_sized and size != block["output_size"]:
+            remedy = "the mask was predicted on the view of another input page"
+        else:
+            remedy = "the mask was predicted on another view"
+    raise refusal(
+        f"was predicted on {predicted}; the page given now is {size} px with SHA-1 "
+        f"{digest}; the mask does not fit: {remedy}."
+    )
+
+
+def parse_sheet_curl_tolerance(text):
+    """The value of --sheet_curl_tolerance, for argparse.
+
+    A share of the grid line period above 0 and up to sheet_curl.MAX_TOLERANCE, half a
+    period: no residual is above that. Anything else, a text that is no number or NaN
+    included, is an argparse error that says so.
+    """
+    try:
+        value = float(text)
+    except ValueError:
+        value = float("nan")
+    # NaN is in no range, so it is refused here as well.
+    if not 0 < value <= sheet_curl.MAX_TOLERANCE:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a share of the grid line period above 0 and up to "
+            f"{sheet_curl.MAX_TOLERANCE:g}"
+        )
+    return value
+
+
+def parse_sheet_curl_passes(text):
+    """The value of --sheet_curl_passes, for argparse: a whole number from 1 to
+    sheet_curl.MAX_PASSES, anything else is an argparse error that says so."""
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
+    if not 1 <= value <= sheet_curl.MAX_PASSES:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a whole number from 1 to {sheet_curl.MAX_PASSES}"
+        )
+    return value
+
+
+def parse_sheet_curl_min_shift(text):
+    """The value of --sheet_curl_min_shift, for argparse: a number of pixels of 0 or
+    more, anything else, NaN and infinity included, is an argparse error."""
+    try:
+        value = float(text)
+    except ValueError:
+        value = float("nan")
+    if not 0 <= value < float("inf"):
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a number of pixels of 0 or more"
+        )
+    return value
+
+
+def sheet_curl_helpers():
+    """What the sheet curl stage takes from this module, as one object.
+
+    sheet_curl has no import of this module, which imports it: the grid line helpers of
+    the perspective stage and the constants that go with them are handed to it, by the
+    names of sheet_curl.HELPERS and as they are at the time of the call, so that a
+    function that is replaced here for the time of a run is the one the stage calls.
+    """
+    return SimpleNamespace(**{name: globals()[name] for name in sheet_curl.HELPERS})
+
+
+def check_mask_sheet_curl(saved, record, field, kept=""):
+    """Warn when a saved mask was predicted on a page straightened otherwise than now.
+
+    saved is the sheet curl record next to the mask, None for a mask without one, as
+    every mask saved without --sheet_curl lines; field is the map this run straightens
+    the page by, None when it keeps the page as it is, and kept then says why. A mask
+    whose record says applied was predicted on the straightened page: it fits a page
+    that this run straightens by the same map, to sheet_curl.MASK_SHIFT_TOLERANCE at
+    the points of the record, and no other.
+    Returns whether the mask lives in the straightened frame, in which case it is used
+    as it is; a mask that does not was predicted on the page as the perspective stage
+    left it, and run() warps it with the page when it straightens the page.
+    """
+    straightened, problem = sheet_curl.mask_frame(saved, field, kept)
+    if problem:
+        print(f"WARNING: mask of record {record} {problem}; the mask does not fit.")
+    return straightened
 
 
 def baseline_row(ratio, image_height, scale=1.0):
@@ -2480,6 +3145,519 @@ def measure_column_mapping(
     return x_map, info
 
 
+# Residual tolerance of the column grid on the second try of --grid_rescue map, twice
+# GRID_RESIDUAL_TOLERANCE. A printed and scanned sheet can have a column a few per cent
+# narrower than the others, which puts its mask edges further off one uniform grid than
+# the first try allows. That is the distortion the column map measures, so the second
+# try is kept only if the map then stands on it. Development pages of the
+# ECG-Image-Database (see the README), 230 clean scans read with this value and no
+# other: the rescue changes 14 of them and leaves 216 byte identical, the leads without
+# a usable signal drop from 3.9 to 1.8 %, and the 5 colour scans it rescues go from a
+# median lead SNR of 1.20 to 12.73 dB; 4 colour scans are tried and refused by the map.
+GRID_RESCUE_RESIDUAL_TOLERANCE = 0.04
+
+
+def _fit_failed_on_edges(reason):
+    """True for the failures of fit_column_grid() that --grid_rescue map tries again.
+
+    They are the two that a distorted column causes, its edges being off the grid of
+    the other columns. Every other failure is a page that is not the 3x4 layout with
+    rhythm strip, which no column map mends.
+    """
+    return reason == "a column has all its edges off the grid" or (
+        reason.startswith("column edges are ") and reason.endswith(" px off the grid")
+    )
+
+
+def _lines_refused_by_phase(reason):
+    """True for the refusal of refine_grid_from_lines() that --grid_rescue map tries
+    again: grid lines that were found, but further off the mask origin than allowed."""
+    return reason.startswith("next grid line is ") and reason.endswith(
+        " px off the mask origin"
+    )
+
+
+def _map_refusal(x_map, map_info):
+    """Why a column map is not in use, "" if it is."""
+    if x_map is not None:
+        return ""
+    return map_info["reason"] or "dead band"
+
+
+def rescue_grid_phase(
+    image_rotated,
+    g0,
+    P,
+    grid_lines,
+    edges,
+    snap_offset=GRID_LINE_SNAP_OFFSET,
+    median_mm=COLUMN_MAPPING_MEDIAN_MM,
+):
+    """Second try of a page whose grid lines are off the origin of the mask grid.
+
+    refine_grid_from_lines() refuses lines whose nearest one is further off the mask
+    origin than GRID_LINE_SHIFT_TOLERANCE, and the page then keeps the grid of the
+    masks without a column map. On a scanned sheet with a distorted column it is the
+    uniform grid of the masks that is off, not the lines, and the column map does not
+    need that origin: it finds its own on the mask edges of all leads, each read at its
+    own millimetre. So the map is measured on the grid the lines give without the
+    origin that was refused, their pitch with the mask grid turned about its centre, as
+    refine_grid_from_lines() turns it before it looks for the next line. With the
+    pitch of the masks instead, the 5 development colour scans the rescue reads came
+    to 11.19 dB in place of 12.73 dB.
+    g0 and P are the grid of the masks, grid_lines the info of the refusal and edges
+    column_mapping_edges(); snap_offset and median_mm are those of
+    measure_column_mapping().
+    Returns a dict: "refused" is "" when the map stands, and then "g0" and "P" are the
+    grid it was measured on, "grid_lines" the info of the lines without its reason
+    (contrast and shift as measured) and "x_map" and "map_info" the map, which run()
+    reads the page on without measuring it again; otherwise "refused" says why the
+    map does not stand and the page is to be left as it was. "how" is "phase" and
+    "was" the reason of the refusal that was tried again.
+    """
+    P_lines = grid_lines["pitch"]
+    g0_lines = float(g0 + NUM_COLUMNS / 2 * (P - P_lines))
+    x_map, map_info = measure_column_mapping(
+        image_rotated,
+        g0_lines,
+        P_lines,
+        edges,
+        snap_offset=snap_offset,
+        median_mm=median_mm,
+    )
+    used = dict(grid_lines)
+    used["reason"] = ""
+    return {
+        "how": "phase",
+        "was": grid_lines["reason"],
+        "refused": _map_refusal(x_map, map_info),
+        "g0": g0_lines,
+        "P": P_lines,
+        "grid_lines": used,
+        "x_map": x_map,
+        "map_info": map_info,
+    }
+
+
+def rescue_grid_fit(
+    image_rotated,
+    signal_masks,
+    signal_positions,
+    pitch,
+    record,
+    was,
+    snap_offset=GRID_LINE_SNAP_OFFSET,
+    median_mm=COLUMN_MAPPING_MEDIAN_MM,
+):
+    """Second try of a page whose mask edges are off one uniform column grid.
+
+    fit_column_grid() gives no grid when the edges of a column are further off it than
+    GRID_RESIDUAL_TOLERANCE, and the page then falls back to --time_mapping bbox. The
+    fit is tried again with GRID_RESCUE_RESIDUAL_TOLERANCE, the grid lines refine that
+    grid as they refine every other, through rescue_grid_phase() if they are refused
+    by their origin, and the column map is measured on the result. The grid is kept
+    only if that map stands: a page whose edges are off the grid for another reason
+    than a distorted column has no map to show for it and stays as it was.
+    signal_masks, signal_positions, pitch and record are those of fit_column_grid(),
+    was the reason it failed with; snap_offset and median_mm are those of
+    measure_column_mapping().
+    Returns the dict of rescue_grid_phase() with "long_leads" of the fit added. "how"
+    is "fit", or "fit+phase" when the grid lines were tried again as well, and "g0"
+    and "P" are the grid after the lines, so run() does not refine it again. A second
+    try that does not get as far as a map has only "how", "was" and "refused".
+    """
+    # The second fit says nothing: its grid is in the line of the rescue, or dropped.
+    g0, P, long_leads, reason = fit_column_grid(
+        signal_masks,
+        signal_positions,
+        image_rotated.shape[1],
+        pitch,
+        record,
+        tolerance=GRID_RESCUE_RESIDUAL_TOLERANCE,
+        quiet=True,
+    )
+    if g0 is None:
+        return {"how": "fit", "was": was, "refused": f"second fit: {reason}"}
+    edges = column_mapping_edges(signal_masks, signal_positions, long_leads)
+    g0, P, grid_lines = refine_grid_from_lines(
+        image_rotated, g0, P, snap_offset=snap_offset
+    )
+    if _lines_refused_by_phase(grid_lines["reason"]):
+        rescue = rescue_grid_phase(
+            image_rotated, g0, P, grid_lines, edges, snap_offset, median_mm
+        )
+        rescue["how"] = "fit+phase"
+        rescue["was"] = f"{was}; {grid_lines['reason']}"
+    elif grid_lines["reason"]:
+        refused = f"grid lines: {grid_lines['reason']}"
+        return {"how": "fit", "was": was, "refused": refused}
+    else:
+        x_map, map_info = measure_column_mapping(
+            image_rotated, g0, P, edges, snap_offset=snap_offset, median_mm=median_mm
+        )
+        rescue = {
+            "how": "fit",
+            "was": was,
+            "refused": _map_refusal(x_map, map_info),
+            "g0": g0,
+            "P": P,
+            "grid_lines": grid_lines,
+            "x_map": x_map,
+            "map_info": map_info,
+        }
+    rescue["long_leads"] = long_leads
+    return rescue
+
+
+def grid_rescue_line(record, rescue):
+    """The line of a page --grid_rescue map tried again, rescued or refused.
+
+    rescue is the dict of rescue_grid_fit() or rescue_grid_phase(). A rescued page
+    names which check was tried again and the numbers of the map it is read on.
+    """
+    if rescue["refused"]:
+        return (
+            f"Grid rescue for record {record}: refused ({rescue['refused']}), page "
+            f"left as it is; {rescue['how']} tried again, was: {rescue['was']}"
+        )
+    map_info = rescue["map_info"]
+    return (
+        f"Grid rescue for record {record}: {rescue['how']}, read on the column map "
+        f"of the second try (g0 {rescue['g0']:.2f} px, P {rescue['P']:.2f} px, shift "
+        f"{map_info['shift']:.2f} px, windows {map_info['windows']}, agreement "
+        f"{map_info['agreement']:.3f}, origin offset "
+        f"{map_info['origin_offset']:+.2f} px); was: {rescue['was']}"
+    )
+
+
+def grid_rescue_qc(rescue):
+    """The grid_rescue column of qc.csv for a page of a run with --grid_rescue map.
+
+    "" for a page that failed no check that is tried again (rescue None), which check
+    was tried again for a rescued page, "refused: <reason>" for one that is left as
+    it is.
+    """
+    if rescue is None:
+        return ""
+    if rescue["refused"]:
+        return f"refused: {rescue['refused']}"
+    return rescue["how"]
+
+
+# Layout row of every short lead of the standard 3x4 page, from the top: the rows of
+# Y_SHIFT_RATIO in config.py. The rhythm strip is the row below them.
+LAYOUT_ROW = {
+    "I": 0,
+    "aVR": 0,
+    "V1": 0,
+    "V4": 0,
+    "II": 1,
+    "aVL": 1,
+    "V2": 1,
+    "V5": 1,
+    "III": 2,
+    "aVF": 2,
+    "V3": 2,
+    "V6": 2,
+}
+RHYTHM_ROW = 3
+NUM_ROWS = 4
+# A row band lower than this many pixel rows has no grid line profile to measure: a
+# tenth of the band of a row on a 200 dpi page.
+ROW_MAPPING_MIN_BAND_ROWS = 30
+# Width in grid millimetres of the running median of a row's displacement from the page
+# map (--row_mapping_median): two periods of the 13.5 mm ripple of grid lines snapped to
+# the pixels, where the page map takes one (COLUMN_MAPPING_MEDIAN_MM); the profile of a
+# row has about a sixth of the rows of the page under it. Chosen on the development
+# clean scans of the ECG-Image-Database (230 pages, --grid_rescue map and --row_mapping
+# lines against both off), where only these two widths were read: with 13.5 mm the
+# paired median gain of a lead is +1.33 dB (patient bootstrap 95 % CI 1.20 to 1.53) and
+# 295 leads are more than 1 dB worse; with 27 mm it is +1.39 dB (1.21 to 1.58) and 250
+# leads, and a PTB-XL diagnostic classifier changes 32 instead of 34 of its 1,150
+# record and class decisions (44 with both off).
+ROW_MAPPING_MEDIAN_MM = 27.0
+
+
+def lead_row(lead, long_leads):
+    """Layout row of a lead: RHYTHM_ROW for a rhythm strip, None for a lead in no row."""
+    if lead in long_leads:
+        return RHYTHM_ROW
+    return LAYOUT_ROW.get(lead)
+
+
+def _column_map_m(knots_m, knots_x, period, x):
+    """The grid millimetre of a trace x on a column map: _column_map_x() inverted."""
+    x = np.asarray(x, dtype=float)
+    m = np.interp(x, knots_x, knots_m)
+    m = np.where(x < knots_x[0], knots_m[0] + (x - knots_x[0]) / period, m)
+    return np.where(x > knots_x[-1], knots_m[-1] + (x - knots_x[-1]) / period, m)
+
+
+def measure_row_mapping(
+    image_rotated,
+    g0,
+    P,
+    signal_masks,
+    signal_positions,
+    long_leads,
+    map_info,
+    snap_offset=GRID_LINE_SNAP_OFFSET,
+    median_mm=ROW_MAPPING_MEDIAN_MM,
+):
+    """One x -> time map per layout row, measured against the column map of the page.
+
+    measure_column_mapping() sums the grid line profiles of all bands of rows, so its
+    map is the mean of the page. A printed and scanned sheet moves its rows against
+    each other by fractions of a pixel, and a lead follows the lines of its own row:
+    on development scans the lag left in a lead after the page map followed the
+    displacement of the printed grid in the band of its row (r -0.63 to -0.79). So the
+    lines are measured once more in the band of each row, and a row is given the page
+    map moved by what its own lines say.
+    Rows: 0 to 2 the short leads as LAYOUT_ROW has them, 3 the rhythm strip. The centre
+    of a row is the median over its leads of the median row of their mask pixels, its
+    band reaches halfway to the neighbouring centres and half a row spacing beyond the
+    outer ones. The band is cut into sub-bands of about GRID_LINE_BAND_HEIGHT rows,
+    each reduced to its median profile, and those whose comb is weaker than
+    GRID_LINE_MIN_BAND_AMPLITUDE of the median comb of the page's bands are left out.
+    The 1 mm offset of the windows of _column_mapping_windows() along that profile is
+    known modulo a line only, and the page map says which line: the displacement d of
+    a window is its line next to the page line at its centre, minus that page line.
+    A window is kept with a comb of COLUMN_MAPPING_MIN_WINDOW_AMPLITUDE of the row's
+    median and |d| within COLUMN_MAPPING_BRANCH_TOLERANCE of a line; d is smoothed with
+    a running median over median_mm grid millimetres (0 or less for none), and the
+    knots of the row are those of the page moved by d, held beyond the outer windows.
+    A row keeps the page map unless its windows cover COLUMN_MAPPING_MIN_COVERAGE of
+    those inside the columns its leads read, leave no stretch of COLUMN_MAPPING_MAX_GAP
+    columns there without one, and give knots that grow along x. A row whose lines are
+    further off the page map than the branch tolerance loses its windows that way and
+    stays on the page map, which is then off for it by that much: its reason says so.
+    image_rotated, g0, P and snap_offset are what measure_column_mapping() was called
+    with and map_info what it returned with its map; signal_masks, signal_positions
+    and long_leads are those of column_mapping_edges().
+    Returns a list of NUM_ROWS dicts: "accepted", "why" (the reason a row keeps the
+    page map), "x_map" (None unless accepted; as the map of measure_column_mapping()),
+    "knots_x", "windows" kept of "inside" the row's columns, "beyond" (windows with
+    lines further off than the branch tolerance), "coverage", "gap", "shift" (the
+    largest move of a sample the row reads, px), "columns" the row reads, "band" and
+    "d" (per column the median, smallest and largest move of its samples, px).
+    """
+    period = P / GRID_LINES_PER_COLUMN
+    knots_m = np.asarray(map_info["knots_m"], dtype=float)
+    knots_x = np.asarray(map_info["knots_x"], dtype=float)
+    nan = float("nan")
+    rows = [
+        {
+            "row": row,
+            "accepted": False,
+            "why": "",
+            "x_map": None,
+            "knots_x": None,
+            "windows": 0,
+            "inside": 0,
+            "beyond": 0,
+            "coverage": nan,
+            "gap": nan,
+            "shift": nan,
+            "columns": [],
+            "band": None,
+            "d": [(nan, nan, nan)] * NUM_COLUMNS,
+        }
+        for row in range(NUM_ROWS)
+    ]
+
+    def fail(why):
+        for out in rows:
+            out["why"] = why
+        return rows
+
+    # The rows of the layout, from the masks the page was cut into.
+    centres, read = {}, {}
+    for lead, mask in signal_masks.items():
+        if mask is None:
+            continue
+        row = lead_row(lead, long_leads)
+        if row is None:
+            continue
+        if row == RHYTHM_ROW:
+            lead_columns = range(NUM_COLUMNS)
+        else:
+            lead_columns = [
+                int(STANDARD_LEAD_OFFSETS_SEC[lead] / SHORT_SIGNAL_LENGTH_SEC)
+            ]
+        counts = (mask[0].numpy() > 0).sum(axis=1)
+        total = counts.sum()
+        if total == 0:
+            continue
+        # Median row of the mask pixels; pixel row r covers [r, r+1).
+        middle = int(np.searchsorted(np.cumsum(counts), total / 2))
+        centres.setdefault(row, []).append(signal_positions[lead]["y1"] + middle + 0.5)
+        read.setdefault(row, set()).update(lead_columns)
+    missing = [str(row) for row in range(NUM_ROWS) if row not in centres]
+    if missing:
+        return fail(f"row bands: no lead of row {' '.join(missing)}")
+    centre = np.array([np.median(centres[row]) for row in range(NUM_ROWS)])
+    if np.any(np.diff(centre) <= 0):
+        return fail("row bands: row centres not in order")
+    darkness = _darkness(image_rotated)
+    band_edges = np.clip(
+        np.r_[
+            centre[0] - (centre[1] - centre[0]) / 2,
+            (centre[1:] + centre[:-1]) / 2,
+            centre[-1] + (centre[-1] - centre[-2]) / 2,
+        ],
+        0,
+        darkness.shape[0],
+    )
+    page_profiles, _ = _band_profiles(darkness)
+    if page_profiles.shape[0] == 0:
+        return fail("image too small for the grid line profile")
+    page_weight = float(np.median(np.abs(_grid_line_comb(page_profiles, period))))
+    low = g0 - COLUMN_MAPPING_REACH * P
+    high = g0 + (NUM_COLUMNS + COLUMN_MAPPING_REACH) * P
+    # The columns as the page map places them, in the coordinate of the lines.
+    column_x = (
+        _column_map_x(
+            knots_m, knots_x, period, np.arange(NUM_COLUMNS + 1) * GRID_LINES_PER_COLUMN
+        )
+        + snap_offset
+    )
+    # Every sample of a column, as vectorise_grid() reads them.
+    samples_per_column = int(SHORT_SIGNAL_LENGTH_SEC * FREQUENCY)
+    column_mm = [
+        (column + np.arange(samples_per_column) / samples_per_column)
+        * GRID_LINES_PER_COLUMN
+        for column in range(NUM_COLUMNS)
+    ]
+    page_x = [_column_map_x(knots_m, knots_x, period, mm) for mm in column_mm]
+
+    def row_map(row_knots):
+        def x_map(m):
+            return _column_map_x(knots_m, row_knots, period, m)
+
+        return x_map
+
+    for out in rows:
+        row = out["row"]
+        out["columns"] = sorted(read[row])
+        out["band"] = (float(band_edges[row]), float(band_edges[row + 1]))
+        top, bottom = int(np.ceil(band_edges[row])), int(np.floor(band_edges[row + 1]))
+        height = bottom - top
+        if height < ROW_MAPPING_MIN_BAND_ROWS:
+            out["why"] = f"row band of {height} rows"
+            continue
+        count = max(1, height // GRID_LINE_BAND_HEIGHT)
+        band_height = height // count
+        profiles = np.array(
+            [
+                np.median(darkness[start : start + band_height], axis=0)
+                for start in top + np.arange(count) * band_height
+            ]
+        )
+        weights = np.abs(_grid_line_comb(profiles, period))
+        kept_bands = weights >= GRID_LINE_MIN_BAND_AMPLITUDE * page_weight
+        if not np.any(kept_bands):
+            out["why"] = "no grid lines in the row band"
+            continue
+        profile = profiles[kept_bands].sum(axis=0)
+        window_x, fine, _ = _column_mapping_windows(profile, period, low, high)
+        if window_x.size < 2:
+            out["why"] = "image too small for the row map"
+            continue
+        # Where the lines of the row are, modulo one line, against the page line next
+        # to the centre of every window.
+        offset = (-np.angle(fine) / (2 * np.pi) * period) % period
+        window_m = _column_map_m(knots_m, knots_x, period, window_x - snap_offset)
+        page_line = (
+            _column_map_x(knots_m, knots_x, period, np.round(window_m)) + snap_offset
+        )
+        d = (offset - page_line) % period
+        d = np.where(d > period / 2, d - period, d)
+        amplitude = np.abs(fine)
+        strong = (amplitude > 0) & (
+            amplitude >= COLUMN_MAPPING_MIN_WINDOW_AMPLITUDE * np.median(amplitude)
+        )
+        near = np.abs(d) <= COLUMN_MAPPING_BRANCH_TOLERANCE * period
+        kept = strong & near
+        in_column = [
+            (window_x >= column_x[column]) & (window_x <= column_x[column + 1])
+            for column in range(NUM_COLUMNS)
+        ]
+        inside = np.zeros(window_x.size, dtype=bool)
+        for column in out["columns"]:
+            inside |= in_column[column]
+        out["inside"] = int(np.count_nonzero(inside))
+        out["windows"] = int(np.count_nonzero(kept & inside))
+        out["coverage"] = out["windows"] / max(out["inside"], 1)
+        # Lines that are there but further off the page map than a branch can be told:
+        # the row then keeps the page map although it is displaced against it.
+        out["beyond"] = int(np.count_nonzero(strong & ~near & inside))
+        if np.count_nonzero(kept) < 2:
+            out["why"] = (
+                f"{out['beyond']} of {out['inside']} windows beyond the branch tolerance"
+                if out["beyond"]
+                else "no grid lines along the row"
+            )
+            continue
+        kept_m, kept_d = window_m[kept], d[kept]
+        if median_mm > 0:
+            # As for the page map: the ripple of lines snapped to the pixels is in the
+            # windows of the row and not in the smoothed page map, so it is in d.
+            kept_d = _running_median(kept_m, kept_d, median_mm)
+        row_knots = knots_x + np.interp(knots_m, kept_m, kept_d)
+        moved = [
+            _column_map_x(knots_m, row_knots, period, mm) - page
+            for mm, page in zip(column_mm, page_x)
+        ]
+        out["d"] = [
+            (float(np.median(part)), float(np.min(part)), float(np.max(part)))
+            for part in moved
+        ]
+        out["shift"] = float(
+            max(np.max(np.abs(moved[column])) for column in out["columns"])
+        )
+        # The longest stretch without a kept window, over every run of columns the row
+        # reads.
+        gap, kept_x = 0.0, window_x[kept]
+        for column in out["columns"]:
+            if column - 1 in out["columns"]:
+                continue
+            last = column
+            while last + 1 in out["columns"]:
+                last += 1
+            start, end = column_x[column], column_x[last + 1]
+            between = kept_x[(kept_x > start) & (kept_x < end)]
+            gap = max(gap, float(np.max(np.diff(np.r_[start, between, end])) / P))
+        out["gap"] = gap
+        out["knots_x"] = row_knots
+        if out["coverage"] < COLUMN_MAPPING_MIN_COVERAGE:
+            out["why"] = f"row keeps {100 * out['coverage']:.0f} % of its windows" + (
+                f", {out['beyond']} beyond the branch tolerance" if out["beyond"] else ""
+            )
+        elif gap > COLUMN_MAPPING_MAX_GAP:
+            out["why"] = f"row has a gap of {gap:.2f} columns"
+        elif np.any(np.diff(row_knots) <= 0):
+            out["why"] = "row map does not grow along x"
+        else:
+            out["accepted"] = True
+            out["x_map"] = row_map(row_knots)
+    return rows
+
+
+def row_mapping_line(record, out):
+    """The --verbose line of one row of measure_row_mapping()."""
+    verdict = "own map" if out["accepted"] else f"page map kept ({out['why']})"
+    moves = " ".join(
+        f"c{column + 1} "
+        + ("-" if np.isnan(median) else f"{median:+.2f}/{low:+.2f}/{high:+.2f}")
+        for column, (median, low, high) in enumerate(out["d"])
+    )
+    return (
+        f"Row mapping for record {record}: row {out['row']} {verdict}, windows "
+        f"{out['windows']}/{out['inside']}, move against the page map "
+        f"(median/min/max per column) {moves} px"
+    )
+
+
 def vectorise_grid(
     image_rotated,
     mask,
@@ -2791,6 +3969,20 @@ def einthoven_warning(qc, record, threshold=EINTHOVEN_RATIO_WARNING):
     return None
 
 
+def rescale_warning(record, lowest, highest):
+    """WARNING line of a page whose output is rescaled before it is written.
+
+    lowest and highest are the smallest and the largest sample of the assembled signals
+    in mV. run() rescales an output with a sample beyond 10 mV on either side to -1..1
+    over all its leads, so what it writes for such a page is not in millivolts.
+    """
+    return (
+        f"WARNING: output rescaled for record {record} "
+        f"(range {lowest:.3f} to {highest:.3f} mV, outside +-10 mV): the written "
+        f"signals are rescaled to -1..1 and are not in millivolts, check this page."
+    )
+
+
 def write_record(record, signals, sig_names, output_folder, placement):
     """Write the signals to a WFDB record."""
     kwargs = dict(
@@ -2817,7 +4009,14 @@ def write_record(record, signals, sig_names, output_folder, placement):
 
 
 def save_mask_files(
-    mask, record, output_folder, rot_angle, homography=None, scale=1.0
+    mask,
+    record,
+    output_folder,
+    rot_angle,
+    homography=None,
+    scale=1.0,
+    paper=None,
+    curl=None,
 ):
     """Save the predicted mask as PNG plus a small JSON with the frame info.
 
@@ -2825,6 +4024,12 @@ def save_mask_files(
     only when the page was warped: a file without one means the rotation alone.
     scale is what --resolution resampled the page by before all of that, written out
     only when it did: a file without one means the page at the size it came in.
+    paper is the record of the paper normalisation, which comes before both and says
+    which page all of that was done to, written out only when there is one: a file
+    without one means the page as it was given.
+    curl is the record of the sheet curl stage, which comes after all of that and says
+    whether the mask lives on the straightened page, written out only when there is
+    one: a file without one means the page as the perspective stage left it.
     """
     mask_to_save = mask.to(torch.uint8)
     write_png(mask_to_save, os.path.join(output_folder, f"{record}_mask.png"))
@@ -2838,6 +4043,10 @@ def save_mask_files(
     # NaN is the stage being off, 1.0 the page having been left at its own scale.
     if np.isfinite(scale) and scale != 1.0:
         meta["scale"] = float(scale)
+    if paper is not None:
+        meta["paper_normalisation"] = paper
+    if curl is not None:
+        meta["sheet_curl"] = curl
     with open(os.path.join(output_folder, f"{record}_mask.json"), "w") as f:
         json.dump(meta, f)
 
@@ -2858,6 +4067,7 @@ def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
         "goldberger_ratio",
         "goldberger_n",
         "max_offset_deviation",
+        "paper_normalisation",
         "baseline_scale",
         "baseline_shift_px",
         "baseline_disagreement_px",
@@ -2877,6 +4087,11 @@ def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
         "trace_shift_rows",
         "column_mapping",
         "column_mapping_shift_px",
+        "grid_rescue",
+        "row_mapping",
+        "perspective_residual_rel",
+        "sheet_curl",
+        "sheet_curl_shift_px",
     ]
     write_header = not os.path.exists(qc_path)
     with open(qc_path, "a", newline="") as f:
@@ -2952,6 +4167,21 @@ def run(args):
     if args.verbose:
         print("Running digitization model...")
 
+    # --grid_rescue map decides on the column map, so it needs the flags the map needs.
+    # map is the default, so a run without them has not asked for it: only --verbose
+    # says that there is no second try, and the QC column says off either way.
+    grid_rescue_on = (
+        args.grid_rescue == "map"
+        and args.time_mapping == "grid"
+        and args.grid_origin == "lines"
+        and args.column_mapping == "lines"
+    )
+    if args.verbose and args.grid_rescue == "map" and not grid_rescue_on:
+        print(
+            "Grid rescue is off for this run: --grid_rescue map needs --time_mapping "
+            "grid, --grid_origin lines and --column_mapping lines."
+        )
+
     # Iterate over the records.
     image_files = [
         f for f in os.listdir(args.data_folder) if f.endswith(f".{IMAGE_TYPE}")
@@ -2964,10 +4194,73 @@ def run(args):
         image = read_image(image_file_path)
         image = image[:3]
 
+        # Normalise the paper
+        paper_block, paper_qc, stages = None, "off", None
+        if args.mask_folder is not None:
+            # A mask only fits the page it was predicted on, and which page that was
+            # stands in the record next to it: with a record the page is checked
+            # against it, or built again from it, and never decided anew. A mask
+            # without one, as every mask saved without the normalisation, is taken
+            # to fit the page as it is given.
+            meta_path = os.path.join(args.mask_folder, f"{record}_mask.json")
+            mask_meta = {}
+            if os.path.exists(meta_path):
+                with open(meta_path) as f:
+                    mask_meta = json.load(f)
+            # A JSON that holds no object has no record. It is left to the check of
+            # the frame of the mask below, which is where it always failed.
+            if isinstance(mask_meta, dict) and "paper_normalisation" in mask_meta:
+                paper_block = mask_meta["paper_normalisation"]
+                image, how = check_paper_block(
+                    paper_block, image, record, args.paper_normalisation
+                )
+                paper_qc = paper_block["decision"]
+                if args.verbose:
+                    how = "replayed" if how == "replayed" else "page is the view"
+                    print(
+                        f"Paper normalisation for record {record}: {paper_qc} from "
+                        f"the mask's record ({how})"
+                    )
+            elif args.paper_normalisation == "auto":
+                paper_qc = "as given"
+                if args.verbose:
+                    print(
+                        f"Paper normalisation for record {record}: mask without a "
+                        f"record, page used as given"
+                    )
+        elif args.paper_normalisation == "auto":
+            image, paper_block, _, stages = normalise_paper(image)
+            paper_qc = paper_block["decision"]
+            if paper_qc == "failed":
+                print(
+                    f"WARNING: paper normalisation not applied to record {record} "
+                    f"({paper_block['reason']}), page kept."
+                )
+            elif paper_qc == "scaled":
+                print(
+                    f"WARNING: paper normalisation not applied to record {record} "
+                    f"({paper_block['reason']}), page rescaled only."
+                )
+            if args.verbose:
+                reason = f" ({paper_block['reason']})" if paper_block["reason"] else ""
+                print(f"Paper normalisation for record {record}: {paper_qc}{reason}")
+        # A page the paper stage decided now and left as it is has been through the
+        # three stages below already, each with the grid lines. What they returned
+        # there is taken here instead of measuring the same page a second time, up to
+        # the first stage whose flag asks for something else: that one and all after
+        # it run as they always do, and so does every stage of a page that was
+        # changed or that comes with a mask.
+        reuse_resolution = stages is not None and args.resolution == "lines"
+        reuse_rotation = reuse_resolution and args.rotation == "lines"
+        reuse_perspective = reuse_rotation and args.perspective == "lines"
+
         # Rescale
         resolution_info = {"period": float("nan"), "scale": float("nan")}
         if args.resolution == "lines":
-            image, resolution_info = normalise_resolution(image)
+            if reuse_resolution:
+                image, resolution_info = stages["image"], stages["resolution_info"]
+            else:
+                image, resolution_info = normalise_resolution(image)
             if resolution_info["reason"]:
                 print(
                     f"WARNING: grid lines not used for the resolution of "
@@ -2984,7 +4277,10 @@ def run(args):
                 )
 
         # Rotate
-        rot_angle, rotation_info = estimate_rotation(image, args.rotation)
+        if reuse_rotation:
+            rot_angle, rotation_info = stages["rot_angle"], stages["rotation_info"]
+        else:
+            rot_angle, rotation_info = estimate_rotation(image, args.rotation)
         if args.rotation == "lines":
             if rotation_info["reason"]:
                 print(
@@ -3009,25 +4305,55 @@ def run(args):
         # Both interpolations put the page in the same frame, only the resampling
         # differs; a straight page keeps its pixels and is never warped.
         if args.interpolation == "bicubic" and rot_angle != 0.0:
-            image_rotated = warp_page(image, rotation)
+            if reuse_rotation:
+                # The page the paper stage measured the perspective on is this warp,
+                # of the same page by the same angle, whatever --perspective says.
+                image_rotated = stages["measured"]
+            else:
+                image_rotated = warp_page(image, rotation)
         else:
             image_rotated = rotate(image, rot_angle)
 
         # Rectify
         homography = None
-        perspective_info = {"shift": float("nan"), "residual": float("nan")}
+        perspective_info = {
+            "shift": float("nan"),
+            "residual": float("nan"),
+            "residual_rel": float("nan"),
+        }
         if args.perspective == "lines":
             # The page has to be measured in the frame of the final warp, because
             # rotate() interpolates nearest, which below a twentieth of a degree moves
             # no pixel at all. The bicubic page already is that frame and the warp of a
-            # straight page gives its own pixels back, so neither is warped twice.
+            # straight page gives its own pixels back, so neither is warped twice, and
+            # the paper stage has warped the page it measured into that frame as well.
             if rot_angle == 0.0:
                 measured = image
             elif args.interpolation == "bicubic":
                 measured = image_rotated
+            elif reuse_perspective:
+                measured = stages["measured"]
             else:
                 measured = warp_page(image, rotation)
-            H_rect, perspective_info = estimate_perspective(measured)
+            # The paper stage measures at the tolerance of the stage itself, whatever
+            # --perspective_tolerance says. What it returned is what this stage returns
+            # at that tolerance, and at a wider one as well if it came without a
+            # reason: a fit that every round accepted, the dead band included, passes
+            # a wider check as it is. A page it refused is measured again, the same
+            # page in the same frame, at the tolerance of the run.
+            tolerance = args.perspective_tolerance
+            widened = tolerance > GRID_LINE_MAX_SLOPE_RESIDUAL
+            if reuse_perspective and not (
+                widened and stages["perspective_info"]["reason"]
+            ):
+                # Measured by the paper stage already, on the page in that frame.
+                H_rect, perspective_info = stages["H_rect"], stages["perspective_info"]
+            else:
+                # The tolerance goes along only when it widens the stage, as the
+                # default of the flag does: at --perspective_tolerance 0.1 this is
+                # the call it always was.
+                asked = {"tolerance": tolerance} if widened else {}
+                H_rect, perspective_info = estimate_perspective(measured, **asked)
             if perspective_info["reason"]:
                 print(
                     f"WARNING: grid lines not used for the perspective of record "
@@ -3041,29 +4367,105 @@ def run(args):
                     f"{perspective_info['period']:.2f} px, "
                     f"windows {perspective_info['windows']}"
                 )
+                # A fit that only a tolerance above the one of the stage let through:
+                # the stage itself refuses it, so a run at --perspective_tolerance 0.1
+                # never prints this.
+                if (
+                    widened
+                    and not perspective_info["reason"]
+                    and perspective_info["residual_rel"] > GRID_LINE_MAX_SLOPE_RESIDUAL
+                ):
+                    print(
+                        perspective_tolerance_line(
+                            record, tolerance, perspective_info, H_rect is not None
+                        )
+                    )
             if H_rect is not None:
                 # From the image, so that the page is interpolated only once.
                 homography = H_rect @ rotation
                 image_rotated = warp_page(image, homography)
 
+        # Straighten
+        curl_field, curl_block, curl_kept = None, None, "--sheet_curl off"
+        curl_qc = "off", float("nan")
+        if args.sheet_curl == "lines":
+            curl_options = {
+                "tol": args.sheet_curl_tolerance,
+                "passes": args.sheet_curl_passes,
+            }
+            # The dead band is the stage's, on the map it would apply; the estimator
+            # keeps its own threshold (sheet_curl.straighten()).
+            curl_band = args.sheet_curl_min_shift
+            # Every page, or only a photographed sheet, which is the page the paper
+            # normalisation warped onto the page frame, now or when its mask was
+            # saved: no other page is measured unless the scope says every page.
+            if args.sheet_curl_scope == "all" or paper_qc == "normalised":
+                # On the page as the perspective stage left it.
+                curl_field, curl_info = sheet_curl.straighten(
+                    image_rotated, curl_options, sheet_curl_helpers(), curl_band
+                )
+            else:
+                curl_info = sheet_curl.out_of_scope(curl_options)
+            if curl_info["decision"] == "refused":
+                print(sheet_curl.warning_line(record, curl_info))
+            if args.verbose:
+                print(sheet_curl.verbose_line(record, curl_info))
+            if curl_field is not None:
+                # The straightened page is a new one, and the page the segmentation
+                # sees: the tensor of the perspective stage is not written into.
+                image_rotated = torch.from_numpy(curl_field.page)
+            curl_kept = curl_info["decision"]
+            curl_qc = sheet_curl.qc_values(curl_info)
+            curl_block = sheet_curl.mask_record(
+                curl_info, curl_field, curl_options, args.sheet_curl_scope, curl_band
+            )
+
         # Segment
         if args.mask_folder is not None:
             # A mask only fits the frame it was predicted in, so check its angle.
             check_mask_rotation(args.mask_folder, record, rot_angle, homography)
+            # And whether it was predicted on a straightened page, which only the
+            # sheet curl record of a mask says: a run with the stage off and a mask
+            # without that record, as every mask saved without the stage, has nothing
+            # to check, and is the run it always was.
+            mask_straightened = False
+            saved_curl = mask_meta.get("sheet_curl")
+            if curl_field is not None or saved_curl is not None:
+                mask_straightened = check_mask_sheet_curl(
+                    saved_curl, record, curl_field, curl_kept
+                )
             mask_path = os.path.join(args.mask_folder, f"{record}_mask.png")
             if not os.path.exists(mask_path):
                 raise FileNotFoundError(
                     f"No mask found for record {record} at {mask_path}."
                 )
             mask_to_use = read_image(mask_path)
-            # A mask of another size cannot be laid over this page at all, and the
-            # only thing that changes the size of a page is the resolution stage.
+            # A mask of another size cannot be laid over this page at all. The size
+            # of a page is changed by the resolution stage and by the paper
+            # normalisation, and a mask with a record of the second has been checked
+            # against its page above. One without a record may still be the mask of
+            # a view that was built outside of this run, which then is the page to
+            # give: with the flag that asks for the normalisation, the message says
+            # that the page was not normalised.
             if mask_to_use.shape[1:] != image_rotated.shape[1:]:
+                as_given = ""
+                if paper_qc == "as given":
+                    as_given = (
+                        " The mask has no paper normalisation record, so the page "
+                        "was used as given."
+                    )
                 raise ValueError(
                     f"Mask of record {record} is {mask_to_use.shape[2]} x "
                     f"{mask_to_use.shape[1]} px, the page is "
                     f"{image_rotated.shape[2]} x {image_rotated.shape[1]} px; "
-                    f"the mask was predicted for another --resolution."
+                    f"the mask was predicted for another --resolution.{as_given}"
+                )
+            if curl_field is not None and not mask_straightened:
+                # The mask was predicted on the page before it was straightened, and
+                # goes where its page went: nearest, so that it holds no label that
+                # was not in it.
+                mask_to_use = torch.from_numpy(
+                    curl_field.warp_labels(mask_to_use.numpy())
                 )
         else:
             mask_to_use = predict_mask_nnunet(
@@ -3075,6 +4477,19 @@ def run(args):
                 fold=args.fold,
             )
         if args.save_mask:
+            # The record goes along only when there is one: without it this is the
+            # call it always was. The mask is saved in the frame of the page the run
+            # goes on with, the straightened one where the sheet curl was applied,
+            # and the record of that stage says so.
+            paper_record = {} if paper_block is None else {"paper": paper_block}
+            curl_record = {} if curl_block is None else {"curl": curl_block}
+            if args.mask_folder is not None and mask_straightened:
+                # A mask that came in the straightened frame was used as it is and is
+                # saved as it is: it keeps the record it came with, also when this
+                # run keeps the page or measures another map (the frame WARNING was
+                # printed then). The record of this run would say of that mask what
+                # is true of the page only, and a later run would warp it again.
+                curl_record = {"curl": saved_curl}
             save_mask_files(
                 mask_to_use,
                 record,
@@ -3082,6 +4497,8 @@ def run(args):
                 rot_angle,
                 homography,
                 resolution_info["scale"],
+                **paper_record,
+                **curl_record,
             )
 
         # Use mask to cut into single, binary masks
@@ -3101,6 +4518,11 @@ def run(args):
         g0, P, long_leads = None, None, []
         grid_lines = {"contrast": float("nan"), "shift": float("nan")}
         baseline_scale = 1.0
+        # --grid_rescue map: the second try of a page that failed a check of the grid,
+        # None for a page that failed none, and the column map of a rescued page. Such
+        # a page takes its grid, its grid lines and that map from the second try; a
+        # refused one goes on as with --grid_rescue off.
+        rescue, rescued_map = None, None
         if args.time_mapping == "grid":
             g0, P, long_leads, reason = fit_column_grid(
                 signal_masks_cropped,
@@ -3109,16 +4531,48 @@ def run(args):
                 args.grid_pitch,
                 record,
             )
+            if grid_rescue_on and g0 is None and _fit_failed_on_edges(reason):
+                rescue = rescue_grid_fit(
+                    image_rotated,
+                    signal_masks_cropped,
+                    signal_positions_cropped,
+                    args.grid_pitch,
+                    record,
+                    reason,
+                    snap_offset=args.grid_line_offset,
+                    median_mm=args.column_mapping_median,
+                )
+                if not rescue["refused"]:
+                    g0, P, long_leads = rescue["g0"], rescue["P"], rescue["long_leads"]
             if g0 is None:
                 print(
                     f"WARNING: no column grid for record {record} ({reason}), "
                     f"falling back to --time_mapping bbox."
                 )
             else:
-                if args.grid_origin == "lines":
+                if args.grid_origin == "lines" and rescue is None:
                     g0, P, grid_lines = refine_grid_from_lines(
                         image_rotated, g0, P, snap_offset=args.grid_line_offset
                     )
+                    if grid_rescue_on and _lines_refused_by_phase(grid_lines["reason"]):
+                        rescue = rescue_grid_phase(
+                            image_rotated,
+                            g0,
+                            P,
+                            grid_lines,
+                            column_mapping_edges(
+                                signal_masks_cropped, signal_positions_cropped, long_leads
+                            ),
+                            snap_offset=args.grid_line_offset,
+                            median_mm=args.column_mapping_median,
+                        )
+                        if not rescue["refused"]:
+                            g0, P = rescue["g0"], rescue["P"]
+                if rescue is not None and not rescue["refused"]:
+                    # Neither is measured again: the map is what the page was kept on.
+                    grid_lines = rescue["grid_lines"]
+                    rescued_map = rescue["x_map"], rescue["map_info"]
+                if args.grid_origin == "lines":
                     if grid_lines["reason"]:
                         print(
                             f"WARNING: grid lines not used for record {record} "
@@ -3129,6 +4583,10 @@ def run(args):
                 baseline_scale = P / (image_rotated.shape[1] * PAGE_PITCH_RATIO)
                 if args.verbose:
                     print(f"Column grid for record {record}: g0 {g0:.2f} px, P {P:.2f} px")
+            # A rescued page says so with or without --verbose, as the WARNING of the
+            # check it failed would have; a refused one has printed that WARNING.
+            if rescue is not None and (args.verbose or not rescue["refused"]):
+                print(grid_rescue_line(record, rescue))
         mm_per_pixel = 25 * sec_per_pixel
         mV_per_pixel = mm_per_pixel / 10
         # The ink of the page, read once for all its leads. Only the grid sampling
@@ -3172,7 +4630,8 @@ def run(args):
                 if args.verbose:
                     print(f"Column mapping for record {record}: {column_mapping}")
             else:
-                x_map, map_info = measure_column_mapping(
+                # A rescued page has its map already, the one it was rescued on.
+                x_map, map_info = rescued_map or measure_column_mapping(
                     image_rotated,
                     g0,
                     P,
@@ -3208,6 +4667,30 @@ def run(args):
                         + "/".join(f"{s:.2f}" for s in map_info["column_shift"])
                         + " px"
                     )
+        # One map per layout row, on a page that is read on its column map.
+        row_maps, row_mapping = {}, "off"
+        if args.row_mapping == "lines":
+            if x_map is None:
+                row_mapping = "page map not used"
+                if args.verbose:
+                    print(f"Row mapping for record {record}: {row_mapping}")
+            else:
+                rows = measure_row_mapping(
+                    image_rotated,
+                    g0,
+                    P,
+                    signal_masks_cropped,
+                    signal_positions_cropped,
+                    long_leads,
+                    map_info,
+                    snap_offset=args.grid_line_offset,
+                    median_mm=args.row_mapping_median,
+                )
+                row_maps = {out["row"]: out["x_map"] for out in rows if out["accepted"]}
+                row_mapping = f"lines {len(row_maps)}/{NUM_ROWS}"
+                if args.verbose:
+                    for out in rows:
+                        print(row_mapping_line(record, out))
         signals_predicted = {}
         for lead, mask in signal_masks_cropped.items():
             if mask is None:
@@ -3254,7 +4737,8 @@ def run(args):
                     info=ink,
                     x_shift=x_shift,
                     sharpen=args.sharpen,
-                    x_map=x_map,
+                    # The map of the lead's row, or the page map where it has none.
+                    x_map=row_maps.get(lead_row(lead, long_leads), x_map),
                 )
                 if ink:
                     ink_measured.append(ink)
@@ -3351,6 +4835,7 @@ def run(args):
             if np.isfinite(offset["raw"])
         ]
         max_offset_deviation = max(deviations) if deviations else np.nan
+        qc["paper_normalisation"] = paper_qc
         qc["baseline_scale"] = baseline_scale
         qc["baseline_shift_px"] = baseline_shift
         qc["baseline_disagreement_px"] = baseline_disagreement
@@ -3371,6 +4856,10 @@ def run(args):
         qc["trace_shift_rows"] = trace_shift_rows
         qc["column_mapping"] = column_mapping
         qc["column_mapping_shift_px"] = column_mapping_shift
+        qc["grid_rescue"] = grid_rescue_qc(rescue) if grid_rescue_on else "off"
+        qc["row_mapping"] = row_mapping
+        qc["perspective_residual_rel"] = perspective_info["residual_rel"]
+        qc["sheet_curl"], qc["sheet_curl_shift_px"] = curl_qc
         append_qc_row(
             args.output_folder, record, args.lead_placement, qc, max_offset_deviation
         )
@@ -3395,6 +4884,7 @@ def run(args):
             print(f"Signal out of range for record {record}, normalizing to range between 1 and -1")
             max_val = np.nanmax(signals)
             min_val = np.nanmin(signals)
+            print(rescale_warning(record, min_val, max_val))
             signals = (signals - min_val) / (max_val - min_val) * 2 - 1
         write_record(
             record, signals, sig_names, args.output_folder, args.lead_placement
