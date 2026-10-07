@@ -626,9 +626,10 @@ def test_run_with_a_tenth_refuses_the_page_as_it_always_did(runs):
     assert ACCEPTED not in printed
     assert float(row["rotation_angle"]) == 0.0
     assert np.isnan(float(row["perspective_shift_px"]))
-    # The residual in pixels, and the same as a share of the period: the last column.
+    # The residual in pixels, and the same as a share of the period: the last column
+    # before the two of the sheet curl stage.
     share = float(row["perspective_residual_rel"])
-    assert header[-1] == "perspective_residual_rel"
+    assert header[-3] == "perspective_residual_rel"
     assert 0.105 < share < 0.12
     in_pixels = float(row["perspective_residual_px"])
     assert share == pytest.approx(in_pixels / PERIOD, rel=0.01)
@@ -674,7 +675,7 @@ def test_run_at_0_15_rectifies_the_page_and_says_so(runs):
     row, header = qc_row(out)
     assert perspective_warning(printed, "above") == []
     share = float(row["perspective_residual_rel"])
-    assert header[-1] == "perspective_residual_rel"
+    assert header[-3] == "perspective_residual_rel"
     assert 0.105 < share < 0.12
     # One line more, right after the line of the stage.
     said = lines_of(printed, "above", "Perspective for record")
@@ -1123,12 +1124,12 @@ def test_append_qc_row_writes_the_column_after_all_others(tmp_path):
         reader = csv.DictReader(f)
         row, old = list(reader)
         # Appended at the end: no column that was there moves.
-        assert reader.fieldnames[-3:] == [
+        assert reader.fieldnames[-5:-2] == [
             "grid_rescue",
             "row_mapping",
             "perspective_residual_rel",
         ]
-        assert len(reader.fieldnames) == 35
+        assert len(reader.fieldnames) == 37
         assert reader.fieldnames.index("paper_normalisation") == 12
         assert reader.fieldnames.index("perspective_residual_px") == 22
         assert reader.fieldnames.index("row_mapping") == 33

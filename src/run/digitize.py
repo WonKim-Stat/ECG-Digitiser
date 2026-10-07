@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import warnings
+from types import SimpleNamespace
 from scipy.interpolate import CubicSpline
 from scipy.signal import butter, sosfiltfilt
 from tqdm import tqdm
@@ -36,6 +37,7 @@ from config import (
     BASELINE,
 )
 from src.run import paper_normalisation
+from src.run import sheet_curl
 
 
 # Parse arguments.
@@ -358,6 +360,91 @@ def get_parser():
             "read those with --perspective_tolerance 0.1. --verbose names a page that "
             "is accepted above 0.1 in one line, and the QC column "
             "perspective_residual_rel holds its residual."
+        ),
+    )
+    parser.add_argument(
+        "--sheet_curl",
+        type=str,
+        choices=["off", "lines"],
+        default="off",
+        help=(
+            "lines = after the perspective, straighten a sheet that is bent, by the "
+            "printed grid lines: a smooth map from the pixels of the page to the "
+            "coordinates of its lines, a projective part and a polynomial per line "
+            "family, is measured in windows over the page, and the page is warped "
+            "into the frame in which the lines are straight before it is segmented. "
+            "A page the map moves by less than --sheet_curl_min_shift is left as it "
+            "is, and so is, with a warning, a page whose lines carry no such map. A "
+            "bend of the whole sheet is taken out, a fold or a local dent is not. "
+            "What was done to a page is written next to its mask by --save_mask: a "
+            "mask saved for a straightened page only fits a run that straightens the "
+            "page by the same map, keeps that record when it is saved again, and a "
+            "mask saved without the stage is warped with its page. off (default) = "
+            "keep the page of the perspective stage."
+        ),
+    )
+    # The defaults of the stage are constants of sheet_curl, the three parse functions
+    # are defined below.
+    parser.add_argument(
+        "--sheet_curl_tolerance",
+        type=parse_sheet_curl_tolerance,
+        default=sheet_curl.TOLERANCE,
+        help=(
+            "Only for --sheet_curl lines. The largest RMS residual of the fit of that "
+            "map that is accepted, as a share of the period of the grid lines, above "
+            "0 and up to 0.5: a page above it is kept as it is, with a warning, and "
+            "so is one whose lines are further than that from straight after the "
+            "warp. 0.25 (default) was chosen on photographs, whose fit leaves 0.10 "
+            "to 0.25 of a period; a clean synthetic page stays below 0.1, and a fit "
+            "above 0.1 can be a wrong map that is accepted."
+        ),
+    )
+    parser.add_argument(
+        "--sheet_curl_passes",
+        type=parse_sheet_curl_passes,
+        default=sheet_curl.PASSES,
+        help=(
+            "Only for --sheet_curl lines. How many measurements may be composed into "
+            "the map, from 1 to 5: the straightened page is measured again, and "
+            "while it still asks for 1 px or more (the threshold of the estimator, "
+            "or --sheet_curl_min_shift where that is smaller) and this number is "
+            "not reached, what it asks for is added to the map; the last "
+            "measurement is the check that the lines are straight. 3 (default) was "
+            "chosen on photographs."
+        ),
+    )
+    parser.add_argument(
+        "--sheet_curl_min_shift",
+        type=parse_sheet_curl_min_shift,
+        default=sheet_curl.MIN_SHIFT_PX,
+        help=(
+            "Only for --sheet_curl lines. The dead band in pixels, 0 or more: a page "
+            "whose accepted map, all passes composed, moves no measured point by "
+            "this much is left as it is, without a warning; a map that moves one by "
+            "exactly this much is applied. It decides whether a map is used, not "
+            "how it is measured: the estimator has a threshold of its own, 1 px, "
+            "for its first measurement, the end of its passes and its check, and "
+            "only a value below 1 takes the place of that threshold. A page left "
+            "alone here was still measured, and a page whose lines carry no map "
+            "is refused with its warning whatever this value is. 15 (default) was "
+            "chosen on development scans and photographs: below it the second "
+            "resampling of a page that reads well, and the warp of its mask, cost "
+            "more than the map gains."
+        ),
+    )
+    parser.add_argument(
+        "--sheet_curl_scope",
+        type=str,
+        choices=list(sheet_curl.SCOPES),
+        default=sheet_curl.SCOPE,
+        help=(
+            "Only for --sheet_curl lines. all (default) = every page; the dead band "
+            "of --sheet_curl_min_shift is what leaves a flat page alone. normalised "
+            "= only a page that the paper normalisation warped onto the Letter "
+            "page, which is a photographed sheet. With --mask_folder that decision "
+            "is the one in the record of the mask and is not made again: under "
+            "normalised a page whose mask has no paper normalisation record, a "
+            "normalised view given as the page included, is out of scope."
         ),
     )
     parser.add_argument(
@@ -2286,6 +2373,84 @@ def check_paper_block(block, image, record, flag):
     )
 
 
+def parse_sheet_curl_tolerance(text):
+    """The value of --sheet_curl_tolerance, for argparse.
+
+    A share of the grid line period above 0 and up to sheet_curl.MAX_TOLERANCE, half a
+    period: no residual is above that. Anything else, a text that is no number or NaN
+    included, is an argparse error that says so.
+    """
+    try:
+        value = float(text)
+    except ValueError:
+        value = float("nan")
+    # NaN is in no range, so it is refused here as well.
+    if not 0 < value <= sheet_curl.MAX_TOLERANCE:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a share of the grid line period above 0 and up to "
+            f"{sheet_curl.MAX_TOLERANCE:g}"
+        )
+    return value
+
+
+def parse_sheet_curl_passes(text):
+    """The value of --sheet_curl_passes, for argparse: a whole number from 1 to
+    sheet_curl.MAX_PASSES, anything else is an argparse error that says so."""
+    try:
+        value = int(text)
+    except ValueError:
+        value = 0
+    if not 1 <= value <= sheet_curl.MAX_PASSES:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a whole number from 1 to {sheet_curl.MAX_PASSES}"
+        )
+    return value
+
+
+def parse_sheet_curl_min_shift(text):
+    """The value of --sheet_curl_min_shift, for argparse: a number of pixels of 0 or
+    more, anything else, NaN and infinity included, is an argparse error."""
+    try:
+        value = float(text)
+    except ValueError:
+        value = float("nan")
+    if not 0 <= value < float("inf"):
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not a number of pixels of 0 or more"
+        )
+    return value
+
+
+def sheet_curl_helpers():
+    """What the sheet curl stage takes from this module, as one object.
+
+    sheet_curl has no import of this module, which imports it: the grid line helpers of
+    the perspective stage and the constants that go with them are handed to it, by the
+    names of sheet_curl.HELPERS and as they are at the time of the call, so that a
+    function that is replaced here for the time of a run is the one the stage calls.
+    """
+    return SimpleNamespace(**{name: globals()[name] for name in sheet_curl.HELPERS})
+
+
+def check_mask_sheet_curl(saved, record, field, kept=""):
+    """Warn when a saved mask was predicted on a page straightened otherwise than now.
+
+    saved is the sheet curl record next to the mask, None for a mask without one, as
+    every mask saved without --sheet_curl lines; field is the map this run straightens
+    the page by, None when it keeps the page as it is, and kept then says why. A mask
+    whose record says applied was predicted on the straightened page: it fits a page
+    that this run straightens by the same map, to sheet_curl.MASK_SHIFT_TOLERANCE at
+    the points of the record, and no other.
+    Returns whether the mask lives in the straightened frame, in which case it is used
+    as it is; a mask that does not was predicted on the page as the perspective stage
+    left it, and run() warps it with the page when it straightens the page.
+    """
+    straightened, problem = sheet_curl.mask_frame(saved, field, kept)
+    if problem:
+        print(f"WARNING: mask of record {record} {problem}; the mask does not fit.")
+    return straightened
+
+
 def baseline_row(ratio, image_height, scale=1.0):
     """Row of the zero line of one lead, for a page rescaled about its centre."""
     centre = image_height / 2
@@ -3844,7 +4009,14 @@ def write_record(record, signals, sig_names, output_folder, placement):
 
 
 def save_mask_files(
-    mask, record, output_folder, rot_angle, homography=None, scale=1.0, paper=None
+    mask,
+    record,
+    output_folder,
+    rot_angle,
+    homography=None,
+    scale=1.0,
+    paper=None,
+    curl=None,
 ):
     """Save the predicted mask as PNG plus a small JSON with the frame info.
 
@@ -3855,6 +4027,9 @@ def save_mask_files(
     paper is the record of the paper normalisation, which comes before both and says
     which page all of that was done to, written out only when there is one: a file
     without one means the page as it was given.
+    curl is the record of the sheet curl stage, which comes after all of that and says
+    whether the mask lives on the straightened page, written out only when there is
+    one: a file without one means the page as the perspective stage left it.
     """
     mask_to_save = mask.to(torch.uint8)
     write_png(mask_to_save, os.path.join(output_folder, f"{record}_mask.png"))
@@ -3870,6 +4045,8 @@ def save_mask_files(
         meta["scale"] = float(scale)
     if paper is not None:
         meta["paper_normalisation"] = paper
+    if curl is not None:
+        meta["sheet_curl"] = curl
     with open(os.path.join(output_folder, f"{record}_mask.json"), "w") as f:
         json.dump(meta, f)
 
@@ -3913,6 +4090,8 @@ def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
         "grid_rescue",
         "row_mapping",
         "perspective_residual_rel",
+        "sheet_curl",
+        "sheet_curl_shift_px",
     ]
     write_header = not os.path.exists(qc_path)
     with open(qc_path, "a", newline="") as f:
@@ -4206,10 +4385,55 @@ def run(args):
                 homography = H_rect @ rotation
                 image_rotated = warp_page(image, homography)
 
+        # Straighten
+        curl_field, curl_block, curl_kept = None, None, "--sheet_curl off"
+        curl_qc = "off", float("nan")
+        if args.sheet_curl == "lines":
+            curl_options = {
+                "tol": args.sheet_curl_tolerance,
+                "passes": args.sheet_curl_passes,
+            }
+            # The dead band is the stage's, on the map it would apply; the estimator
+            # keeps its own threshold (sheet_curl.straighten()).
+            curl_band = args.sheet_curl_min_shift
+            # Every page, or only a photographed sheet, which is the page the paper
+            # normalisation warped onto the page frame, now or when its mask was
+            # saved: no other page is measured unless the scope says every page.
+            if args.sheet_curl_scope == "all" or paper_qc == "normalised":
+                # On the page as the perspective stage left it.
+                curl_field, curl_info = sheet_curl.straighten(
+                    image_rotated, curl_options, sheet_curl_helpers(), curl_band
+                )
+            else:
+                curl_info = sheet_curl.out_of_scope(curl_options)
+            if curl_info["decision"] == "refused":
+                print(sheet_curl.warning_line(record, curl_info))
+            if args.verbose:
+                print(sheet_curl.verbose_line(record, curl_info))
+            if curl_field is not None:
+                # The straightened page is a new one, and the page the segmentation
+                # sees: the tensor of the perspective stage is not written into.
+                image_rotated = torch.from_numpy(curl_field.page)
+            curl_kept = curl_info["decision"]
+            curl_qc = sheet_curl.qc_values(curl_info)
+            curl_block = sheet_curl.mask_record(
+                curl_info, curl_field, curl_options, args.sheet_curl_scope, curl_band
+            )
+
         # Segment
         if args.mask_folder is not None:
             # A mask only fits the frame it was predicted in, so check its angle.
             check_mask_rotation(args.mask_folder, record, rot_angle, homography)
+            # And whether it was predicted on a straightened page, which only the
+            # sheet curl record of a mask says: a run with the stage off and a mask
+            # without that record, as every mask saved without the stage, has nothing
+            # to check, and is the run it always was.
+            mask_straightened = False
+            saved_curl = mask_meta.get("sheet_curl")
+            if curl_field is not None or saved_curl is not None:
+                mask_straightened = check_mask_sheet_curl(
+                    saved_curl, record, curl_field, curl_kept
+                )
             mask_path = os.path.join(args.mask_folder, f"{record}_mask.png")
             if not os.path.exists(mask_path):
                 raise FileNotFoundError(
@@ -4236,6 +4460,13 @@ def run(args):
                     f"{image_rotated.shape[2]} x {image_rotated.shape[1]} px; "
                     f"the mask was predicted for another --resolution.{as_given}"
                 )
+            if curl_field is not None and not mask_straightened:
+                # The mask was predicted on the page before it was straightened, and
+                # goes where its page went: nearest, so that it holds no label that
+                # was not in it.
+                mask_to_use = torch.from_numpy(
+                    curl_field.warp_labels(mask_to_use.numpy())
+                )
         else:
             mask_to_use = predict_mask_nnunet(
                 image_rotated,
@@ -4247,8 +4478,18 @@ def run(args):
             )
         if args.save_mask:
             # The record goes along only when there is one: without it this is the
-            # call it always was.
+            # call it always was. The mask is saved in the frame of the page the run
+            # goes on with, the straightened one where the sheet curl was applied,
+            # and the record of that stage says so.
             paper_record = {} if paper_block is None else {"paper": paper_block}
+            curl_record = {} if curl_block is None else {"curl": curl_block}
+            if args.mask_folder is not None and mask_straightened:
+                # A mask that came in the straightened frame was used as it is and is
+                # saved as it is: it keeps the record it came with, also when this
+                # run keeps the page or measures another map (the frame WARNING was
+                # printed then). The record of this run would say of that mask what
+                # is true of the page only, and a later run would warp it again.
+                curl_record = {"curl": saved_curl}
             save_mask_files(
                 mask_to_use,
                 record,
@@ -4257,6 +4498,7 @@ def run(args):
                 homography,
                 resolution_info["scale"],
                 **paper_record,
+                **curl_record,
             )
 
         # Use mask to cut into single, binary masks
@@ -4617,6 +4859,7 @@ def run(args):
         qc["grid_rescue"] = grid_rescue_qc(rescue) if grid_rescue_on else "off"
         qc["row_mapping"] = row_mapping
         qc["perspective_residual_rel"] = perspective_info["residual_rel"]
+        qc["sheet_curl"], qc["sheet_curl_shift_px"] = curl_qc
         append_qc_row(
             args.output_folder, record, args.lead_placement, qc, max_offset_deviation
         )

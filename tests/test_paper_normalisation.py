@@ -709,9 +709,10 @@ def test_save_mask_files_writes_a_record_after_the_frame(tmp_path):
         '{"rot_angle": 0.5, "height": 6, "width": 8, "paper_normalisation": '
         '{"version": "v", "decision": "pass_chain", "input_size": [8, 6]}}'
     )
-    # Drivers call it with up to six arguments in this order: the record comes last.
+    # Drivers call it with up to six arguments in this order: the record comes after
+    # them, and only the record of the sheet curl stage after it.
     parameters = inspect.signature(digitize.save_mask_files).parameters
-    assert list(parameters)[-2:] == ["scale", "paper"]
+    assert list(parameters)[-3:-1] == ["scale", "paper"]
     assert parameters["paper"].default is None
 
 

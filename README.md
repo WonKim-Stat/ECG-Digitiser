@@ -253,9 +253,10 @@ where
 
 #### Pipeline stages
 
-Under the defaults, every page goes through stages 1 to 10 below before its signals are
-written (`run()` in `src/run/digitize.py`). Every stage that reads the printed 1 mm grid
-lines falls back to the behaviour without them if the page shows none.
+Under the defaults, every page goes through the stages below, all but stage 5, which is
+off unless it is asked for, before its signals are written (`run()` in
+`src/run/digitize.py`). Every stage that reads the printed 1 mm grid lines falls back to
+the behaviour without them if the page shows none.
 
 1. **Paper normalisation:** a photographed page is put into the frame the model was
    trained on. A page whose grid lines stages 2 to 4 read as it is, or whose printed
@@ -274,13 +275,24 @@ lines falls back to the behaviour without them if the page shows none.
    more than 0.15 of their period off the fit is kept as it was rotated, with a
    `WARNING`. `--perspective_tolerance 0.1` keeps every page above a tenth as it was
    rotated, the reading before 0.15 became the default.
-5. **Segmentation:** nnU-Net predicts the lead masks of the corrected page.
-6. **Column grid:** all leads are put on one shared column grid, with the column pitch
+5. **Sheet curl:** off unless `--sheet_curl lines` asks for it. A sheet that is bent is
+   straightened by its grid lines: a smooth map from the pixels of the page to the
+   coordinates of its grid lines, a projective part and a polynomial per line family,
+   is measured in windows over the page as stage 4 left it, and the page is warped into
+   the frame in which the lines are straight (`src/run/sheet_curl.py`). Every page is
+   looked at, unless `--sheet_curl_scope normalised` says only a page that stage 1
+   warped onto the Letter page, a photographed sheet. A page that its map moves by less
+   than 15 px is left as it is, and so is, with a `WARNING`, a page whose grid lines
+   carry no such map. A bend of the whole sheet is taken out, a fold or a local dent is
+   not.
+6. **Segmentation:** nnU-Net predicts the lead masks of the corrected page, which is
+   the straightened one where stage 5 was applied.
+7. **Column grid:** all leads are put on one shared column grid, with the column pitch
    from the page height, the origin refined to sub-pixel accuracy on the grid lines and
    moved by the grid line offset. A page that fails a check of this grid because one of
    its columns is distorted is tried a second time, and kept on that try only if the
-   column map of stage 7 stands on it. `--grid_rescue off` does not try again.
-7. **Column mapping:** the time axis is read off the grid lines themselves: the 1 mm
+   column map of stage 8 stands on it. `--grid_rescue off` does not try again.
+8. **Column mapping:** the time axis is read off the grid lines themselves: the 1 mm
    lines, each named by the bold 5 mm lines, say where every millimetre of the page is,
    so a page whose grid and traces are stretched, compressed or stepped in places by
    printing, paper feed or scanning is read at the x of each sample's own millimetre.
@@ -289,14 +301,14 @@ lines falls back to the behaviour without them if the page shows none.
    the four rows of leads is read on a map of its own, the map of the page moved by what
    the grid lines in the band of that row say. `--row_mapping off` reads every lead on
    the map of the page.
-8. **Trace reading:** every column of a lead gives one row, the mean row of its mask
+9. **Trace reading:** every column of a lead gives one row, the mean row of its mask
    weighted by the ink of the page under it, read on a column axis moved by the trace
    shift measured on the page.
-9. **Sharpening:** the 20–40 Hz band that the width of a column and the linear
-   interpolation between columns attenuate is put back: the part below 35 Hz of the
-   difference between an aperture-corrected cubic spline through the columns and the
-   linear trace is added to the trace, so steep QRS spikes cannot ring.
-10. **Baseline:** the zero line comes from the page geometry scaled with the column pitch
+10. **Sharpening:** the 20–40 Hz band that the width of a column and the linear
+    interpolation between columns attenuate is put back: the part below 35 Hz of the
+    difference between an aperture-corrected cubic spline through the columns and the
+    linear trace is added to the trace, so steep QRS spikes cannot ring.
+11. **Baseline:** the zero line comes from the page geometry scaled with the column pitch
     and is then shifted so that the Einthoven and Goldberger sums have no DC offset.
 
 
@@ -304,11 +316,16 @@ lines falls back to the behaviour without them if the page shows none.
 
 | Flag | Choices | Default | What it does |
 | --- | --- | --- | --- |
-| `--paper_normalisation` | `off`, `auto` | `auto` | `auto` puts a photographed page into the frame the model was trained on, before every other stage and on the signals of the image alone. A page whose printed grid lines the resolution, the rotation and the perspective stage all read as it is is left as it is (`pass_chain`), and so is one without a background to find a paper edge in: the image reaches at most 8 mm beyond a Letter sheet, or no paper edge is found and the grid is within 12 mm of the border on all four sides, or the paper found covers 95 % of the image (`pass_fullframe`). Otherwise the four edges of the sheet are looked for (the region of the red grid, then in 24 bands per side the step from the print or its white margin to the background, then each side again at full resolution) and the sheet is warped in one bicubic pass onto a US Letter landscape page at 200 dpi (2200 × 1700 px), long side horizontal, in the orientation that puts the trace ink in the lower part, and scaled so that the 1 mm grid has the period it has on a scanned printout, 0.954 × 200 dpi (`normalised`). A page whose paper is not found, runs off the image or gives an implausible sheet or grid is kept, with a `WARNING` (`failed`); such a page, or a `pass_fullframe` one, whose grid the resolution stage could not read while the extent of its grid says it is more than 12 % above 200 dpi of paper is shrunk to that and not rectified, with a `WARNING` as well (`scaled`). The curl of a sheet is not taken out, and the print gets the scale of the frame, not its position. A page without a readable grid is not told from a photograph by its content, as in the view builder: a blank page is `pass_fullframe`, and a large image without a grid, blank or with content that looks like a sheet at the scale of a photograph (4000 × 3000 px, say), is taken to show a whole Letter sheet and shrunk to 200 dpi of it (`scaled`). The stage is the image code of the view builder that made the photograph results of the quality control section, function for function, with the thresholds chosen there on the 345 development photographs of the ECG-Image-Database (115 records, three photo conditions; references below the table). With that builder, outside this repository, 301 of those pages were normalised, 22 scaled, 12 passed and 10 failed; scored per lead against PTB-XL, the median lead SNR of the three conditions rose from −6.20, −3.63 and −4.53 dB to −1.87, −1.10 and −0.52 dB (paired median, pooled over the three, +3.71 dB, 95 % CI 2.87 to 4.41; +3.55 dB with the time axis left uniform, so from the normalisation alone), a PTB-XL diagnostic classifier changed 26.3, 32.7 and 30.6 % instead of 47.5, 51.3 and 40.2 % of its record and class decisions against the digital signal, and the 903 rendered pages, scans and synthetic pages it was checked on were all left as they are. So photographs are read better, not well: most of what is left is the time axis of a sheet that does not lie flat. The stage itself, run on those 345 pages with their saved masks, gives the same view, pixel for pixel, and the same signals, byte for byte, so these numbers are its numbers. With the flag itself, the 575 rendered and scanned development pages of that database and all 208 synthetic pages (every page of the results below included) were left as they are and keep byte identical signals. On a page that is left as it is, with `--resolution`, `--rotation` and `--perspective` at `lines`, the three stages are measured once and used twice, and the stage costs about 0.1 s (the digests of the page); only the perspective of a page whose grid line fit was refused in that first measurement is measured again, at `--perspective_tolerance`, when that is above 0.1, as its default is; with one of them set otherwise the stages are measured a second time, 1 to 4 s per page on generator pages, and a synthetic 12-megapixel photograph takes 5 to 8 s. What was done to a page is recorded next to its mask, see below the table. `off` takes the page as it is, the behaviour before `auto` became the default. |
+| `--paper_normalisation` | `off`, `auto` | `auto` | `auto` puts a photographed page into the frame the model was trained on, before every other stage and on the signals of the image alone. A page whose printed grid lines the resolution, the rotation and the perspective stage all read as it is is left as it is (`pass_chain`), and so is one without a background to find a paper edge in: the image reaches at most 8 mm beyond a Letter sheet, or no paper edge is found and the grid is within 12 mm of the border on all four sides, or the paper found covers 95 % of the image (`pass_fullframe`). Otherwise the four edges of the sheet are looked for (the region of the red grid, then in 24 bands per side the step from the print or its white margin to the background, then each side again at full resolution) and the sheet is warped in one bicubic pass onto a US Letter landscape page at 200 dpi (2200 × 1700 px), long side horizontal, in the orientation that puts the trace ink in the lower part, and scaled so that the 1 mm grid has the period it has on a scanned printout, 0.954 × 200 dpi (`normalised`). A page whose paper is not found, runs off the image or gives an implausible sheet or grid is kept, with a `WARNING` (`failed`); such a page, or a `pass_fullframe` one, whose grid the resolution stage could not read while the extent of its grid says it is more than 12 % above 200 dpi of paper is shrunk to that and not rectified, with a `WARNING` as well (`scaled`). The curl of a sheet is not taken out by this stage (`--sheet_curl lines`, off by default, is the stage for a sheet that is bent), and the print gets the scale of the frame, not its position. A page without a readable grid is not told from a photograph by its content, as in the view builder: a blank page is `pass_fullframe`, and a large image without a grid, blank or with content that looks like a sheet at the scale of a photograph (4000 × 3000 px, say), is taken to show a whole Letter sheet and shrunk to 200 dpi of it (`scaled`). The stage is the image code of the view builder that made the photograph results of the quality control section, function for function, with the thresholds chosen there on the 345 development photographs of the ECG-Image-Database (115 records, three photo conditions; references below the table). With that builder, outside this repository, 301 of those pages were normalised, 22 scaled, 12 passed and 10 failed; scored per lead against PTB-XL, the median lead SNR of the three conditions rose from −6.20, −3.63 and −4.53 dB to −1.87, −1.10 and −0.52 dB (paired median, pooled over the three, +3.71 dB, 95 % CI 2.87 to 4.41; +3.55 dB with the time axis left uniform, so from the normalisation alone), a PTB-XL diagnostic classifier changed 26.3, 32.7 and 30.6 % instead of 47.5, 51.3 and 40.2 % of its record and class decisions against the digital signal, and the 903 rendered pages, scans and synthetic pages it was checked on were all left as they are. So photographs are read better, not well: most of what is left is the time axis of a sheet that does not lie flat. The stage itself, run on those 345 pages with their saved masks, gives the same view, pixel for pixel, and the same signals, byte for byte, so these numbers are its numbers. With the flag itself, the 575 rendered and scanned development pages of that database and all 208 synthetic pages (every page of the results below included) were left as they are and keep byte identical signals. On a page that is left as it is, with `--resolution`, `--rotation` and `--perspective` at `lines`, the three stages are measured once and used twice, and the stage costs about 0.1 s (the digests of the page); only the perspective of a page whose grid line fit was refused in that first measurement is measured again, at `--perspective_tolerance`, when that is above 0.1, as its default is; with one of them set otherwise the stages are measured a second time, 1 to 4 s per page on generator pages, and a synthetic 12-megapixel photograph takes 5 to 8 s. What was done to a page is recorded next to its mask, see below the table. `off` takes the page as it is, the behaviour before `auto` became the default. |
 | `--resolution` | `keep`, `lines` | `lines` | `lines` resamples the page so that the printed 1 mm grid lines have the period of a 200 dpi page, the scale the model was trained on. A page within about a tenth of that scale keeps its pixels, because resampling it costs more than the scale does. |
 | `--rotation` | `hough`, `lines` | `lines` | `lines` refines a 0.1° Hough angle with the phase drift of the grid lines, which resolves fractions of a degree. `hough` is the Hough transform of the page in whole degrees only. |
 | `--perspective` | `off`, `lines` | `lines` | `lines` takes the shear and the perspective that the grid lines show out of the rotated page, and leaves a page alone that is straight enough already. `off` keeps the rotated page. |
 | `--perspective_tolerance` | a share of the grid line period, `0.1` to `0.5` | `0.15` | Only for `--perspective lines`: the largest residual of the grid line fit that the perspective stage accepts, as a share of the period of the lines it measures on. A page whose fit is above it keeps the rotated page, with a `WARNING`. `0.1` is the tolerance of the stage itself. The grid of a printed and scanned sheet is not exactly the projective image of a square one, so the fit of such a page can end a little above 0.1, and the default, `0.15`, rectifies it. Only the perspective stage of the run takes the value. The rotation stage keeps 0.1, and so does `--paper_normalisation auto` where it decides whether the stages read a page as it is, so the decisions of the paper normalisation are those at 0.1. A value below 0.1 or above 0.5 is refused when the arguments are read: the flag only widens the stage. A page that is rectified with a residual above 0.1 is in another frame than at 0.1, so a mask saved for it at 0.1 does not fit, and `--mask_folder` says so with its frame `WARNING`; what that means for masks saved before 0.15 became the default is below the table. `--verbose` names a page that is accepted above 0.1 in one line, `Perspective for record <record>: accepted at --perspective_tolerance <k>, residual <share> of the period (the stage's own tolerance is 0.1), homography applied`, or `…, inside the dead band, page kept` for a page that is accepted and straight enough to be left alone, and `qc.csv` holds the share in `perspective_residual_rel`. Development-set numbers and limits are under *Results on real pages* below: the scans gain, though 6 of the 89 mould-damaged scans that 0.15 moves into another frame lose more than 1 dB of page SNR, and so do 20 of the 100 photographs it moves, where the change of the classifier's decisions has an interval that includes zero. `0.1` is the reading before `0.15` became the default: it reproduces older outputs, and it is the frame that masks saved without the flag before the change were predicted in. |
+| `--sheet_curl` | `off`, `lines` | `off` | `lines` straightens a sheet that is bent, after the perspective stage and before the segmentation. The paper normalisation puts the four corners of a photographed sheet on the page frame and the perspective stage fits one homography to its grid; both leave the bend of the sheet in the page, so its grid lines are curves, the column grid and the column map do not stand on them, and the traces are read off a time axis that is not theirs. The stage measures a smooth map from the pixels of the page, as the perspective stage left it, to the coordinates of its grid lines (`src/run/sheet_curl.py`): the phase of the 1 mm lines of both line families in windows 16 lines long, a quarter of a window apart; a projective part fitted to both families together and, per family, a polynomial of total degree 4 for what that part leaves; and the shift and the one scale for which the map moves the page least, without a rotation, since the grid gives the orientation. The page is then warped into the frame in which the lines are straight, bicubic and onto a new page of the same size, and measured again: what the straightened page still asks for is added to the map until `--sheet_curl_passes` measurements are in it, and the last measurement is the check that the lines are straight. A page comes out in one of four ways, which `qc.csv` holds in `sheet_curl`. `applied`: the page that is segmented and read is the straightened one. `dead band`: the map that would be applied, with all its passes composed, moves no measured point by `--sheet_curl_min_shift` (15 px unless given), and the page is left exactly as it is, without a `WARNING`; such a page was still measured, warped and measured again to check the map, so it costs the seconds named below. `refused: <reason>`: the page is kept as it is and prints `WARNING: sheet curl not straightened for record <record> (<reason>), keeping the page as it is.` The reasons are, in short: no grid lines, or too few windows with them; a fit that leaves more than `--sheet_curl_tolerance`; lines that span or cover less than half of the page; a map that folds, or that `stretches or squeezes the page by more than a factor of two somewhere`, which in practice is a page with holes in its grid that the map is held across; a correction of more than 5 % of the page width somewhere; a map whose inverse does not converge; a straightened page that gives no map, whose lines are not straight, or that still asks for more after the last pass; and an error inside the measurement, which is a refusal as well, so that one page does not end the run of a folder. `out of scope`: the page is not looked at, see `--sheet_curl_scope`. `applied` says that a map was accepted and the page was warped with it, not that the sheet is flat now: a smooth bend of the whole sheet is taken out, a fold or a local dent is not, since the map has no term for it, and a page with one can be `applied` without being straightened there. On synthetic generator pages bent by a known map, the estimator recovers the map to 0.03 to 0.35 px RMS for whole-sheet bends of 3 to 40 px. That was measured at the estimator's own threshold of 1 px with no dead band on top: with the default dead band of 15 px the smaller of these bends (3 px, and 10 px, which the map moves by 4 to 9 px on a clean page) are left as they are. `--verbose` prints one line per page, `Sheet curl for record <record>: <decision>, carrier …`, with the numbers of the fit (the carrier and its period, the windows of both line families, the residual of the projective part, of the field, after the warp and over all windows, the largest and the RMS shift where the lines were measured and the largest over the whole page, the scale, the smallest Jacobian determinant, the passes, the cover and the share of the windows the fit keeps), or `Sheet curl for record <record>: out of scope, not a page the paper normalisation warped onto the page frame`. In that line the decision of a page left in the dead band of `--sheet_curl_min_shift` reads `dead band of the accepted map`, with the numbers of the map that was measured, checked and not used; a plain `dead band` is a page whose first measurement already moves it by less than the 1 px of the estimator, where nothing was warped and `after the warp` is `nan`. The stage costs seconds, not fractions of one: on synthetic generator pages (2200 × 1700 px) 0.4 to 2 s for a page that is measured once and left alone and 1 to 6 s for one that is straightened with one measurement and its check; a page that takes all three passes is measured four times and warped three times. On the 345 development photographs, in the driver and in the run of *Results on real pages*, the stage took 0.9 to 9.7 s for a page it straightened (median 2.3 s, and 2.4 s for the 123 pages with three passes) and 0.2 to 6.6 s for a page it refused (median 0.6 s). A page that ends in the dead band of `--sheet_curl_min_shift` costs what a straightened one does, since its map is measured and checked before it is left alone. A mask that comes with the page is warped with it, or was saved for the straightened page and carries a record that says so: see below the table. Development-set numbers and limits are under *Results on real pages* below; the tolerance, the passes, the dead band and the scope were chosen on the development pages those numbers are on, and they were made with saved masks, each predicted on the bent page and warped with it. A run in which nnU-Net predicts on the straightened page was read once, on the development pages the stage straightens, and gives the same picture (the last paragraph before the limits there). `off` keeps the page of the perspective stage and measures nothing: signals, masks, printed lines and every column that `qc.csv` had are what they were without the stage, and only a mask that was saved for a straightened page gets a `WARNING` (below the table). |
+| `--sheet_curl_tolerance` | a share of the grid line period, above `0` and up to `0.5` | `0.25` | Only for `--sheet_curl lines`: the largest RMS residual of the fit of the map that is accepted, as a share of the period of the grid lines. A page whose fit leaves more is refused, and so is one whose lines are further than that from a projective fit after the warp; both are kept as they are, with the `WARNING` of the stage. Clean synthetic pages suggest 0.1: the fit of a bent sheet ends below it there. With 0.1 the stage accepts 11 of the 345 development photographs of the ECG-Image-Database, since the fit of a photograph leaves 0.10 to 0.25 of a period on nine pages in ten (median 0.18). The default was therefore chosen on those photographs, where 0.25 accepts 135 pages with 2 passes and 188 with 3 (no dead band above the 1 px of the estimator, every page in scope); it has not been confirmed on other pages. What 0.25 lets through is not always a right map: on a drawn page with a known map, out of focus and bent by 38 px, a fit that leaves 0.17 of a period is accepted and is a wrong map, 9 px RMS and 25 px at its worst off the truth, which 0.1 refuses and the check on the straightened page does not catch. On the photographs the pages accepted between the two tolerances still gain more often than they lose (the counts are in the limits under *Results on real pages*). No residual is above half a period, so a value above 0.5, like one of 0 or less, is refused when the arguments are read. |
+| `--sheet_curl_passes` | a whole number from `1` to `5` | `3` | Only for `--sheet_curl lines`: how many measurements may be composed into the map. The straightened page is measured again; while it still asks for 1 px or more, the threshold of the estimator, and this number is not reached, what it asks for is added to the map and the page is warped anew from the page as it was, so no page is resampled on top of a resampled one. The last measurement is the check that the lines are straight and adds nothing; with `1` the first map is checked and that is all. A page that does not settle, one that after the last pass still asks for 1 px or more and for a quarter or more of what the page asked for, is refused. The default was chosen on the 345 development photographs of the ECG-Image-Database: with a tolerance of 0.25, no dead band above that 1 px and every page in scope, 3 passes straighten 188 pages where 2 straighten 135. The dead band of `--sheet_curl_min_shift` does not end the passes: it is taken on the map when all its passes are composed (only a value of that flag below 1 takes the place of the 1 px here). |
+| `--sheet_curl_min_shift` | any number of pixels, `0` or more | `15` | Only for `--sheet_curl lines`: the dead band of the stage. A page whose accepted map, with all its passes composed, moves no measured point by this much is left exactly as it is, without a `WARNING` (`dead band` in `qc.csv`, with the largest move of that map in `sheet_curl_shift_px`); a map that moves a point by exactly this much is applied. The dead band decides whether a map is used, not how it is measured. The estimator has a threshold of its own, 1 px, the value the stage was developed with and every development number was read with: a page whose first map moves it by less is a `dead band` page as well (all 176 flat synthetic pages that were tried stay inside it), a further pass is composed only while the straightened page asks for 1 px or more, and the check lets pass what a straightened page still asks for below it. Only a value of this flag below 1 takes the place of that threshold. So a page that is left in the dead band was still measured, warped and measured again, and a page whose grid lines carry no map that is accepted is `refused` with its `WARNING` whatever this value is, also when the map it would have had is a small one. The default was chosen on the development pages of the ECG-Image-Database, clean and mould-damaged scans included, among rules counted from the run at 1 px by leaving alone the pages whose map moves less (see *Results on real pages*). A small bend costs a page that reads well, since the page is resampled once more and a saved mask is warped nearest, which moves the edge of a trace by up to half a pixel: with no dead band above 1 px the stage straightens 193 of the 230 clean scans, and 67 of them lose more than 1 dB of page SNR where 17 gain. Counted with 15 px it straightens 2 of the clean scans, 139 of the 345 photographs, 151 of the 230 mould-damaged scans and none of the 115 rendered pages. What the dead band costs is a bend below it, which is left as it is: a drawn full-size page bent by 12 px, whose map moves it by 7.6 px, is read at 2.5 dB against the flat page with the defaults, as without the stage, and at 25.9 dB with `--sheet_curl_min_shift 2` (a drawn page, not a photograph). `0` is no dead band at all, of the stage or of the estimator: every page with a map that is accepted is warped, and every pass is used. |
+| `--sheet_curl_scope` | `normalised`, `all` | `all` | Only for `--sheet_curl lines`: which pages the stage looks at. `all` looks at every page; what leaves a flat page alone is the dead band of `--sheet_curl_min_shift`, not the scope. `normalised` is only a page that the paper normalisation warped onto the Letter page, which is a photographed sheet: decided so in this run by `--paper_normalisation auto` or, with `--mask_folder`, said so by the `paper_normalisation` record of its mask, which is replayed and not decided again. Every other page is then `out of scope` and is not measured: a page the paper normalisation left as it is, only scaled or failed on, a page read with a mask that has no such record, and every page under `--paper_normalisation off` unless the record of its mask says `normalised`. So under `normalised` a normalised view that is given as the page with a mask without a record is out of scope, and only `qc.csv` and the `--verbose` line say so: such a run needs `all`. The default was chosen on the development pages (see *Results on real pages*). The mould-damaged scans, which the paper normalisation does not warp, gain most from the stage; the 20 photographs straightened at 1 px that the paper normalisation had not warped gain nothing in the median page SNR, and the two classifiers disagree on them; and the clean scans, which lose under a small dead band (67 of the 230 pages lose and 17 gain more than 1 dB at 1 px), are kept out by the dead band of 15 px, not by the scope. So `all` without that dead band is not a setting to read clean scans with. |
 | `--time_mapping` | `bbox`, `grid` | `grid` | `grid` samples all leads on one shared column grid, for the standard 3x4 layout with rhythm strip. `bbox` stretches the bounding box of every lead to its length. |
 | `--grid_pitch` | `page`, `fit` | `page` | Where the column pitch of that grid comes from: `page` from the page height, checked against the least squares fit of the column edges, `fit` from that fit. |
 | `--grid_origin` | `masks`, `lines` | `lines` | `lines` refines origin and pitch of the column grid on the printed grid lines, assuming the first column starts on a grid line. `masks` uses the mask edges only. |
@@ -357,7 +374,8 @@ A mask without the record, which is every mask saved with `--paper_normalisation
 by a version without the stage, or again from such a mask, has no such pixel check: its page is used as given,
 with `as given` in `qc.csv` under the default `--paper_normalisation auto` and `off`
 under `--paper_normalisation off`, and only the size of the mask and the frame warnings
-of the rotation and the perspective stand between it and another page. So a folder of
+of the rotation, the perspective and, for a mask saved for a straightened page, the
+sheet curl stand between it and another page. So a folder of
 such masks is read to the same signals with either flag. A mask that is refused can
 still be used: give the run the page it was predicted on, which is the recorded view
 itself or, with `--paper_normalisation auto`, the input page the view is rebuilt from;
@@ -392,6 +410,67 @@ other page fits at either tolerance: a page whose fit is within 0.1, one that is
 refused at 0.15 as well, and one that is accepted above 0.1 but straight enough to be
 left alone are in the same frame at both.
 
+The frame of a mask depends on `--sheet_curl` as well, and for this stage the JSON says
+which frame it is. A run with `--sheet_curl lines` and `--save_mask` saves the mask in
+the frame it goes on with, which is the straightened page where the stage was applied,
+and gives the JSON one more key, `sheet_curl`: the version of the record, the decision
+(`applied`, `dead band`, `refused` or `out of scope`) and the reason of a refusal, the
+scope, the dead band (`dead_band`), the options and constants that define the map
+(`min_shift` among the options is the threshold of the estimator, 1 px, not the dead
+band), the largest shift of the map
+(`shift_max`), and for an `applied` page its size and the map itself at a lattice of
+9 × 7 points over the page, its borders included (`points`, rows `[x, y, X, Y]`: the
+point (x, y) of the page lies at (X, Y) on the straightened one). With
+`--sheet_curl off`, the default, the JSON is byte for byte what it was. With
+`--mask_folder` the record says what is done with the mask:
+
+- a mask without the record, which is every mask saved without the stage, and a mask
+  whose record says anything but `applied`, was predicted on the page as the
+  perspective stage left it. When the run straightens the page, the mask is warped with
+  it, nearest neighbour, so that it holds no label that was not in it; when the run
+  keeps the page, the mask is used as it is. So masks saved before the stage can be
+  read with `--sheet_curl lines`, and the development-set numbers under *Results on
+  real pages* were made that way;
+- a mask whose record says `applied` was predicted on the straightened page. It is
+  used as it is and never warped again, and it only fits a run that straightens the
+  page by the same map, to within 0.1 px at the points of the record.
+
+A mask of the second kind that does not fit gets a `WARNING` in the words of the frame
+check, and the run goes on with it, as it does after the frame warnings of the rotation
+and the perspective. When the map of the run is another one, it prints
+`WARNING: mask of record <record> was predicted on a page straightened by a sheet curl map that is <distance> px off the one used now; the mask does not fit.`
+and when the run does not straighten the page at all, because the stage is `off` or the
+page is out of scope, inside the dead band or refused,
+`WARNING: mask of record <record> was predicted on a page whose sheet curl was straightened, the page is now kept as it is (<why>); the mask does not fit.`
+A record of a version this code does not read, an `applied` record that does not hold
+all 63 points of its map and the size of its page, and a record that is no JSON object
+are said in the same way (`has a sheet curl record of version …`,
+`… without the points of its map`, `… that is no object`), and such a mask is used as it
+is and not warped; `null` is no record. The map of a page depends on the page the
+perspective stage hands on and on the options of the stage, so read masks that were
+saved for straightened pages with the flags they were saved with. That includes the
+dead band: a page that was straightened at `--sheet_curl_min_shift 1` and is left alone
+at the default of 15 px gets the second `WARNING`, with `(dead band)`, so a folder of
+masks saved at one dead band is read with that dead band, and with the tolerance, the
+passes and the scope it was saved with; `dead_band`, `options` and `scope` in the
+record say which they were. As for the perspective, the check reads what
+`<record>_mask.json` holds, so a mask folder without that file is taken to hold masks
+of pages that were not straightened. And a version of this code from before
+`--sheet_curl` does not know the record at all: it reads a mask that was saved for a
+straightened page without any `WARNING` and writes the signals of a mask that does not
+fit. Keep masks of straightened pages in folders of their own, and do not read them
+with an older version.
+A mask that came in the straightened frame, or with a record that cannot be read,
+keeps the record it came with when a run with `--mask_folder` and `--save_mask` saves
+it again, also when that run keeps the page (stage `off`, out of scope, dead band,
+refused) or straightens it by another map: it has printed the `WARNING` then, the mask
+it saves is the one it was given, and a later run that straightens the page still uses
+it as it is. Every other mask is saved with the record of the run that saves it, and
+with `--sheet_curl off` a mask that came without a record is saved without one, byte
+for byte as before.
+In a run without `--mask_folder` nnU-Net predicts on the straightened page; what it
+makes of one was read once on development pages, see *Results on real pages*.
+
 The real-page numbers in the table, in the quality control section and under *Results on
 real pages* below are on the ECG-Image-Database, version 2
 (<https://www.kaggle.com/datasets/physionet/ecg-image-database>), whose images are
@@ -403,7 +482,12 @@ What the two flags change on the same pages is under *Results on real pages*. An
 every real-page number that is not about `--perspective_tolerance` itself (the numbers
 in the table, those of the quality control section, the evaluation-set numbers and the
 paragraphs on the two flags) was measured before 0.15 became the default of that flag,
-and is read at 0.1. The dataset page asks for these citations:
+and is read at 0.1. `--sheet_curl lines` is off unless it is asked for and is in none
+of these numbers. Its own numbers, in the rows of its options in the table and in the
+last paragraphs of *Results on real pages*, are the exception to both rules: they were
+read, with the stage and without it, with the defaults as they are now
+(`--grid_rescue map --row_mapping lines --perspective_tolerance 0.15`). The
+dataset page asks for these citations:
 
 1. M. A. Reyna et al., "ECG-Image-Database: large-scale paired ECG images and time-series
    with real-world artifacts; a foundation for computerized ECG digitization and
@@ -456,6 +540,19 @@ columns:
   appended after `row_mapping`, so no column that was there moves; as for
   `paper_normalisation`, do not append to a `qc.csv` written by an older version, but
   use a fresh output folder.
+- **Sheet curl:** `sheet_curl`, `off` without `--sheet_curl lines`. With it: `applied`
+  for a page that was straightened, `dead band` for a page whose map, all passes
+  composed, moves no measured point by `--sheet_curl_min_shift` (or whose first map
+  moves none by the 1 px of the estimator), which is left as it is, `refused: <reason>` for a
+  page whose grid lines carry no map that is accepted, which is kept as it is with a
+  `WARNING`, and `out of scope` for a page that `--sheet_curl_scope` does not look at.
+  And `sheet_curl_shift_px`, the largest move in pixels that the map of an `applied` or
+  a `dead band` page makes where its grid lines were measured (NaN for every other
+  page). `applied` says that the page was warped with a map that was accepted, not
+  that the sheet is flat now: a fold or a local dent stays. These two columns are the
+  36th and the 37th, appended after `perspective_residual_rel`, so no column that was
+  there moves; as for `paper_normalisation`, do not append to a `qc.csv` written by an
+  older version, but use a fresh output folder.
 - **Column grid:** `grid_line_contrast`, the amplitude of the grid line comb over the
   neighbouring periods, and `grid_line_shift_px`, how far the grid lines moved the
   origin of the mask grid.
@@ -494,7 +591,9 @@ A `WARNING` line is printed whenever a stage cannot do what it is asked and fall
 is kept as it is, or only rescaled); the grid lines are unusable for the resolution (the
 page is kept as it is), for the
 rotation (the whole degree Hough angle is kept), for the perspective (the rotated page
-is kept) or for the grid origin (the grid of the masks is kept); no column grid fits the
+is kept) or for the grid origin (the grid of the masks is kept); with
+`--sheet_curl lines`, the grid lines of a page in its scope carry no map that is
+accepted (the page of the perspective stage is kept); no column grid fits the
 page, so `--time_mapping bbox` is used for it; the Einthoven and the Goldberger baseline
 estimate disagree by more than the tolerance, so the page baseline is kept; the grid
 line map of `--column_mapping lines` cannot be trusted, so the uniform grid is kept; or
@@ -566,7 +665,8 @@ not flag.
 they became that. The numbers on the two flags, in this and the next four paragraphs,
 were all read at `--perspective_tolerance 0.1`, the tolerance of the perspective stage
 itself and the reading when they were made; what 0.15, the default now, changes on the
-same pages is at the end of this section. The numbers here are **development-set
+same pages comes after them, and what `--sheet_curl lines`, off by default, does on the
+photographs is at the end of this section. The numbers here are **development-set
 numbers**: the tolerance of the second fit, the pitch of the second try and the width
 of the row median were chosen on these pages, and the evaluation set of the database
 has not been read with either flag. They are on the 230 clean colour and greyscale
@@ -670,7 +770,10 @@ gets worse: 20 pages lose more than 1 dB of page SNR, while 58 gain more than 1 
 against 0.64 dB over the 100, and −1.71 dB at 0.15): 10 of them were at or above 5 dB
 at 0.1, out of 18 such pages among the 100, and 7 of those 18 are below 5 dB at 0.15.
 This looks like a projective correction laid on a curled sheet breaking a page that
-worked; the curl of these pages was not measured. Over the 345 pages the classifier
+worked; the curl of these pages was not measured then (`--sheet_curl lines` straightens
+19 of the 20 in the run at the end of this section, and 12 of those gain more than
+1 dB and none loses, though a group picked for a bad outcome tends to gain under any
+change). Over the 345 pages the classifier
 changes 470 instead of 493 of its 1,725 decisions (−23, −48.7 to +1.0, an interval that
 includes zero as well), the leads without a usable signal go from 57.2 to 53.2 %, the
 median lead SNR from −0.83 to −0.34 dB, and 270 instead of 292 pages have a page SNR
@@ -718,6 +821,171 @@ the photographs of the same 115 records in view, and the evaluation set has not 
 read with it. So the numbers say what the tolerance does on these pages, not what it
 would do on others. `--perspective_tolerance 0.1` gives the reading before 0.15 became
 the default, and a mask saved at 0.1 is read with it (see below the options table).
+
+`--sheet_curl lines` is off by default, and everything above in this section was read
+without it. Its numbers are **development-set numbers**, and the options of the stage
+are fitted to the pages they are on. The options the stage was planned with were fixed
+on synthetic pages before a photograph was read: a tolerance of 0.1, 2 passes and a
+threshold of 1 px. With them the stage accepts 11 of the 345 development photographs,
+since the fit of a photograph leaves 0.10 to 0.25 of a grid line period on nine pages
+in ten (median 0.18), so the planned reading changes next to nothing. Everything below
+is exploratory: the tolerance of 0.25 and the 3 passes were chosen on these
+photographs, in three runs on them, and the dead band of 15 px and the scope `all` were
+then picked among rules composed from those runs on the same development pages (dead
+bands of 5, 10 and 15 px and both scopes among them), the clean and the mould-damaged
+scans of the same records included. So the numbers say what the stage does on these
+pages, not what it would do on others, and the evaluation set of the database has not
+been read with it. They are on the development set (115 PTB-XL records): the 345
+photographs of three conditions, and with every page in scope also the 230 clean
+scans, the 230 mould-damaged scans and the 115 rendered pages; the original pages, read
+from saved masks with `--paper_normalisation auto` and the defaults of the other
+stages, and compared, paired, with the same pages read without the stage. All pages of
+a group are in every denominator, those the stage refuses or leaves alone included; the
+classifier is the one of the paragraphs above unless a second one is named, and the
+intervals are patient bootstrap 95 % CIs. The stage was applied after the segmentation:
+the saved masks were predicted on the pages before they were straightened and are
+warped with their pages (see below the options table). So in these numbers nnU-Net has
+not seen a straightened page; a run without `--mask_folder`, where the model predicts
+on the straightened page, is the subject of the last paragraph before the limits. The
+numbers were made with the driver the stage was developed with, outside
+this repository, whose estimator `src/run/sheet_curl.py` holds. The flags themselves
+give the signals of that driver, file for file, on synthetic pages and on all 920
+development pages: read from the saved masks with `--sheet_curl lines
+--sheet_curl_min_shift 1`, they straighten the same 188 photographs, 193 clean scans
+and 207 mould-damaged scans and none of the rendered pages.
+
+The run the numbers come from is not the default one: it has the tolerance of 0.25 and
+the 3 passes of the defaults and every page in scope, but no dead band above the 1 px
+of the estimator (`--sheet_curl_min_shift 1`). On the photographs 188 of the 345 pages
+are straightened with it (57, 83 and 48 of the three conditions) and 157 are refused.
+The leads without a usable signal drop from 53.2 to 43.7 %, the median lead SNR goes
+from −0.34 to 1.97 dB, 219 instead of 270 pages have a page SNR below 5 dB and 314
+instead of 331 one below 12 dB; 99 pages gain more than 1 dB of page SNR and 22 lose
+more than 1 dB. The classifier changes 408 instead of 470 of its 1,725 record and class
+decisions against the digital signal (−62, 95 % CI −89.8 to −35.0) and 307 instead of
+361 of the 1,452 that the digital signal puts at least 1 logit from the threshold (−54,
+−78.6 to −30.2), the mean absolute change of its class probabilities falls from 0.1960
+to 0.1765 (by 0.0195, 0.0114 to 0.0274), and a second classifier changes 430 instead of
+462 of its decisions on the same pages (−32, −57.0 to −5.1). By condition the
+classifier changes 104 instead of 129, 155 instead of 174 and 149 instead of 167 of its
+575 decisions; the interval of the second of these, the stained photographs, touches
+zero (−19, −37.7 to 0.0), and on the mould-damaged photographs the second classifier
+changes 159 instead of 153 (+6, −6.9 to +18.4).
+
+Where that lands, among the 188 photographs straightened in that run. The 131 that were
+below 5 dB page SNR go from a median page SNR of −1.65 to 4.23 dB (75 gain and 6 lose
+more than 1 dB). Of the 11 that were at or above 12 dB, 5 lose and 3 gain; of the 30
+that the map moves by less than 10 px, 10 lose and 5 gain; and the 20 that the paper
+normalisation did not warp gain nothing in the median page SNR (−3.7 to −3.4 dB; 5 gain
+and 1 loses more than 1 dB, and with them left alone the classifier changes 6 decisions
+more and the second classifier 5 fewer). The first two groups are cut on the page SNR
+without the stage, which is one of the two numbers compared, so part of what they show
+is regression to the mean: pages picked for reading badly tend to gain, and pages
+picked for reading well tend to lose, under any change. They say where the change
+lands, not how large it is; its size is in the paragraph above, over all 345 pages.
+
+Scans and rendered pages were read with the same run, every page in scope, on the 575
+rendered and scanned development pages of the same records. The 115 rendered pages
+stay inside the 1 px of the estimator and keep their signals. On the 230 clean scans
+the stage costs: 193 pages are straightened (the map of a clean scan moves it by 6.5 px
+in the median), 67 pages lose and 17 gain more than 1 dB of page SNR, the median lead
+SNR goes from 15.26 to 14.75 dB, 19 instead of 10 pages are below 12 dB, and the
+classifier changes 26 instead of 23 of its 1,150 decisions (+3, −4 to +10; the second
+classifier 40 instead of 35). On the 230 mould-damaged scans it gains much: 207 pages
+are straightened, the median lead SNR goes from 4.21 to 13.50 dB, the leads without a
+usable signal drop from 32.5 to 9.3 %, 25 instead of 114 pages are below 5 dB, 159
+pages gain and 9 lose more than 1 dB, and the classifier changes 68 instead of 158 of
+its 1,150 decisions (−90, −121 to −61; the second classifier 73 instead of 158). So
+without a dead band the stage is a gain on mould-damaged scans and a loss on clean
+ones.
+
+The defaults of the flags (every page in scope, a dead band of 15 px, the same
+tolerance and passes) take the dead band on the map the stage would apply and leave
+the estimator at its 1 px. So their numbers are those of the run above and of the run
+without the stage, page by page: a page whose map in that run moves it by less than
+15 px keeps the signals it has without the stage, and every other page has those of
+that run. A reading of all 920 development pages with the flags themselves
+(`--sheet_curl lines` and no other option of the stage), from the saved masks, gives
+exactly these signals, file for file. With the defaults 139 of the 345 photographs
+are straightened: the classifier changes 414 instead of 470 decisions (−56, about −82
+to −32, from a second bootstrap whose ends differ by up to 2 from those above) and the
+second classifier 430 instead of 462 (−32, about −55 to −9), the leads without a usable
+signal drop from 53.2 to 44.8 %, 221 instead of 270 pages are below 5 dB, and 84 pages
+gain and 11 lose more than 1 dB. Of the 230 clean scans 2 are straightened; none loses
+and 1 gains more than 1 dB, and both classifiers change the decisions they change
+without the stage (23 and 35 of 1,150). Of the 230 mould-damaged scans 151 are
+straightened: the median lead SNR goes from 4.21 to 13.25 dB, the leads without a
+usable signal drop from 32.5 to 11.1 %, 31 instead of 114 pages are below 5 dB, 135
+pages gain and 2 lose more than 1 dB, and the classifier changes 72 instead of 158
+decisions (−86, about −114 to −59; the second classifier 75 instead of 158, −83, about
+−108 to −58). None of the 115 rendered pages is straightened. The dead band gives up a
+part of the gain, 72 against 68 changed decisions on the mould-damaged scans and 414
+against 408 on the photographs, to leave the clean scans as they are: with 10 px, 53
+clean scans were still straightened, and 24 of them lost where 7 gained.
+
+Straightening before the segmentation. The numbers above warp a mask that was predicted
+on the bent page. The run of the stage as it stands in the digitiser, without
+`--mask_folder`, lets nnU-Net predict on the straightened page; it was made once, on the
+development pages that the run at a dead band of 1 px straightens (188 photographs and
+207 mould-damaged scans; the pages it refuses and the clean scans and rendered pages
+were not predicted again), with `--sheet_curl lines --sheet_curl_min_shift 1`, and every
+page was straightened again by the same decision. Read with every page of a group in the
+denominator, as above, it gives the picture of the saved masks. On the 345 photographs
+the classifier changes 424 of its 1,725 decisions, where it changes 408 with the mask
+warped after the segmentation and 470 without the stage (before against after: +16,
+−5 to +38; the second classifier 432 against 430 and 462); the leads without a usable
+signal are 45.0 % against 43.7 % and 53.2 %, 223 against 219 and 270 pages are below
+5 dB, and of the 188 pages 33 gain and 23 lose more than 1 dB of page SNR against the
+warped mask. On the 230 mould-damaged scans it changes 66 of its 1,150 decisions,
+against 68 and 158 (−2, −17 to +12; the second classifier 68 against 73 and 158); the
+median lead SNR is 14.31 dB against 13.50 dB and 4.21 dB (paired on the leads of the
+207 pages: +0.62 dB, 0.53 to 0.74), 48 against 63 and 166 pages are below 12 dB, and 84
+pages gain and 4 lose more than 1 dB against the warped mask. So predicting on the
+straightened page is not worse than warping the mask, a little better in SNR on the
+mould-damaged scans, and it does not mend what the photographs lack: the model reads a
+flattened photograph no better than a bent one. These too are development-set numbers
+of one run, made after the options were chosen.
+
+Limits. The photographs stay far from the digital signal with the stage: in the run at
+1 px the classifier still changes 23.7 % of its decisions and 314 of the 345 pages are
+below 12 dB page SNR, and 90 pages still have no column grid (103 without the stage).
+157 photographs are refused: 67 because the map is held across holes in the cover of
+the grid lines and tears there (55 at the first measurement, with the reason that
+starts `the map stretches or squeezes the page by more than a factor of two somewhere`,
+and 12 on the straightened page, where the same words follow
+`the straightened page gives no field`), 34 because three passes do not settle, 21 for
+want of grid line contrast and 3 more whose straightened page shows no lines, 20
+because the fit leaves more than the tolerance of 0.25 (one of them on the straightened
+page), 9 because the lines are not straight after the warp, and 3 because the map
+folds. The tolerance of 0.25 lets a wrong map through: on a drawn page with a known map
+(the grid of the tests, out of focus and bent by 38 px), a fit that leaves 0.17 of a
+period is accepted and is a wrong map, 9 px RMS and 25 px at its worst off the truth,
+and the check on the straightened page does not catch it; a tolerance of 0.1 refuses
+the page. Two more such pages, bent by 40 px, whose first fits leave 0.20 and 0.23 of a
+period, are refused, but only because a later pass tears their map. On the development
+photographs the pages accepted between the two tolerances still gain more often than
+they lose. Of the 188 photographs straightened in the run
+at 1 px, the 11 whose fit leaves less than 0.10 of a period have 7 pages that gain and
+1 that loses more than 1 dB of page SNR; the 56 between 0.10 and 0.15 have 28 and 9;
+the 80 between 0.15 and 0.20 have 47 and 5; and the 41 at 0.20 and above have 17 and
+7, with a median page SNR that goes from 0.46 to 1.88 dB. On the mould-damaged scans
+202 of the 207 straightened pages leave less than 0.10. So `applied` with a residual
+above 0.1, which `--verbose` prints, is a map that paid on these pages on average, not
+one that is known to be right. A fold or a local dent is outside the model, and a page
+with one can be `applied` without being straightened. The dead band costs the small
+bends: a bend whose map moves the page by less than 15 px is left as it is (the drawn
+page of the options table: 2.5 dB with the defaults, 25.9 dB with a dead band of
+2 px), and a page left in the dead band is still measured, warped and checked, which
+takes seconds per page. Apart from the one run of the paragraph above, the stage was
+measured with saved masks, each predicted on the bent page and warped with it, nearest
+neighbour; the defaults (dead band 15 px) were read with saved masks only. All 176 flat
+synthetic pages that were tried with the driver stay inside its 1 px, with byte
+identical signals. On synthetic generator pages bent by a known map, the map is
+recovered to 0.03 to 0.35 px RMS for whole-sheet bends of 3 to 40 px (at the 1 px of
+the estimator with no dead band on top; the default dead band of 15 px leaves the
+smaller of these bends alone), which says that the estimator finds a smooth bend on a
+clean page, not how it does on a photograph. `--sheet_curl off`, the
+default, is the reading of every other number in this README.
 
 
 #### Results on synthetic pages

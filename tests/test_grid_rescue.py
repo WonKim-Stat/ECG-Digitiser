@@ -924,13 +924,13 @@ def test_append_qc_row_writes_the_two_columns_after_all_others(tmp_path):
         reader = csv.DictReader(f)
         row = next(reader)
         # Appended at the end: no column that was there moves.
-        assert reader.fieldnames[-5:-1] == [
+        assert reader.fieldnames[-7:-3] == [
             "column_mapping",
             "column_mapping_shift_px",
             "grid_rescue",
             "row_mapping",
         ]
-        assert len(reader.fieldnames) == 35
+        assert len(reader.fieldnames) == 37
         assert reader.fieldnames.index("paper_normalisation") == 12
         assert reader.fieldnames.index("column_mapping_shift_px") == 31
     assert row["grid_rescue"] == "fit+phase"
