@@ -985,7 +985,7 @@ def test_a_run_without_the_stage_is_the_run_it_was(runs, name):
     # there where they were: the two of the stage come after them and say off.
     assert "heet curl" not in printed
     assert list(mask_meta(out, name)) == ["rot_angle", "height", "width"]
-    assert header[:35] == OLD_COLUMNS and header[35:] == list(CURL_COLUMNS)
+    assert header[:35] == OLD_COLUMNS and header[35:37] == list(CURL_COLUMNS)
     assert row["sheet_curl"] == "off" and np.isnan(float(row["sheet_curl_shift_px"]))
     # The mask is saved as it was given.
     assert torch.equal(read_image(str(out / f"{name}_mask.png")), mask_of(name))
@@ -1065,8 +1065,9 @@ def test_run_straightens_a_bent_page_and_the_mask_that_comes_with_it(runs):
     # The stages before it print what they printed.
     start = every.index(said[0])
     assert every[:start] == printed_off.splitlines()[:start]
-    # The two columns of the stage, after all others.
-    assert header[-2:] == list(CURL_COLUMNS) and header[:35] == OLD_COLUMNS
+    # The two columns of the stage, after all others of its time (--layout appends two
+    # more after them).
+    assert header[35:37] == list(CURL_COLUMNS) and header[:35] == OLD_COLUMNS
     assert row["sheet_curl"] == "applied"
     assert 12.0 < float(row["sheet_curl_shift_px"]) < 13.5
     row_off = qc_row(off)[0]
@@ -1557,12 +1558,12 @@ def test_append_qc_row_writes_the_two_columns_after_all_others(tmp_path):
         reader = csv.DictReader(f)
         row, second, old = list(reader)
         # Appended at the end: no column that was there moves.
-        assert reader.fieldnames[-3:] == [
+        assert reader.fieldnames[-5:-2] == [
             "perspective_residual_rel",
             "sheet_curl",
             "sheet_curl_shift_px",
         ]
-        assert len(reader.fieldnames) == 37
+        assert len(reader.fieldnames) == 39
         assert reader.fieldnames[:35] == OLD_COLUMNS
         assert reader.fieldnames.index("paper_normalisation") == 12
         assert reader.fieldnames.index("row_mapping") == 33

@@ -38,6 +38,7 @@ from config import (
 )
 from src.run import paper_normalisation
 from src.run import sheet_curl
+from src.run.layout import STANDARD, detect_layout, layout_from_key, strips_with_trace
 
 
 # Parse arguments.
@@ -130,8 +131,9 @@ def get_parser():
         choices=["bbox", "grid"],
         default="grid",
         help=(
-            "grid = sample all leads on one shared column grid (standard 3x4 layout "
-            "with rhythm strip only, falls back to bbox otherwise); "
+            "grid = sample all leads on one shared column grid (the columns of the "
+            "page's layout, see --layout; falls back to bbox where no such grid is "
+            "found); "
             "bbox = legacy, stretch the bounding box of every lead to its length."
         ),
     )
@@ -484,6 +486,29 @@ def get_parser():
             "default; the record of a saved mask is still checked."
         ),
     )
+    # parse_layout() is defined below as well.
+    parser.add_argument(
+        "--layout",
+        type=parse_layout,
+        default="auto",
+        help=(
+            "The table of leads of the page. auto (default) = found on the mask, by "
+            "where its traces are and not by their labels: the rows of traces and "
+            "their spacing name the table (3x4, 6x2 or 12x1) and the number of rhythm "
+            "strips below it. A standard page, three rows of four columns and one "
+            "strip, and a page whose layout is not clear, is read as the standard 3x4 "
+            "page with the rhythm strip II, as before the flag; any other page is cut "
+            "into its cells by position, every trace pixel of a cell going to the lead "
+            "the table has there, the strips named II, V1, V5 from the top, and read "
+            "on columns of 10 s / C. A lead that has a strip as well as a short cell "
+            "is written as its strip, 10 s. standard = no detection, the standard "
+            "page. A key such as 6x2+II, 3x4+II,V1,V5, 12x1+none or 3x4+V1 = that "
+            "table with those strips, top to bottom: the rows and cells are still "
+            "found on the mask, which must show that many rows, columns and strips, "
+            "otherwise the page is read as the standard one with a warning; this is "
+            "how a strip other than II is named, which the mask cannot tell."
+        ),
+    )
     parser.add_argument(
         "--save_mask",
         action="store_true",
@@ -497,6 +522,27 @@ def get_parser():
         help="Load masks from this folder instead of running nnUNet.",
     )
     return parser
+
+
+# The words of --layout that are not a key of a layout.
+LAYOUT_WORDS = ("auto", "standard")
+
+
+def parse_layout(text):
+    """--layout: auto, standard or the key of a layout (src/run/layout.py).
+
+    A key is the table and its strips, e.g. 6x2+II or 12x1+none; it is returned as
+    Layout.key() writes it, and an unknown table or lead is an argparse error.
+    """
+    if text in LAYOUT_WORDS:
+        return text
+    try:
+        return layout_from_key(text).key()
+    except ValueError as error:
+        raise argparse.ArgumentTypeError(
+            f"{text!r} is not auto, standard or a layout key such as 6x2+II, "
+            f"3x4+II,V1,V5 or 12x1+none ({error})"
+        )
 
 
 # Offsets in seconds of the standard 3x4 layout, used as a fallback.
@@ -797,18 +843,327 @@ def cut_binary(mask_to_use, image_rotated):
     return signal_masks, signal_positions, signal_images
 
 
+# PAGE LAYOUTS (--layout)
+#
+# The segmentation model labels a trace by where it would be on the standard 3x4 page,
+# so on a page of another layout its labels are wrong (D1: 56 % of the short traces of
+# 6x2 pages, 86 % of 12x1 pages), while the traces themselves are found. On such a page
+# the labels are not read: detect_layout() (src/run/layout.py) finds the rows of traces
+# and the table they make, and every trace pixel of a cell, a row band times one of C
+# equal columns of the trace width, is given to the lead the table has there. A lead
+# that has a strip as well as a short cell is read as its strip, 10 s, and its short
+# cell is dropped, as the model drops the short II of the standard page. Everything
+# after the cut reads the layout instead of the constants of the standard page. A
+# standard page, and a page whose layout is not clear, keeps the path it always had:
+# the labels of the model and those constants, the same functions with
+# layout=STANDARD and the same arithmetic.
+#
+# The bands alone cut a tall QRS complex: on a 6x2 page the rows are 189 px apart and
+# on a 12x1 page 121 px, so an R or S wave of 1.2 or 0.8 mV runs into the band of the
+# next row, whose lead then gets its tip. So the rows are followed along x first
+# (layout_label_mask()): in every column the trace pixels form vertical runs, and a run
+# that continues the run a row had in the column before, and no other row's, goes to
+# that row whole, also beyond its band; every other run is cut by the bands. On the D1
+# oracle masks (20 pages per layout, median lead SNR) this takes 6x2+II from 20.4 to
+# 22.3 dB, 6x2 from 21.5 to 22.9, 3x4+II,V1,V5 from 20.5 to 22.2 and 12x1 from 9.1 to
+# 16.7 dB; the labels of those masks as the cut give 23.8, 24.0 and 22.3 dB (6x2+II,
+# 6x2, 12x1). What is left are the strokes of two rows that cross each other.
+
+# Runs of trace pixels in a column closer than this share of the page height are one
+# run (10 px of 1700): a mask drawn from the points of a steep stroke is dashed, with
+# gaps of up to 9 px (D1 oracle masks, 90th percentile).
+LAYOUT_RUN_GAP = 0.006
+# A run continues the trace of a row when it comes this close to the run the row had in
+# the column before, as a share of the page height (10 px of 1700).
+LAYOUT_FOLLOW_TOLERANCE = 0.006
+# A row that has had no run for more than this share of the page width, in columns (10
+# of 2200), is no longer followed and starts again on a run of its own band.
+LAYOUT_FOLLOW_MISS = 0.0045
+# The first and the last column of the cut reach this share of the trace width beyond
+# the trace width that detect_layout() found (30 px of 1970). That width ends where the
+# traces leave the bands of their rows, and a QRS complex at the very start or end of
+# the traces, which all leads have at once, ends it early (one D1 oracle page: 24 px).
+LAYOUT_CUT_MARGIN = 0.015
+
+
+def _layout_rows(layout, info, x0, x1):
+    """Bands, baselines and the label of every row at every column of [x0, x1).
+
+    The rows are the short rows from the top and then the strips. A row's label is
+    that of the lead the table has in the cell of a column, 0 where the cell has no
+    trace or its lead is read as a strip, and where a strip has no trace. [x0, x1) may
+    reach beyond the trace width: the first and the last cell of a row reach as far.
+    Returns (bands [(y0, y1)], baselines, labels [rows, x1 - x0] uint8).
+    """
+    strips = strips_with_trace(info)
+    with_trace = {(cell["row"], cell["column"]) for cell in info["cells"]}
+    bands = [None] * layout.num_rows
+    labels = np.zeros((layout.num_rows, x1 - x0), dtype=np.uint8)
+
+    def span(cell, reaches_left, reaches_right):
+        # The columns of a cell in labels, the outer ones to the ends of [x0, x1).
+        a, b = cell["span"]
+        return (x0 if reaches_left else a) - x0, (x1 if reaches_right else b) - x0
+
+    for cell in info["cells"] + info["missing_cells"]:
+        bands[cell["row"]] = tuple(cell["band"])
+        lead = cell["lead_by_position"]
+        if (cell["row"], cell["column"]) in with_trace and lead not in strips:
+            column = cell["column"]
+            a, b = span(cell, column == 0, column == layout.columns - 1)
+            labels[cell["row"], a:b] = LEAD_LABEL_MAPPING[lead]
+    for k, cell in enumerate(info["strip_cells"]):
+        row = layout.n_short_rows + k
+        bands[row] = tuple(cell["band"])
+        if cell["lead_by_position"] in strips:
+            a, b = span(cell, True, True)
+            labels[row, a:b] = LEAD_LABEL_MAPPING[cell["lead_by_position"]]
+    return bands, np.asarray(info["rows_y"], dtype=float), labels
+
+
+def _trace_runs(binary, x0, x1, gap):
+    """The vertical runs of trace pixels of every column of [x0, x1).
+
+    Runs closer than gap pixels are one. Returns (column, start, end) arrays sorted by
+    column and start, the column counted from x0 and [start, end) the rows of a run.
+    """
+    block = binary[:, x0:x1].T
+    edges = np.diff(np.pad(block, ((0, 0), (1, 1))).astype(np.int8), axis=1)
+    column, start = np.nonzero(edges == 1)
+    end = np.nonzero(edges == -1)[1]
+    if column.size == 0:
+        return column, start, end
+    new = np.r_[True, (column[1:] != column[:-1]) | (start[1:] - end[:-1] > gap)]
+    first = np.flatnonzero(new)
+    last = np.r_[first[1:], column.size] - 1
+    return column[first], start[first], end[last]
+
+
+def layout_label_mask(mask, layout, info):
+    """The label mask of a page read by the position of its traces.
+
+    mask is the label mask of the model ([1, H, W] or [H, W]), layout and info what
+    choose_layout() returned for it; the labels of the model are not read. A trace
+    pixel of a short cell with a trace (info["cells"], its band of rows and span of
+    columns) gets the label of the lead the table has there, one of a strip with a
+    trace that of its lead (strips_with_trace()). The short cell of a lead that is
+    read as a strip is left out, and so is a cell without a trace
+    (info["missing_cells"]) and a pixel further than LAYOUT_CUT_MARGIN left or right
+    of the trace width; the first and the last cells reach that far.
+    The rows are followed along x (see the comment above LAYOUT_RUN_GAP). Column by
+    column, the runs of trace pixels (LAYOUT_RUN_GAP) are matched to the rows: a row
+    claims a run that comes within LAYOUT_FOLLOW_TOLERANCE of its run of the column
+    before, and of the runs it alone claims it takes the one nearest that run, whole,
+    as long as its middle is between the baselines of the two rows next to it (a row
+    spacing beyond the outer ones). A row that has no run of its own for
+    LAYOUT_FOLLOW_MISS of the page width starts again on the run of its band that no
+    row claims, the one nearest its baseline. Every other run is cut by the bands.
+    Returns an [H, W] uint8 array.
+    """
+    labels = mask.numpy() if torch.is_tensor(mask) else np.asarray(mask)
+    if labels.ndim == 3:
+        labels = labels[0]
+    binary = labels > 0
+    height, width = binary.shape
+    relabelled = np.zeros(labels.shape, dtype=np.uint8)
+    x0, x1 = info["x_extent"]
+    margin = int(round(LAYOUT_CUT_MARGIN * (x1 - x0)))
+    x0, x1 = max(0, x0 - margin), min(width, x1 + margin)
+    bands, base, row_labels = _layout_rows(layout, info, x0, x1)
+    n = len(bands)
+    spacing = float(np.median(np.diff(base))) if n > 1 else float(height)
+    above = np.r_[base[0] - spacing, base[:-1]]
+    below = np.r_[base[1:], base[-1] + spacing]
+    gap = max(1, int(round(LAYOUT_RUN_GAP * height)))
+    tolerance = max(1, int(round(LAYOUT_FOLLOW_TOLERANCE * height)))
+    miss = max(1, int(round(LAYOUT_FOLLOW_MISS * width)))
+    column, start, end = _trace_runs(binary, x0, x1, gap)
+    first = np.searchsorted(column, np.arange(x1 - x0 + 1))
+    track, missed = [None] * n, [0] * n
+    for i in range(x1 - x0):
+        x = x0 + i
+        runs = list(zip(start[first[i] : first[i + 1]], end[first[i] : first[i + 1]]))
+        # The rows that claim every run, and the run each row takes.
+        claims, taken = [], {}
+        for j, (s, e) in enumerate(runs):
+            claim = [
+                k
+                for k in range(n)
+                if track[k] is not None
+                and s < track[k][1] + tolerance
+                and e > track[k][0] - tolerance
+            ]
+            claims.append(claim)
+            middle = (s + e) / 2
+            if len(claim) == 1 and above[claim[0]] < middle < below[claim[0]]:
+                k = claim[0]
+                distance = abs(middle - (track[k][0] + track[k][1]) / 2)
+                if k not in taken or distance < taken[k][0]:
+                    taken[k] = (distance, j)
+        owner = {j: k for k, (_, j) in taken.items()}
+        # A row without a trace starts again in its band.
+        for k in range(n):
+            if track[k] is not None or k in taken:
+                continue
+            free = [
+                (abs((s + e) / 2 - base[k]), j)
+                for j, (s, e) in enumerate(runs)
+                if j not in owner
+                and not claims[j]
+                and bands[k][0] <= (s + e) / 2 < bands[k][1]
+            ]
+            if free:
+                owner[min(free)[1]] = k
+        found = [None] * n
+        for j, (s, e) in enumerate(runs):
+            k = owner.get(j)
+            if k is not None:
+                relabelled[s:e, x][binary[s:e, x]] = row_labels[k, i]
+                found[k] = (s, e)
+                continue
+            for k, (y0, y1) in enumerate(bands):
+                a, b = max(s, y0), min(e, y1)
+                if a < b:
+                    relabelled[a:b, x][binary[a:b, x]] = row_labels[k, i]
+        for k in range(n):
+            if found[k] is not None:
+                track[k], missed[k] = found[k], 0
+                continue
+            missed[k] += 1
+            if missed[k] > miss:
+                track[k] = None
+    return relabelled
+
+
+def cut_layout(mask_to_use, image_rotated, layout, info, relabelled=None):
+    """Cut the mask of a page of another layout into single binary masks, by position.
+
+    The same three dicts as cut_binary(), keyed by lead name: the mask of every lead,
+    cropped to the box of its ink, the position of that box and the image under it,
+    None for a lead without ink. The masks are those of layout_label_mask(): the
+    labels of the model are not read, a lead with a strip is its strip. relabelled is
+    that label mask where the caller has it already.
+    """
+    if relabelled is None:
+        relabelled = layout_label_mask(mask_to_use, layout, info)
+    return cut_binary(torch.from_numpy(relabelled)[None], image_rotated)
+
+
+def layout_line(record, layout, info):
+    """The line of a page that is read on the layout path."""
+    return (
+        f"Layout for record {record}: {layout.key()} ({layout.n_short_rows} rows x "
+        f"{layout.columns} columns, {layout.n_strips} strip(s); label agreement "
+        f"{info['label_agreement']:.2f})"
+    )
+
+
+def choose_layout(mask, flag, record):
+    """The layout a page is read with under --layout <flag>, and how it was chosen.
+
+    mask is the label mask of the page ([1, H, W]). Returns (layout, info, qc): layout
+    is STANDARD for the path of the standard page, which every page takes unless a
+    layout other than the standard one is found (auto) or given and found (a key); info
+    is that of detect_layout() (None for standard) and qc the value of the QC column
+    layout: "standard", "standard(not detected)", "standard(given <key>, mask
+    differs)" or the key of the layout read. Prints the line of a page that is not
+    detected, of a page that is read on another layout, and the WARNING of a given
+    layout that the mask does not show.
+    """
+    if flag == "standard":
+        return STANDARD, None, "standard"
+    labels = np.asarray(mask[0].numpy() if torch.is_tensor(mask) else mask[0])
+    labels = labels.astype(np.uint8)
+    found, info = detect_layout(labels)
+    if flag == "auto":
+        if found is None:
+            # Not a WARNING: a standard page that the model segmented poorly is one.
+            print(
+                f"Layout for record {record}: not detected ({info['reason']}), read as "
+                f"the standard 3x4 page with rhythm strip II."
+            )
+            return STANDARD, info, "standard(not detected)"
+        if info["standard"]:
+            return STANDARD, info, "standard"
+        print(layout_line(record, found, info))
+        return found, info, found.key()
+    # A key: the rows and the cells of the mask, the strips named as the key names them.
+    given = layout_from_key(flag)
+    shape = (given.columns, given.n_short_rows, given.n_strips)
+    if found is None or (info["columns"], info["rows"], info["strips"]) != shape:
+        if found is None:
+            shows, why = "no known layout", info["reason"]
+        else:
+            shows = (
+                f"{info['rows']} rows x {info['columns']} columns and "
+                f"{info['strips']} strip(s)"
+            )
+            why = f"found {found.key()}"
+        print(
+            f"WARNING: layout {flag} given for record {record} but the mask shows "
+            f"{shows} ({why}); reading the page as the standard 3x4 page."
+        )
+        return STANDARD, info, f"standard(given {flag}, mask differs)"
+    if given == STANDARD:
+        return STANDARD, info, "standard"
+    for k, cell in enumerate(info["strip_cells"]):
+        cell["lead_by_position"] = given.strips[k]
+    print(layout_line(record, given, info))
+    return given, info, given.key()
+
+
+def column_scale(layout):
+    """Width of a column of the standard page over that of a column of the layout.
+
+    The tolerances of the column grid that are relative to its pitch P were set on the
+    standard page, whose column is 2.5 s, 62.5 mm. Multiplied by this they keep their
+    size in millimetres on a page with wider columns (6x2: 0.5, 12x1: 0.25). It is 1.0
+    for STANDARD, and a product with 1.0 is exact, so the standard page keeps its
+    arithmetic.
+    """
+    return STANDARD.seconds_per_column / layout.seconds_per_column
+
+
+def _strip_ratio(y_shift_ratio, lead):
+    """Baseline ratio of the strip of a lead: its own with several strips, else full."""
+    return y_shift_ratio.get(f"full:{lead}", y_shift_ratio["full"])
+
+
 def vectorise(
-    image_rotated, mask, signal_cropped, sec_per_pixel, mV_per_pixel, y_shift_ratio, lead
+    image_rotated,
+    mask,
+    signal_cropped,
+    sec_per_pixel,
+    mV_per_pixel,
+    y_shift_ratio,
+    lead,
+    layout=STANDARD,
+    long_leads=None,
 ):
-    """Vectorise the image."""
+    """Vectorise the image.
+
+    long_leads None tells a strip by its length, as on the standard page: a mask of
+    more than 5 s is the 10 s strip, any other a 2.5 s lead. On the layout path
+    long_leads are the strips of the page, and a lead that is none of them is read
+    over one column of the layout, layout.seconds_per_column.
+    """
 
     # Get scaling info
-    total_seconds_from_mask = round(torch.tensor(sec_per_pixel).item() * mask.shape[2], 1)
-    if total_seconds_from_mask > (LONG_SIGNAL_LENGTH_SEC / 2):
+    if long_leads is None:
+        total_seconds_from_mask = round(
+            torch.tensor(sec_per_pixel).item() * mask.shape[2], 1
+        )
+        if total_seconds_from_mask > (LONG_SIGNAL_LENGTH_SEC / 2):
+            total_seconds = LONG_SIGNAL_LENGTH_SEC
+            y_shift_ratio_ = y_shift_ratio["full"]
+        else:
+            total_seconds = SHORT_SIGNAL_LENGTH_SEC
+            y_shift_ratio_ = y_shift_ratio[lead]
+    elif lead in long_leads:
         total_seconds = LONG_SIGNAL_LENGTH_SEC
-        y_shift_ratio_ = y_shift_ratio["full"]
+        y_shift_ratio_ = _strip_ratio(y_shift_ratio, lead)
     else:
-        total_seconds = SHORT_SIGNAL_LENGTH_SEC
+        total_seconds = layout.seconds_per_column
         y_shift_ratio_ = y_shift_ratio[lead]
     values_needed = int(total_seconds * FREQUENCY)
 
@@ -876,51 +1231,74 @@ def fit_column_grid(
     record="",
     tolerance=None,
     quiet=False,
+    layout=STANDARD,
+    long_leads=None,
 ):
-    """Fit the shared column grid of the standard 3x4 layout with rhythm strip.
+    """Fit the shared column grid of a layout, the standard 3x4 one with rhythm strip
+    unless another one is given.
 
     Returns (g0, P, long_leads, reason). g0 is the x position of the left edge of
-    the first column, P the width of one 2.5 s column in pixels. If the layout is
-    not the expected one, g0 and P are None and reason says why.
-    tolerance is how far a column edge may be off the grid, relative to the pitch,
-    GRID_RESIDUAL_TOLERANCE unless given; quiet leaves out the line about a page
-    pitch that does not match. Both are for the second try of rescue_grid_fit().
+    the first column, P the width of one column (2.5 s on the standard page) in
+    pixels. If the layout is not the expected one, g0 and P are None and reason says
+    why.
+    tolerance is how far a column edge may be off the grid, relative to the pitch of
+    the standard page (column_scale()), GRID_RESIDUAL_TOLERANCE unless given; quiet
+    leaves out the line about a page pitch that does not match. Both are for the
+    second try of rescue_grid_fit().
+    long_leads None finds the rhythm strip among the masks as the standard page has
+    it, a mask twice as wide as the median one that spans all columns. On the layout
+    path the strips are known from their cells and given here, possibly none (a page
+    of 6x2 or 12x1 without strips): the masks are cut by position, so no two short
+    leads can pass as a strip, and a strip is a lead over all columns.
+    A page of a layout other than the standard one is cut by position (cut_layout()),
+    so the edges between two of its cells are where the cut put them, on equal
+    columns of a trace width that can be a few pixels off, and not where the traces
+    are: only the start of the first and the end of the last column are fitted.
     """
     if tolerance is None:
         tolerance = GRID_RESIDUAL_TOLERANCE
+    # In millimetres of the standard page; exact for it (a product with 1.0).
+    tolerance = tolerance * column_scale(layout)
+    columns = layout.columns
     widths = {
         lead: mask.shape[2] for lead, mask in signal_masks.items() if mask is not None
     }
     if not widths:
         return None, None, [], "no leads found"
-    median_width = np.median(list(widths.values()))
-    long_leads = [lead for lead, width in widths.items() if width >= 2 * median_width]
-    if not long_leads:
-        return None, None, [], "no rhythm strip found"
-    # Two merged short leads must not pass as a rhythm strip.
-    if any(widths[lead] < (NUM_COLUMNS - 0.5) * median_width for lead in long_leads):
-        return None, None, long_leads, "rhythm strip does not span all columns"
+    if long_leads is None:
+        median_width = np.median(list(widths.values()))
+        long_leads = [
+            lead for lead, width in widths.items() if width >= 2 * median_width
+        ]
+        if not long_leads:
+            return None, None, [], "no rhythm strip found"
+        # Two merged short leads must not pass as a rhythm strip.
+        if any(widths[lead] < (columns - 0.5) * median_width for lead in long_leads):
+            return None, None, long_leads, "rhythm strip does not span all columns"
+    else:
+        long_leads = [lead for lead in long_leads if lead in widths]
 
     # Every lead gives the start of its first and the end of its last column. The
     # rhythm strip gives the start of the first and the end of the last column.
+    outer_only = layout != STANDARD
     lead_edges = []
     for lead, width in widths.items():
         x1 = signal_positions[lead]["x1"]
         if lead in long_leads:
-            first_column, last_column = 0, NUM_COLUMNS - 1
-        elif lead in STANDARD_LEAD_OFFSETS_SEC:
-            first_column = int(STANDARD_LEAD_OFFSETS_SEC[lead] / SHORT_SIGNAL_LENGTH_SEC)
+            first_column, last_column = 0, columns - 1
+        elif layout.column_of(lead) is not None:
+            first_column = layout.column_of(lead)
             last_column = first_column
         else:
             return None, None, long_leads, f"unknown lead {lead}"
-        lead_edges.append((first_column, x1, True))
-        lead_edges.append((last_column + 1, x1 + width, False))
+        if not outer_only or first_column == 0:
+            lead_edges.append((first_column, x1, True))
+        if not outer_only or last_column == columns - 1:
+            lead_edges.append((last_column + 1, x1 + width, False))
     short_columns = {
-        int(STANDARD_LEAD_OFFSETS_SEC[lead] / SHORT_SIGNAL_LENGTH_SEC)
-        for lead in widths
-        if lead not in long_leads
+        layout.column_of(lead) for lead in widths if lead not in long_leads
     }
-    if short_columns != set(range(NUM_COLUMNS)):
+    if short_columns != set(range(columns)):
         return None, None, long_leads, "not every column has a short lead"
 
     # A mask that runs on past its column (into the margin or the next lead) must
@@ -935,9 +1313,9 @@ def fit_column_grid(
             starts[boundary] = min(starts.get(boundary, np.inf), edge)
         else:
             ends[boundary] = max(ends.get(boundary, -np.inf), edge)
-    if set(starts) != set(range(NUM_COLUMNS)) or set(ends) != set(
-        range(1, NUM_COLUMNS + 1)
-    ):
+    fitted_starts = {0} if outer_only else set(range(columns))
+    fitted_ends = {columns} if outer_only else set(range(1, columns + 1))
+    if set(starts) != fitted_starts or set(ends) != fitted_ends:
         return None, None, long_leads, "a column has all its edges off the grid"
 
     # Pixel c covers [c, c+1), so starts and ends are both column boundaries.
@@ -946,7 +1324,7 @@ def fit_column_grid(
     P_fit, g0 = np.polyfit(boundaries, edges, 1)
     P = P_fit
     if pitch == "page":
-        P_page = image_height * PAGE_PITCH_RATIO
+        P_page = image_height * layout.page_pitch_ratio
         if abs(P_fit - P_page) <= PAGE_PITCH_TOLERANCE * P_page:
             # With a fixed pitch no single edge pixel moves the origin by more than 1/n.
             P = P_page
@@ -1022,18 +1400,24 @@ def _grid_line_comb(profiles, period):
     return (centred * np.hanning(width)) @ np.exp(-2j * np.pi * x / period)
 
 
-def refine_grid_from_lines(image_rotated, g0, P, snap_offset=GRID_LINE_SNAP_OFFSET):
+def refine_grid_from_lines(
+    image_rotated, g0, P, snap_offset=GRID_LINE_SNAP_OFFSET, layout=STANDARD
+):
     """Refine the column grid with the printed 1 mm grid lines of the image.
 
     The vertical grid lines are a comb over the whole page width, whose period gives
     the pitch and whose phase gives the origin far below one pixel, while the mask
     edges are whole pixels. The origin is the grid line next to the mask origin.
     snap_offset is how far in pixels the drawn lines sit right of the traces, 0.5 for
-    the matplotlib generator and 0 for a scanned page.
+    the matplotlib generator and 0 for a scanned page. layout gives the number of
+    columns and the lines in one of them; the largest move of the origin,
+    GRID_LINE_SHIFT_TOLERANCE of the pitch, is that of the standard page in
+    millimetres (column_scale()).
     Returns (g0, P, info). Without usable grid lines g0 and P come back unchanged and
     info["reason"] says why. info["pitch"] is the column pitch the lines have, also
     when their origin is refused, and NaN when no lines were found.
     """
+    lines_per_column = layout.grid_lines_per_column
     profiles, _ = _band_profiles(_darkness(image_rotated))
     info = {
         "contrast": float("nan"),
@@ -1050,7 +1434,7 @@ def refine_grid_from_lines(image_rotated, g0, P, snap_offset=GRID_LINE_SNAP_OFFS
 
     # Coarse scan over the pitch range, then a fine one around the peak. The peak of
     # the Hann window is 0.4 % of the period wide on a 2200 px page.
-    period = P / GRID_LINES_PER_COLUMN
+    period = P / lines_per_column
     for half_range, steps in ((GRID_LINE_PITCH_RANGE, 51), (2e-4, 41)):
         candidates = period * (1 + np.linspace(-half_range, half_range, steps))
         amplitudes = np.array([amplitude(candidate) for candidate in candidates])
@@ -1068,15 +1452,15 @@ def refine_grid_from_lines(image_rotated, g0, P, snap_offset=GRID_LINE_SNAP_OFFS
         info["reason"] = f"no grid lines found (contrast {info['contrast']:.1f})"
         return g0, P, info
 
-    P_lines = period * GRID_LINES_PER_COLUMN
+    P_lines = period * lines_per_column
     info["pitch"] = float(P_lines)
     phase = -np.angle(_grid_line_comb(profiles, period).sum()) / (2 * np.pi) * period
     phase -= snap_offset
     # A new pitch turns the mask grid about its centre, not about its origin.
-    g0_masks = g0 + NUM_COLUMNS / 2 * (P - P_lines)
+    g0_masks = g0 + layout.columns / 2 * (P - P_lines)
     g0_lines = phase + np.round((g0_masks - phase) / period) * period
     info["shift"] = float(g0_lines - g0_masks)
-    if abs(info["shift"]) > GRID_LINE_SHIFT_TOLERANCE * P:
+    if abs(info["shift"]) > GRID_LINE_SHIFT_TOLERANCE * P * column_scale(layout):
         info["reason"] = (
             f"next grid line is {info['shift']:+.1f} px off the mask origin"
         )
@@ -2909,28 +3293,35 @@ def _column_map_x(knots_m, knots_x, period, millimetres):
     return np.where(m > knots_m[-1], knots_x[-1] + (m - knots_m[-1]) * period, x)
 
 
-def column_mapping_edges(signal_masks, signal_positions, long_leads):
+def column_mapping_edges(signal_masks, signal_positions, long_leads, layout=STANDARD):
     """The mask edges of every lead with the grid millimetre each belongs to.
 
     A short lead starts at the start of its column and ends at the start of the next,
-    the rhythm strip spans all columns; a column is 62.5 mm. The edges are x1 and
+    the rhythm strip spans all columns; a column is 62.5 mm on the standard page and
+    layout.grid_lines_per_column millimetres on another. The edges are x1 and
     x1 + width, as fit_column_grid() reads them: pixel c covers [c, c+1). A lead that is
-    in no column of the layout gives no edge. Returns a list of (x, mm).
+    in no column of the layout gives no edge. On a page of another layout, cut by
+    position, only the start of the first and the end of the last column are edges of
+    the traces, as fit_column_grid() has it. Returns a list of (x, mm).
     """
+    lines_per_column = layout.grid_lines_per_column
+    outer_only = layout != STANDARD
     edges = []
     for lead, mask in signal_masks.items():
         if mask is None:
             continue
         if lead in long_leads:
-            first, last = 0, NUM_COLUMNS
-        elif lead in STANDARD_LEAD_OFFSETS_SEC:
-            first = int(STANDARD_LEAD_OFFSETS_SEC[lead] / SHORT_SIGNAL_LENGTH_SEC)
+            first, last = 0, layout.columns
+        elif layout.column_of(lead) is not None:
+            first = layout.column_of(lead)
             last = first + 1
         else:
             continue
         x1 = float(signal_positions[lead]["x1"])
-        edges.append((x1, first * GRID_LINES_PER_COLUMN))
-        edges.append((x1 + mask.shape[2], last * GRID_LINES_PER_COLUMN))
+        if not outer_only or first == 0:
+            edges.append((x1, first * lines_per_column))
+        if not outer_only or last == layout.columns:
+            edges.append((x1 + mask.shape[2], last * lines_per_column))
     return edges
 
 
@@ -2941,6 +3332,7 @@ def measure_column_mapping(
     edges,
     snap_offset=GRID_LINE_SNAP_OFFSET,
     median_mm=COLUMN_MAPPING_MEDIAN_MM,
+    layout=STANDARD,
 ):
     """Where every millimetre of the printed grid is along x, from its vertical lines.
 
@@ -2969,7 +3361,12 @@ def measure_column_mapping(
     info["dead_band"] says that it moves no sample the page reads by
     COLUMN_MAPPING_MIN_SHIFT_PX; info["shift"] is that largest move in pixels and
     info["column_shift"] the same per column.
+    layout gives the columns, their width in lines and in samples; the reach beyond the
+    columns, the largest gap and the largest origin offset, all relative to the pitch,
+    are those of the standard page in millimetres (column_scale()).
     """
+    columns, lines_per_column = layout.columns, layout.grid_lines_per_column
+    scale = column_scale(layout)
     nan = float("nan")
     info = {
         "shift": nan,
@@ -2983,13 +3380,13 @@ def measure_column_mapping(
         "origin_offset": nan,
         "origin_move": nan,
         "smoothing": nan,
-        "column_shift": [nan] * NUM_COLUMNS,
+        "column_shift": [nan] * columns,
         "dead_band": False,
         "reason": "",
         "knots_m": None,
         "knots_x": None,
     }
-    period = P / GRID_LINES_PER_COLUMN
+    period = P / lines_per_column
     profiles, _ = _band_profiles(_darkness(image_rotated))
     if profiles.shape[0] == 0:
         info["reason"] = "image too small for the grid line profile"
@@ -2999,8 +3396,9 @@ def measure_column_mapping(
     weights = np.abs(_grid_line_comb(profiles, period))
     kept_bands = weights >= GRID_LINE_MIN_BAND_AMPLITUDE * np.median(weights)
     profile = profiles[kept_bands].sum(axis=0)
-    low = g0 - COLUMN_MAPPING_REACH * P
-    high = g0 + (NUM_COLUMNS + COLUMN_MAPPING_REACH) * P
+    reach = COLUMN_MAPPING_REACH * scale
+    low = g0 - reach * P
+    high = g0 + (columns + reach) * P
     centres, fine, coarse = _column_mapping_windows(profile, period, low, high)
     if centres.size < 2:
         info["reason"] = "image too small for the column map"
@@ -3066,7 +3464,7 @@ def measure_column_mapping(
     info["windows"] = int(x.size)
     info["jump"] = float(np.max(np.abs(np.diff(offset)), initial=0.0) / period)
 
-    end = g0 + NUM_COLUMNS * P
+    end = g0 + columns * P
     inside = (centres >= g0) & (centres <= end)
     kept_inside = np.count_nonzero((x >= g0) & (x <= end))
     info["coverage"] = float(kept_inside / max(np.count_nonzero(inside), 1))
@@ -3074,7 +3472,7 @@ def measure_column_mapping(
     if info["coverage"] < COLUMN_MAPPING_MIN_COVERAGE:
         info["reason"] = f"map keeps {100 * info['coverage']:.0f} % of its windows"
         return None, info
-    if info["gap"] > COLUMN_MAPPING_MAX_GAP:
+    if info["gap"] > COLUMN_MAPPING_MAX_GAP * scale:
         info["reason"] = f"map has a gap of {info['gap']:.2f} columns"
         return None, info
     if info["jump"] > COLUMN_MAPPING_MAX_JUMP:
@@ -3097,7 +3495,7 @@ def measure_column_mapping(
     consensus = float(np.median(edge_lines))
     origin = np.round(consensus)
     info["origin_offset"] = float((consensus - origin) * period)
-    if abs(info["origin_offset"]) > GRID_LINE_SHIFT_TOLERANCE * P:
+    if abs(info["origin_offset"]) > GRID_LINE_SHIFT_TOLERANCE * P * scale:
         info["reason"] = (
             f"mask edges are {info['origin_offset']:+.1f} px off the next grid line"
         )
@@ -3119,17 +3517,17 @@ def measure_column_mapping(
     info["knots_m"], info["knots_x"] = knots_m, knots_x
 
     # Every sample the page reads: the rhythm strip covers all columns.
-    samples_per_column = SHORT_SIGNAL_LENGTH_SEC * FREQUENCY
+    samples_per_column = layout.seconds_per_column * FREQUENCY
     millimetres = (
-        np.arange(int(NUM_COLUMNS * samples_per_column))
+        np.arange(int(columns * samples_per_column))
         / samples_per_column
-        * GRID_LINES_PER_COLUMN
+        * lines_per_column
     )
     mapped = _column_map_x(knots_m, knots_x, period, millimetres)
-    uniform = g0 + millimetres * P / GRID_LINES_PER_COLUMN
+    uniform = g0 + millimetres * P / lines_per_column
     moved = np.abs(mapped - uniform)
     info["shift"] = float(np.max(moved))
-    info["column_shift"] = [float(np.max(part)) for part in np.split(moved, NUM_COLUMNS)]
+    info["column_shift"] = [float(np.max(part)) for part in np.split(moved, columns)]
     info["origin_move"] = float(mapped[0] - g0)
     # The dead band is one for the page: a column the map moves by less than a pixel is
     # still read on it, since the uniform columns are fitted to the whole page, the
@@ -3192,6 +3590,7 @@ def rescue_grid_phase(
     edges,
     snap_offset=GRID_LINE_SNAP_OFFSET,
     median_mm=COLUMN_MAPPING_MEDIAN_MM,
+    layout=STANDARD,
 ):
     """Second try of a page whose grid lines are off the origin of the mask grid.
 
@@ -3206,7 +3605,7 @@ def rescue_grid_phase(
     pitch of the masks instead, the 5 development colour scans the rescue reads came
     to 11.19 dB in place of 12.73 dB.
     g0 and P are the grid of the masks, grid_lines the info of the refusal and edges
-    column_mapping_edges(); snap_offset and median_mm are those of
+    column_mapping_edges(); snap_offset, median_mm and layout are those of
     measure_column_mapping().
     Returns a dict: "refused" is "" when the map stands, and then "g0" and "P" are the
     grid it was measured on, "grid_lines" the info of the lines without its reason
@@ -3216,7 +3615,7 @@ def rescue_grid_phase(
     "was" the reason of the refusal that was tried again.
     """
     P_lines = grid_lines["pitch"]
-    g0_lines = float(g0 + NUM_COLUMNS / 2 * (P - P_lines))
+    g0_lines = float(g0 + layout.columns / 2 * (P - P_lines))
     x_map, map_info = measure_column_mapping(
         image_rotated,
         g0_lines,
@@ -3224,6 +3623,7 @@ def rescue_grid_phase(
         edges,
         snap_offset=snap_offset,
         median_mm=median_mm,
+        layout=layout,
     )
     used = dict(grid_lines)
     used["reason"] = ""
@@ -3248,6 +3648,8 @@ def rescue_grid_fit(
     was,
     snap_offset=GRID_LINE_SNAP_OFFSET,
     median_mm=COLUMN_MAPPING_MEDIAN_MM,
+    layout=STANDARD,
+    long_leads=None,
 ):
     """Second try of a page whose mask edges are off one uniform column grid.
 
@@ -3260,7 +3662,7 @@ def rescue_grid_fit(
     than a distorted column has no map to show for it and stays as it was.
     signal_masks, signal_positions, pitch and record are those of fit_column_grid(),
     was the reason it failed with; snap_offset and median_mm are those of
-    measure_column_mapping().
+    measure_column_mapping(); layout and long_leads those of fit_column_grid().
     Returns the dict of rescue_grid_phase() with "long_leads" of the fit added. "how"
     is "fit", or "fit+phase" when the grid lines were tried again as well, and "g0"
     and "P" are the grid after the lines, so run() does not refine it again. A second
@@ -3275,16 +3677,18 @@ def rescue_grid_fit(
         record,
         tolerance=GRID_RESCUE_RESIDUAL_TOLERANCE,
         quiet=True,
+        layout=layout,
+        long_leads=long_leads,
     )
     if g0 is None:
         return {"how": "fit", "was": was, "refused": f"second fit: {reason}"}
-    edges = column_mapping_edges(signal_masks, signal_positions, long_leads)
+    edges = column_mapping_edges(signal_masks, signal_positions, long_leads, layout)
     g0, P, grid_lines = refine_grid_from_lines(
-        image_rotated, g0, P, snap_offset=snap_offset
+        image_rotated, g0, P, snap_offset=snap_offset, layout=layout
     )
     if _lines_refused_by_phase(grid_lines["reason"]):
         rescue = rescue_grid_phase(
-            image_rotated, g0, P, grid_lines, edges, snap_offset, median_mm
+            image_rotated, g0, P, grid_lines, edges, snap_offset, median_mm, layout
         )
         rescue["how"] = "fit+phase"
         rescue["was"] = f"{was}; {grid_lines['reason']}"
@@ -3293,7 +3697,13 @@ def rescue_grid_fit(
         return {"how": "fit", "was": was, "refused": refused}
     else:
         x_map, map_info = measure_column_mapping(
-            image_rotated, g0, P, edges, snap_offset=snap_offset, median_mm=median_mm
+            image_rotated,
+            g0,
+            P,
+            edges,
+            snap_offset=snap_offset,
+            median_mm=median_mm,
+            layout=layout,
         )
         rescue = {
             "how": "fit",
@@ -3378,11 +3788,18 @@ ROW_MAPPING_MIN_BAND_ROWS = 30
 ROW_MAPPING_MEDIAN_MM = 27.0
 
 
-def lead_row(lead, long_leads):
-    """Layout row of a lead: RHYTHM_ROW for a rhythm strip, None for a lead in no row."""
+def lead_row(lead, long_leads, layout=STANDARD):
+    """Layout row of a lead: RHYTHM_ROW for a rhythm strip, None for a lead in no row.
+
+    On a layout with several strips strip k is row R + k (Layout.strip_row()); a lead
+    in long_leads that is not a strip of the layout, as the strip of the standard page
+    that the model labels with another lead, is the first strip row.
+    """
     if lead in long_leads:
-        return RHYTHM_ROW
-    return LAYOUT_ROW.get(lead)
+        if layout.n_strips > 1 and lead in layout.strips:
+            return layout.strip_row(layout.strips.index(lead))
+        return layout.rhythm_row
+    return layout.layout_row().get(lead)
 
 
 def _column_map_m(knots_m, knots_x, period, x):
@@ -3403,6 +3820,7 @@ def measure_row_mapping(
     map_info,
     snap_offset=GRID_LINE_SNAP_OFFSET,
     median_mm=ROW_MAPPING_MEDIAN_MM,
+    layout=STANDARD,
 ):
     """One x -> time map per layout row, measured against the column map of the page.
 
@@ -3432,16 +3850,22 @@ def measure_row_mapping(
     further off the page map than the branch tolerance loses its windows that way and
     stays on the page map, which is then off for it by that much: its reason says so.
     image_rotated, g0, P and snap_offset are what measure_column_mapping() was called
-    with and map_info what it returned with its map; signal_masks, signal_positions
-    and long_leads are those of column_mapping_edges().
-    Returns a list of NUM_ROWS dicts: "accepted", "why" (the reason a row keeps the
-    page map), "x_map" (None unless accepted; as the map of measure_column_mapping()),
-    "knots_x", "windows" kept of "inside" the row's columns, "beyond" (windows with
+    with and map_info what it returned with its map; signal_masks, signal_positions,
+    long_leads and layout are those of column_mapping_edges(). On another layout the
+    rows are its rows of short leads and then its strips (lead_row()), and the reach,
+    the largest gap and the samples of a column are those of measure_column_mapping().
+    Returns a list of layout.num_rows dicts (NUM_ROWS on the standard page):
+    "accepted", "why" (the reason a row keeps the page map), "x_map" (None unless
+    accepted; as the map of measure_column_mapping()), "knots_x", "windows" kept of
+    "inside" the row's columns, "beyond" (windows with
     lines further off than the branch tolerance), "coverage", "gap", "shift" (the
     largest move of a sample the row reads, px), "columns" the row reads, "band" and
     "d" (per column the median, smallest and largest move of its samples, px).
     """
-    period = P / GRID_LINES_PER_COLUMN
+    columns, lines_per_column = layout.columns, layout.grid_lines_per_column
+    num_rows = layout.num_rows
+    scale = column_scale(layout)
+    period = P / lines_per_column
     knots_m = np.asarray(map_info["knots_m"], dtype=float)
     knots_x = np.asarray(map_info["knots_x"], dtype=float)
     nan = float("nan")
@@ -3460,9 +3884,9 @@ def measure_row_mapping(
             "shift": nan,
             "columns": [],
             "band": None,
-            "d": [(nan, nan, nan)] * NUM_COLUMNS,
+            "d": [(nan, nan, nan)] * columns,
         }
-        for row in range(NUM_ROWS)
+        for row in range(num_rows)
     ]
 
     def fail(why):
@@ -3475,15 +3899,13 @@ def measure_row_mapping(
     for lead, mask in signal_masks.items():
         if mask is None:
             continue
-        row = lead_row(lead, long_leads)
+        row = lead_row(lead, long_leads, layout)
         if row is None:
             continue
-        if row == RHYTHM_ROW:
-            lead_columns = range(NUM_COLUMNS)
+        if row >= layout.rhythm_row:
+            lead_columns = range(columns)
         else:
-            lead_columns = [
-                int(STANDARD_LEAD_OFFSETS_SEC[lead] / SHORT_SIGNAL_LENGTH_SEC)
-            ]
+            lead_columns = [layout.column_of(lead)]
         counts = (mask[0].numpy() > 0).sum(axis=1)
         total = counts.sum()
         if total == 0:
@@ -3492,10 +3914,10 @@ def measure_row_mapping(
         middle = int(np.searchsorted(np.cumsum(counts), total / 2))
         centres.setdefault(row, []).append(signal_positions[lead]["y1"] + middle + 0.5)
         read.setdefault(row, set()).update(lead_columns)
-    missing = [str(row) for row in range(NUM_ROWS) if row not in centres]
+    missing = [str(row) for row in range(num_rows) if row not in centres]
     if missing:
         return fail(f"row bands: no lead of row {' '.join(missing)}")
-    centre = np.array([np.median(centres[row]) for row in range(NUM_ROWS)])
+    centre = np.array([np.median(centres[row]) for row in range(num_rows)])
     if np.any(np.diff(centre) <= 0):
         return fail("row bands: row centres not in order")
     darkness = _darkness(image_rotated)
@@ -3512,21 +3934,22 @@ def measure_row_mapping(
     if page_profiles.shape[0] == 0:
         return fail("image too small for the grid line profile")
     page_weight = float(np.median(np.abs(_grid_line_comb(page_profiles, period))))
-    low = g0 - COLUMN_MAPPING_REACH * P
-    high = g0 + (NUM_COLUMNS + COLUMN_MAPPING_REACH) * P
+    reach = COLUMN_MAPPING_REACH * scale
+    low = g0 - reach * P
+    high = g0 + (columns + reach) * P
     # The columns as the page map places them, in the coordinate of the lines.
     column_x = (
         _column_map_x(
-            knots_m, knots_x, period, np.arange(NUM_COLUMNS + 1) * GRID_LINES_PER_COLUMN
+            knots_m, knots_x, period, np.arange(columns + 1) * lines_per_column
         )
         + snap_offset
     )
     # Every sample of a column, as vectorise_grid() reads them.
-    samples_per_column = int(SHORT_SIGNAL_LENGTH_SEC * FREQUENCY)
+    samples_per_column = layout.samples_per_column
     column_mm = [
         (column + np.arange(samples_per_column) / samples_per_column)
-        * GRID_LINES_PER_COLUMN
-        for column in range(NUM_COLUMNS)
+        * lines_per_column
+        for column in range(columns)
     ]
     page_x = [_column_map_x(knots_m, knots_x, period, mm) for mm in column_mm]
 
@@ -3580,7 +4003,7 @@ def measure_row_mapping(
         kept = strong & near
         in_column = [
             (window_x >= column_x[column]) & (window_x <= column_x[column + 1])
-            for column in range(NUM_COLUMNS)
+            for column in range(columns)
         ]
         inside = np.zeros(window_x.size, dtype=bool)
         for column in out["columns"]:
@@ -3633,7 +4056,7 @@ def measure_row_mapping(
             out["why"] = f"row keeps {100 * out['coverage']:.0f} % of its windows" + (
                 f", {out['beyond']} beyond the branch tolerance" if out["beyond"] else ""
             )
-        elif gap > COLUMN_MAPPING_MAX_GAP:
+        elif gap > COLUMN_MAPPING_MAX_GAP * scale:
             out["why"] = f"row has a gap of {gap:.2f} columns"
         elif np.any(np.diff(row_knots) <= 0):
             out["why"] = "row map does not grow along x"
@@ -3674,6 +4097,7 @@ def vectorise_grid(
     x_shift=0.0,
     sharpen="none",
     x_map=None,
+    layout=STANDARD,
 ):
     """Vectorise one lead by sampling it on the shared column grid.
 
@@ -3687,14 +4111,22 @@ def vectorise_grid(
     the samples instead of the uniform columns of g0 and P; None keeps those.
     The return value stays the signal, because that is what every caller reads, so
     info, if given, is the dict the ink measurement of this lead is reported in.
+    layout gives the column of a short lead, layout.seconds_per_column long and
+    layout.grid_lines_per_column millimetres wide; a strip (is_long) is 10 s over all
+    columns, at the baseline of its own strip where the layout has several
+    (y_shift_ratio "full:<lead>", Layout.y_shift_ratio()) and at "full" otherwise.
     """
     if sharpen not in ("none", "bandlimited"):
         raise ValueError(f"unknown sharpen mode {sharpen!r}")
-    total_seconds = LONG_SIGNAL_LENGTH_SEC if is_long else SHORT_SIGNAL_LENGTH_SEC
-    y_shift_ratio_ = y_shift_ratio["full"] if is_long else y_shift_ratio[lead]
+    seconds_per_column = layout.seconds_per_column
+    total_seconds = LONG_SIGNAL_LENGTH_SEC if is_long else seconds_per_column
+    if is_long:
+        y_shift_ratio_ = _strip_ratio(y_shift_ratio, lead)
+    else:
+        y_shift_ratio_ = y_shift_ratio[lead]
     values_needed = int(total_seconds * FREQUENCY)
-    samples_per_column = SHORT_SIGNAL_LENGTH_SEC * FREQUENCY
-    mV_per_pixel = 25 * SHORT_SIGNAL_LENGTH_SEC / P / 10
+    samples_per_column = seconds_per_column * FREQUENCY
+    mV_per_pixel = 25 * seconds_per_column / P / 10
 
     # Mean row of the mask in every column, in image coordinates.
     binary = mask[0].numpy() > 0
@@ -3709,10 +4141,11 @@ def vectorise_grid(
     if x_map is None:
         x = g0 + column * P + np.arange(values_needed) * P / samples_per_column - 0.5
     else:
-        # A sample is 1/20 mm at 25 mm/s and 500 Hz, a column 62.5 mm.
+        # A sample is 1/20 mm at 25 mm/s and 500 Hz, a column 62.5 mm on the
+        # standard page.
         millimetres = (
             column + np.arange(values_needed) / samples_per_column
-        ) * GRID_LINES_PER_COLUMN
+        ) * layout.grid_lines_per_column
         x = x_map(millimetres) - 0.5
     # The lead is read where its ink is, so the shift moves the columns of the
     # profile and not the sampling grid, which belongs to the printed grid.
@@ -3730,19 +4163,25 @@ def vectorise_grid(
     )
 
 
-def estimate_baseline_shift(signals_predicted, long_leads, mV_per_pixel, P, record=""):
+def estimate_baseline_shift(
+    signals_predicted, long_leads, mV_per_pixel, P, record="", layout=STANDARD
+):
     """Baseline error of a record in pixels, from the limb lead sum rules.
 
     Goldberger (aVR + aVL + aVF = 0) and Einthoven (I + III - II = 0) hold sample
     wise, so with every lead read a px too low the medians of the two sums are
     -3 a m and -a m. Returns (shift, disagreement of the two estimates) in pixels,
     (0.0, nan) if a rule cannot be evaluated.
+    layout names the column of the rule, that of its first lead, and its window of
+    layout.samples_per_column samples, which a strip is cut to; the largest
+    disagreement, relative to the pitch, is that of the standard page in millimetres
+    (column_scale()).
     """
-    samples_per_column = int(SHORT_SIGNAL_LENGTH_SEC * FREQUENCY)
+    samples_per_column = layout.samples_per_column
 
     def rule_median(leads, coefficients):
         # The first lead is short and names the column the whole rule lives in.
-        column = int(STANDARD_LEAD_OFFSETS_SEC[leads[0]] / SHORT_SIGNAL_LENGTH_SEC)
+        column = layout.column_of(leads[0])
         windows = []
         for lead in leads:
             signal = signals_predicted.get(lead)
@@ -3768,7 +4207,7 @@ def estimate_baseline_shift(signals_predicted, long_leads, mV_per_pixel, P, reco
     from_goldberger = -goldberger / (3 * mV_per_pixel)
     from_einthoven = -einthoven / mV_per_pixel
     disagreement = from_goldberger - from_einthoven
-    if abs(disagreement) > BASELINE_DISAGREEMENT_TOLERANCE * P:
+    if abs(disagreement) > BASELINE_DISAGREEMENT_TOLERANCE * P * column_scale(layout):
         print(
             f"WARNING: baseline estimates disagree for record {record}: "
             f"Goldberger {from_goldberger:.2f} px, Einthoven {from_einthoven:.2f} px, "
@@ -3781,17 +4220,22 @@ def estimate_baseline_shift(signals_predicted, long_leads, mV_per_pixel, P, reco
     return float(shift), float(disagreement)
 
 
-def compute_grid_lead_offsets(signal_positions, signal_lengths, long_leads, g0, P):
-    """Get the time offset of every lead from the column grid it was sampled on."""
+def compute_grid_lead_offsets(
+    signal_positions, signal_lengths, long_leads, g0, P, layout=STANDARD
+):
+    """Get the time offset of every lead from the column grid it was sampled on.
+
+    A short lead starts at the start of its column, layout.offset_sec(), a strip at 0.
+    """
     offsets = {}
     for lead in signal_lengths:
         if lead in long_leads:
             offsets[lead] = {"raw": 0.0, "snapped": 0.0}
             continue
-        raw = (signal_positions[lead]["x1"] - g0) * SHORT_SIGNAL_LENGTH_SEC / P
+        raw = (signal_positions[lead]["x1"] - g0) * layout.seconds_per_column / P
         offsets[lead] = {
             "raw": float(raw),
-            "snapped": float(STANDARD_LEAD_OFFSETS_SEC[lead]),
+            "snapped": float(layout.offset_sec(lead)),
         }
     return offsets
 
@@ -3827,24 +4271,35 @@ def mask_overhang(mask, x1, window):
     return float(max(window[0] - centres[0], centres[-1] - window[1], 0.0))
 
 
-def compute_lead_offsets(signal_positions, signal_lengths, sec_per_pixel, record=""):
-    """Get the time offset in seconds of every predicted lead."""
+def compute_lead_offsets(
+    signal_positions, signal_lengths, sec_per_pixel, record="", layout=STANDARD
+):
+    """Get the time offset in seconds of every predicted lead.
+
+    The offsets snap to the columns of the layout, layout.seconds_per_column apart, and
+    without a rhythm strip they are those of its table.
+    """
+    seconds_per_column = layout.seconds_per_column
     long_length = LONG_SIGNAL_LENGTH_SEC * FREQUENCY
-    max_offset = LONG_SIGNAL_LENGTH_SEC - SHORT_SIGNAL_LENGTH_SEC
+    max_offset = LONG_SIGNAL_LENGTH_SEC - seconds_per_column
     long_leads = [
         lead for lead, length in signal_lengths.items() if length >= long_length
     ]
 
     # Without a rhythm strip there is no reference, so fall back to the layout table.
     if not long_leads:
+        table = "standard lead offsets" if layout == STANDARD else (
+            f"lead offsets of layout {layout.key()}"
+        )
         print(
             f"No rhythm lead found for record {record}, "
-            f"falling back to the standard lead offsets."
+            f"falling back to the {table}."
         )
+        table_offsets = layout.lead_offsets_sec()
         return {
             lead: {
                 "raw": float("nan"),
-                "snapped": float(STANDARD_LEAD_OFFSETS_SEC.get(lead, 0.0)),
+                "snapped": float(table_offsets.get(lead, 0.0)),
             }
             for lead in signal_lengths
         }
@@ -3857,7 +4312,7 @@ def compute_lead_offsets(signal_positions, signal_lengths, sec_per_pixel, record
             offsets[lead] = {"raw": 0.0, "snapped": 0.0}
             continue
         raw = (signal_positions[lead]["x1"] - x1_ref) * sec_per_pixel
-        snapped = round(raw / SHORT_SIGNAL_LENGTH_SEC) * SHORT_SIGNAL_LENGTH_SEC
+        snapped = round(raw / seconds_per_column) * seconds_per_column
         clamped = float(min(max(snapped, 0.0), max_offset))
         if abs(raw - snapped) > 0.5 or clamped != snapped:
             print(
@@ -4092,6 +4547,8 @@ def append_qc_row(output_folder, record, placement, qc, max_offset_deviation):
         "perspective_residual_rel",
         "sheet_curl",
         "sheet_curl_shift_px",
+        "layout",
+        "layout_label_agreement",
     ]
     write_header = not os.path.exists(qc_path)
     with open(qc_path, "a", newline="") as f:
@@ -4501,20 +4958,50 @@ def run(args):
                 **curl_record,
             )
 
+        # The table of leads of the page (--layout). The standard page, and a page whose
+        # layout is not clear, is cut by the labels of the model and read as it always
+        # was; a page of another layout is cut by the position of its traces, and its
+        # strips (layout_strips) are known from their cells. None of the standard page
+        # finds its strip among the masks.
+        layout, layout_info, layout_qc = choose_layout(mask_to_use, args.layout, record)
+        on_layout = layout != STANDARD
+        layout_strips = strips_with_trace(layout_info) if on_layout else None
+        y_shift_ratio = layout.y_shift_ratio()
+
         # Use mask to cut into single, binary masks
-        signal_masks_cropped, signal_positions_cropped, _ = cut_binary(
-            mask_to_use, image_rotated
-        )
+        if on_layout:
+            # The labels of the cells, which the trace shift reads as well.
+            layout_labels = layout_label_mask(mask_to_use, layout, layout_info)
+            signal_masks_cropped, signal_positions_cropped, _ = cut_layout(
+                mask_to_use, image_rotated, layout, layout_info, layout_labels
+            )
+        else:
+            signal_masks_cropped, signal_positions_cropped, _ = cut_binary(
+                mask_to_use, image_rotated
+            )
 
         # Vecotrise
-        x_pixel_list = [
-            v.shape[2] for v in signal_masks_cropped.values() if v is not None
-        ]
-        x_pixel_list_median = np.median(x_pixel_list)
-        x_pixel_list_below_2x_median_mean = np.mean(
-            [v for v in x_pixel_list if v < 2 * x_pixel_list_median]
-        )
-        sec_per_pixel = 2.5 / x_pixel_list_below_2x_median_mean
+        if not on_layout:
+            x_pixel_list = [
+                v.shape[2] for v in signal_masks_cropped.values() if v is not None
+            ]
+            x_pixel_list_median = np.median(x_pixel_list)
+            x_pixel_list_below_2x_median_mean = np.mean(
+                [v for v in x_pixel_list if v < 2 * x_pixel_list_median]
+            )
+            sec_per_pixel = 2.5 / x_pixel_list_below_2x_median_mean
+        else:
+            # The strips are known, and a short lead is one column of the layout wide.
+            short_widths = [
+                mask.shape[2]
+                for lead, mask in signal_masks_cropped.items()
+                if mask is not None and lead not in layout_strips
+            ]
+            sec_per_pixel = (
+                layout.seconds_per_column / np.mean(short_widths)
+                if short_widths
+                else float("nan")
+            )
         g0, P, long_leads = None, None, []
         grid_lines = {"contrast": float("nan"), "shift": float("nan")}
         baseline_scale = 1.0
@@ -4530,6 +5017,8 @@ def run(args):
                 image_rotated.shape[1],
                 args.grid_pitch,
                 record,
+                layout=layout,
+                long_leads=layout_strips,
             )
             if grid_rescue_on and g0 is None and _fit_failed_on_edges(reason):
                 rescue = rescue_grid_fit(
@@ -4541,6 +5030,8 @@ def run(args):
                     reason,
                     snap_offset=args.grid_line_offset,
                     median_mm=args.column_mapping_median,
+                    layout=layout,
+                    long_leads=layout_strips,
                 )
                 if not rescue["refused"]:
                     g0, P, long_leads = rescue["g0"], rescue["P"], rescue["long_leads"]
@@ -4552,7 +5043,11 @@ def run(args):
             else:
                 if args.grid_origin == "lines" and rescue is None:
                     g0, P, grid_lines = refine_grid_from_lines(
-                        image_rotated, g0, P, snap_offset=args.grid_line_offset
+                        image_rotated,
+                        g0,
+                        P,
+                        snap_offset=args.grid_line_offset,
+                        layout=layout,
                     )
                     if grid_rescue_on and _lines_refused_by_phase(grid_lines["reason"]):
                         rescue = rescue_grid_phase(
@@ -4561,10 +5056,14 @@ def run(args):
                             P,
                             grid_lines,
                             column_mapping_edges(
-                                signal_masks_cropped, signal_positions_cropped, long_leads
+                                signal_masks_cropped,
+                                signal_positions_cropped,
+                                long_leads,
+                                layout,
                             ),
                             snap_offset=args.grid_line_offset,
                             median_mm=args.column_mapping_median,
+                            layout=layout,
                         )
                         if not rescue["refused"]:
                             g0, P = rescue["g0"], rescue["P"]
@@ -4578,9 +5077,9 @@ def run(args):
                             f"WARNING: grid lines not used for record {record} "
                             f"({grid_lines['reason']}), keeping the grid of the masks."
                         )
-                sec_per_pixel = SHORT_SIGNAL_LENGTH_SEC / P
+                sec_per_pixel = layout.seconds_per_column / P
                 # A cropped page keeps its size, so its rows are rescaled with the pitch.
-                baseline_scale = P / (image_rotated.shape[1] * PAGE_PITCH_RATIO)
+                baseline_scale = P / (image_rotated.shape[1] * layout.page_pitch_ratio)
                 if args.verbose:
                     print(f"Column grid for record {record}: g0 {g0:.2f} px, P {P:.2f} px")
             # A rescued page says so with or without --verbose, as the WARNING of the
@@ -4599,9 +5098,9 @@ def run(args):
         trace_shift, trace_shift_rows, x_shift = float("nan"), 0, 0.0
         if args.trace_shift == "page" and g0 is not None:
             page_ink = _ink(image_rotated) if ink_map is None else ink_map
-            measured, shift_info = measure_trace_shift(
-                mask_to_use[0].numpy(), page_ink
-            )
+            # The labels the leads were cut by: on the layout path those of the cells.
+            labelled = layout_labels if on_layout else mask_to_use[0].numpy()
+            measured, shift_info = measure_trace_shift(labelled, page_ink)
             trace_shift = trace_shift_px(measured, args.trace_estimator)
             trace_shift_rows = shift_info["rows"]
             x_shift = trace_shift
@@ -4636,10 +5135,14 @@ def run(args):
                     g0,
                     P,
                     column_mapping_edges(
-                        signal_masks_cropped, signal_positions_cropped, long_leads
+                        signal_masks_cropped,
+                        signal_positions_cropped,
+                        long_leads,
+                        layout,
                     ),
                     snap_offset=args.grid_line_offset,
                     median_mm=args.column_mapping_median,
+                    layout=layout,
                 )
                 column_mapping_shift = map_info["shift"]
                 if map_info["reason"]:
@@ -4685,9 +5188,10 @@ def run(args):
                     map_info,
                     snap_offset=args.grid_line_offset,
                     median_mm=args.row_mapping_median,
+                    layout=layout,
                 )
                 row_maps = {out["row"]: out["x_map"] for out in rows if out["accepted"]}
-                row_mapping = f"lines {len(row_maps)}/{NUM_ROWS}"
+                row_mapping = f"lines {len(row_maps)}/{layout.num_rows}"
                 if args.verbose:
                     for out in rows:
                         print(row_mapping_line(record, out))
@@ -4698,25 +5202,23 @@ def run(args):
             elif g0 is not None:
                 # The rhythm strip spans all columns, a short lead only its own.
                 if lead in long_leads:
-                    column, n_columns = 0, NUM_COLUMNS
+                    column, n_columns = 0, layout.columns
                 else:
-                    column = int(
-                        STANDARD_LEAD_OFFSETS_SEC[lead] / SHORT_SIGNAL_LENGTH_SEC
-                    )
+                    column = layout.column_of(lead)
                     n_columns = 1
                 window = (g0 + column * P, g0 + (column + n_columns) * P)
                 x1 = signal_positions_cropped[lead]["x1"]
                 # The grid sampling interpolates over gaps, so report them, as far as
                 # they reach into the window it reads the lead over.
                 gap = max_mask_gap(mask, x1, window)
-                if gap > GRID_GAP_TOLERANCE * P:
+                if gap > GRID_GAP_TOLERANCE * P * column_scale(layout):
                     print(
                         f"WARNING: lead {lead} of record {record} has a gap of "
                         f"{gap} px in its mask, interpolated linearly."
                     )
                 if args.verbose:
                     overhang = mask_overhang(mask, x1, window)
-                    if overhang > GRID_RESIDUAL_TOLERANCE * P:
+                    if overhang > GRID_RESIDUAL_TOLERANCE * P * column_scale(layout):
                         print(
                             f"Lead {lead} of record {record} has mask pixels up to "
                             f"{overhang:.0f} px outside its column, ignored."
@@ -4730,7 +5232,7 @@ def run(args):
                     P,
                     column,
                     lead in long_leads,
-                    Y_SHIFT_RATIO,
+                    y_shift_ratio,
                     lead,
                     baseline_scale,
                     ink_map=ink_map,
@@ -4738,7 +5240,8 @@ def run(args):
                     x_shift=x_shift,
                     sharpen=args.sharpen,
                     # The map of the lead's row, or the page map where it has none.
-                    x_map=row_maps.get(lead_row(lead, long_leads), x_map),
+                    x_map=row_maps.get(lead_row(lead, long_leads, layout), x_map),
+                    layout=layout,
                 )
                 if ink:
                     ink_measured.append(ink)
@@ -4749,8 +5252,10 @@ def run(args):
                     signal_positions_cropped[lead]["y1"],
                     sec_per_pixel,
                     mV_per_pixel,
-                    Y_SHIFT_RATIO,
+                    y_shift_ratio,
                     lead,
+                    layout=layout,
+                    long_leads=layout_strips,
                 )
 
         # One number for the ink of the page: the median over the leads that were
@@ -4769,7 +5274,7 @@ def run(args):
         baseline_shift, baseline_disagreement = 0.0, float("nan")
         if g0 is not None and args.baseline == "leads":
             baseline_shift, baseline_disagreement = estimate_baseline_shift(
-                signals_predicted, long_leads, mV_per_pixel, P, record
+                signals_predicted, long_leads, mV_per_pixel, P, record, layout
             )
             for lead, signal in signals_predicted.items():
                 if signal is not None:
@@ -4792,11 +5297,11 @@ def run(args):
         if g0 is not None:
             # Place every lead in the column it was sampled from.
             offsets = compute_grid_lead_offsets(
-                signal_positions_cropped, signal_lengths, long_leads, g0, P
+                signal_positions_cropped, signal_lengths, long_leads, g0, P, layout
             )
         else:
             offsets = compute_lead_offsets(
-                signal_positions_cropped, signal_lengths, sec_per_pixel, record
+                signal_positions_cropped, signal_lengths, sec_per_pixel, record, layout
             )
         signals, sig_names = assemble_signals(
             signals, offsets, num_samples, args.lead_placement
@@ -4860,6 +5365,10 @@ def run(args):
         qc["row_mapping"] = row_mapping
         qc["perspective_residual_rel"] = perspective_info["residual_rel"]
         qc["sheet_curl"], qc["sheet_curl_shift_px"] = curl_qc
+        qc["layout"] = layout_qc
+        qc["layout_label_agreement"] = (
+            layout_info["label_agreement"] if on_layout else float("nan")
+        )
         append_qc_row(
             args.output_folder, record, args.lead_placement, qc, max_offset_deviation
         )
